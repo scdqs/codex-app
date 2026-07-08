@@ -9,3 +9,4 @@ repository.workspace = true
 anyhow = { workspace = true }
 bridge-core = { path = "../../crates/bridge-core" }
 tokio = { workspace = true }
+uuid = { workspace = true }

@@ -1,10 +1,14 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use axum::{
     Extension, Json, Router,
     body::Body,
     extract::{
-        Path, Query, State, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, Request, StatusCode},
@@ -31,7 +35,12 @@ use crate::{
 pub struct AppState {
     pairing: Arc<Mutex<PairingManager>>,
     event_hub: EventHub,
+    event_history: Arc<Mutex<HashMap<String, VecDeque<SessionEvent>>>>,
+    control_token: Arc<str>,
 }
+
+const EVENT_HISTORY_LIMIT_PER_THREAD: usize = 256;
+const BRIDGE_CONTROL_TOKEN_HEADER: &str = "x-bridge-control-token";
 
 #[derive(Debug, Clone)]
 struct AuthenticatedDevice {
@@ -64,6 +73,21 @@ pub struct PairingCompleteRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PairingCompleteResponse {
+    device_id: String,
+    session_token: String,
+    session_expires_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefreshRequest {
+    device_id: String,
+    device_secret: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRefreshResponse {
     device_id: String,
     session_token: String,
     session_expires_at: u64,
@@ -104,10 +128,16 @@ struct ErrorResponse {
 }
 
 impl AppState {
-    pub fn new(pairing: PairingManager, event_hub: EventHub) -> Self {
+    pub fn new(
+        pairing: PairingManager,
+        event_hub: EventHub,
+        control_token: impl Into<Arc<str>>,
+    ) -> Self {
         Self {
             pairing: Arc::new(Mutex::new(pairing)),
             event_hub,
+            event_history: Arc::new(Mutex::new(HashMap::new())),
+            control_token: control_token.into(),
         }
     }
 
@@ -131,13 +161,21 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             require_bearer_auth,
         ));
+    let websocket_route =
+        Router::new()
+            .route("/ws", get(ws_handler))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_websocket_auth,
+            ));
 
     Router::new()
         .route("/api/health", get(health))
         .route("/api/pairing/start", post(start_pairing))
         .route("/api/pairing/complete", post(complete_pairing))
-        .route("/ws", get(ws_handler))
+        .route("/api/session/refresh", post(refresh_session))
         .merge(authenticated_routes)
+        .merge(websocket_route)
         .with_state(state)
 }
 
@@ -150,13 +188,30 @@ async fn health() -> Json<HealthResponse> {
 
 async fn start_pairing(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<PairingStartResponse>, ApiError> {
+    require_control_token(&state, &headers)?;
+
     let mut pairing = state.pairing.lock().await;
     let pairing_token = pairing.create_token()?;
 
     Ok(Json(PairingStartResponse {
         pairing_token,
         expires_in_ms: DEFAULT_PAIRING_TOKEN_TTL_MS,
+    }))
+}
+
+async fn refresh_session(
+    State(state): State<AppState>,
+    Json(request): Json<SessionRefreshRequest>,
+) -> Result<Json<SessionRefreshResponse>, ApiError> {
+    let mut pairing = state.pairing.lock().await;
+    let registration = pairing.create_session(&request.device_id, &request.device_secret)?;
+
+    Ok(Json(SessionRefreshResponse {
+        device_id: registration.device_id,
+        session_token: registration.session_token,
+        session_expires_at: registration.session_expires_at,
     }))
 }
 
@@ -211,8 +266,19 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSnapsho
     Json(state.event_hub.all_snapshots().await)
 }
 
-async fn list_session_events(Path(_thread_id): Path<String>) -> Json<Vec<SessionEvent>> {
-    Json(Vec::new())
+async fn list_session_events(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+) -> Json<Vec<SessionEvent>> {
+    let events = state
+        .event_history
+        .lock()
+        .await
+        .get(&thread_id)
+        .map(|events| events.iter().cloned().collect())
+        .unwrap_or_default();
+
+    Json(events)
 }
 
 async fn send_message(
@@ -230,6 +296,7 @@ async fn send_message(
         }),
         created_at: current_time_ms(),
     };
+    record_session_event(&state, event.clone()).await;
     state.event_hub.publish(ServerEnvelope::SessionEvent(event));
 
     (
@@ -262,20 +329,8 @@ async fn decide_approval(
     ))
 }
 
-async fn ws_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
-    ws: WebSocketUpgrade,
-) -> Result<Response, ApiError> {
-    let token = query
-        .get("token")
-        .map(String::as_str)
-        .or_else(|| bearer_token_from_headers(&headers))
-        .ok_or(ApiError::Unauthorized)?;
-    authenticate_token(&state, token).await?;
-
-    Ok(ws.on_upgrade(move |socket| websocket_stream(state.event_hub, socket)))
+async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(move |socket| websocket_stream(state.event_hub, socket))
 }
 
 async fn websocket_stream(event_hub: EventHub, socket: WebSocket) {
@@ -307,11 +362,44 @@ async fn require_bearer_auth(
     Ok(next.run(request).await)
 }
 
+async fn require_websocket_auth(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let token = bearer_token_from_headers(request.headers())
+        .or_else(|| token_from_query(request.uri().query().unwrap_or_default()))
+        .ok_or(ApiError::Unauthorized)?;
+    authenticate_token(&state, token).await?;
+
+    Ok(next.run(request).await)
+}
+
 async fn authenticate_token(state: &AppState, token: &str) -> Result<String, ApiError> {
     let pairing = state.pairing.lock().await;
     pairing
         .validate_session_token(token)
         .map_err(|_| ApiError::Unauthorized)
+}
+
+fn token_from_query(query: &str) -> Option<&str> {
+    query.split('&').find_map(|param| {
+        param
+            .strip_prefix("token=")
+            .filter(|token| !token.is_empty())
+    })
+}
+
+fn require_control_token(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let token = bearer_token_from_headers(headers)
+        .or_else(|| control_token_from_headers(headers))
+        .ok_or(ApiError::Unauthorized)?;
+
+    if token == state.control_token.as_ref() {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
 }
 
 fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
@@ -321,6 +409,25 @@ fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
         .ok()?
         .strip_prefix("Bearer ")
         .filter(|token| !token.is_empty())
+}
+
+fn control_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(BRIDGE_CONTROL_TOKEN_HEADER)?
+        .to_str()
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
+async fn record_session_event(state: &AppState, event: SessionEvent) {
+    let mut event_history = state.event_history.lock().await;
+    let thread_events = event_history
+        .entry(event.thread_id.clone())
+        .or_insert_with(VecDeque::new);
+    if thread_events.len() == EVENT_HISTORY_LIMIT_PER_THREAD {
+        thread_events.pop_front();
+    }
+    thread_events.push_back(event);
 }
 
 fn current_time_ms() -> u64 {
@@ -388,6 +495,8 @@ mod tests {
         storage::Storage,
     };
 
+    const TEST_CONTROL_TOKEN: &str = "test-control-token";
+
     fn temp_storage() -> (TempDir, Storage) {
         let dir = tempdir().expect("tempdir is created");
         let path: PathBuf = dir.path().join("bridge.sqlite");
@@ -396,10 +505,17 @@ mod tests {
         (dir, storage)
     }
 
+    fn temp_db_path() -> (TempDir, PathBuf) {
+        let dir = tempdir().expect("tempdir is created");
+        let path = dir.path().join("bridge.sqlite");
+
+        (dir, path)
+    }
+
     fn test_state() -> (TempDir, AppState) {
         let (dir, storage) = temp_storage();
         let pairing = PairingManager::with_clock(storage, || 1_725_000_000_000);
-        let state = AppState::new(pairing, EventHub::new());
+        let state = AppState::new(pairing, EventHub::new(), TEST_CONTROL_TOKEN);
 
         (dir, state)
     }
@@ -421,19 +537,30 @@ mod tests {
         registration.session_token
     }
 
+    fn request(method: Method, uri: &str, body: impl Into<Body>) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(body.into())
+            .expect("request builds")
+    }
+
+    fn json_request(method: Method, uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request builds")
+    }
+
     #[tokio::test]
     async fn health_returns_connection_state() {
         let (_dir, state) = test_state();
         let app = build_router(state);
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/health")
-                    .body(Body::empty())
-                    .expect("request builds"),
-            )
+            .oneshot(request(Method::GET, "/api/health", Body::empty()))
             .await
             .expect("request succeeds");
 
@@ -453,17 +580,245 @@ mod tests {
         let app = build_router(state);
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/api/sessions")
-                    .body(Body::empty())
-                    .expect("request builds"),
-            )
+            .oneshot(request(Method::GET, "/api/sessions", Body::empty()))
             .await
             .expect("request succeeds");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn pairing_start_requires_control_token() {
+        let (_dir, state) = test_state();
+        let app = build_router(state);
+
+        for request in [
+            request(Method::POST, "/api/pairing/start", Body::empty()),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/pairing/start")
+                .header(header::AUTHORIZATION, "Bearer wrong-control-token")
+                .body(Body::empty())
+                .expect("request builds"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("request succeeds");
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn pairing_start_accepts_control_token() {
+        let (_dir, state) = test_state();
+        let app = build_router(state);
+
+        for request in [
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/pairing/start")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {TEST_CONTROL_TOKEN}"),
+                )
+                .body(Body::empty())
+                .expect("request builds"),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/pairing/start")
+                .header(BRIDGE_CONTROL_TOKEN_HEADER, TEST_CONTROL_TOKEN)
+                .body(Body::empty())
+                .expect("request builds"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("request succeeds");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert!(body["pairingToken"].as_str().is_some());
+            assert_eq!(body["expiresInMs"], json!(DEFAULT_PAIRING_TOKEN_TTL_MS));
+        }
+    }
+
+    #[tokio::test]
+    async fn session_refresh_renews_after_pairing_manager_restart() {
+        let (_dir, path) = temp_db_path();
+        {
+            let storage = Storage::open(&path).expect("storage opens");
+            let mut pairing = PairingManager::with_clock(storage, || 1_725_000_000_000);
+            let token = pairing.create_token().expect("pairing token creates");
+            pairing
+                .register_device(&token, "phone-1", "Damon's phone", "phone-secret")
+                .expect("device registers");
+        }
+        let storage = Storage::open(path).expect("storage reopens");
+        let state = AppState::new(
+            PairingManager::with_clock(storage, || 1_725_000_100_000),
+            EventHub::new(),
+            TEST_CONTROL_TOKEN,
+        );
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/api/session/refresh",
+                json!({
+                    "deviceId": "phone-1",
+                    "deviceSecret": "phone-secret",
+                }),
+            ))
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["deviceId"], json!("phone-1"));
+        assert!(body["sessionToken"].as_str().is_some());
+        assert_eq!(body["sessionExpiresAt"], json!(1_725_086_500_000u64));
+    }
+
+    #[tokio::test]
+    async fn session_refresh_rejects_wrong_secret() {
+        let (_dir, state) = test_state();
+        pair_device(&state).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/api/session/refresh",
+                json!({
+                    "deviceId": "phone-1",
+                    "deviceSecret": "wrong-secret",
+                }),
+            ))
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn protected_rest_routes_reject_missing_and_invalid_tokens() {
+        struct ProtectedRoute {
+            method: Method,
+            uri: &'static str,
+            body: Option<Value>,
+        }
+
+        let routes = [
+            ProtectedRoute {
+                method: Method::GET,
+                uri: "/api/devices",
+                body: None,
+            },
+            ProtectedRoute {
+                method: Method::DELETE,
+                uri: "/api/devices/phone-1",
+                body: None,
+            },
+            ProtectedRoute {
+                method: Method::GET,
+                uri: "/api/sessions",
+                body: None,
+            },
+            ProtectedRoute {
+                method: Method::GET,
+                uri: "/api/sessions/thread-1/events",
+                body: None,
+            },
+            ProtectedRoute {
+                method: Method::POST,
+                uri: "/api/sessions/thread-1/messages",
+                body: Some(json!({ "text": "hello" })),
+            },
+            ProtectedRoute {
+                method: Method::POST,
+                uri: "/api/approvals/approval-1/decision",
+                body: Some(json!({ "decision": "approve", "comment": null })),
+            },
+        ];
+
+        for route in routes {
+            let (_dir, state) = test_state();
+            let app = build_router(state);
+            let missing_token_request = match &route.body {
+                Some(body) => json_request(route.method.clone(), route.uri, body.clone()),
+                None => request(route.method.clone(), route.uri, Body::empty()),
+            };
+
+            let response = app
+                .clone()
+                .oneshot(missing_token_request)
+                .await
+                .expect("request succeeds");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} without token",
+                route.uri
+            );
+
+            let invalid_token_request = match &route.body {
+                Some(body) => Request::builder()
+                    .method(route.method.clone())
+                    .uri(route.uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer invalid-session-token")
+                    .body(Body::from(body.to_string()))
+                    .expect("request builds"),
+                None => Request::builder()
+                    .method(route.method.clone())
+                    .uri(route.uri)
+                    .header(header::AUTHORIZATION, "Bearer invalid-session-token")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            };
+
+            let response = app
+                .oneshot(invalid_token_request)
+                .await
+                .expect("request succeeds");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{} with invalid token",
+                route.uri
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_route_rejects_missing_and_invalid_tokens_before_upgrade() {
+        let (_dir, state) = test_state();
+        let app = build_router(state);
+
+        for uri in ["/ws", "/ws?token=invalid-session-token"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(uri)
+                        .header(header::CONNECTION, "upgrade")
+                        .header(header::UPGRADE, "websocket")
+                        .header(header::SEC_WEBSOCKET_VERSION, "13")
+                        .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("request succeeds");
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
     }
 
     #[tokio::test]
@@ -513,5 +868,45 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn paired_device_can_read_message_events_published_through_api() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let app = build_router(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/thread-1/messages")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "text": "hello" }).to_string()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body[0]["threadId"], json!("thread-1"));
+        assert_eq!(body[0]["type"], json!("message"));
+        assert_eq!(body[0]["payload"]["text"], json!("hello"));
     }
 }

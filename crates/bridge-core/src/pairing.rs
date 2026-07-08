@@ -146,6 +146,15 @@ impl PairingManager {
         device_id: &str,
         device_secret: &str,
     ) -> Result<String, PairingError> {
+        self.create_session(device_id, device_secret)
+            .map(|registration| registration.session_token)
+    }
+
+    pub fn create_session(
+        &mut self,
+        device_id: &str,
+        device_secret: &str,
+    ) -> Result<DeviceRegistration, PairingError> {
         match self.device_by_id(device_id)? {
             Some(device) if device.revoked_at.is_some() => Err(PairingError::DeviceRevoked),
             Some(device) => {
@@ -153,8 +162,13 @@ impl PairingManager {
                     return Err(PairingError::InvalidToken);
                 }
 
-                let (token, _) = self.mint_session_token_for_device_id(device_id);
-                Ok(token)
+                let (session_token, session_expires_at) =
+                    self.mint_session_token_for_device_id(device_id);
+                Ok(DeviceRegistration {
+                    device_id: device_id.to_string(),
+                    session_token,
+                    session_expires_at,
+                })
             }
             None => Err(PairingError::DeviceNotFound),
         }

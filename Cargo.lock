@@ -141,6 +141,7 @@ dependencies = [
  "anyhow",
  "bridge-core",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
