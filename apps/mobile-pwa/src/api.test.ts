@@ -171,6 +171,20 @@ describe("pairing API helpers", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "/api/assets/../sessions",
+    "/api/assets/local-image/../../sessions",
+    "/api/assets/%2e%2e/sessions",
+  ])("fetchAssetBlob_rejects_traversal_asset_paths_without_fetch", async (src) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({}));
+
+    await expect(fetchAssetBlob("http://bridge.local", "session-1", src)).rejects.toMatchObject({
+      status: 400,
+      message: "Invalid asset source",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("fetchAssetBlob_rejects_non_image_content_type", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       new Response("not an image", {

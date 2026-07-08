@@ -735,7 +735,7 @@ function EventRow({
         <p>{event.type.replace("_", " ")}</p>
         <span>{payloadText(event.payload)}</span>
         {attachments.length > 0 ? (
-          <div className="attachment-list">
+          <div className="attachment-list" aria-label="Image attachments">
             {attachments.map((attachment, index) => (
               <AttachmentImage
                 assetSession={assetSession}
