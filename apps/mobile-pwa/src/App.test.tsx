@@ -7,6 +7,8 @@ import App, { appendOrMergeSessionEvent, mergePolledSessionEvents } from "./App"
 import type { SessionEvent, SessionSnapshot } from "./protocol";
 import { clearSession, loadSession, saveSession } from "./storage";
 
+const originalScrollTo = (HTMLElement.prototype as Partial<HTMLElement>).scrollTo;
+
 describe("App", () => {
   beforeEach(() => {
     MockWebSocket.instances = [];
@@ -19,6 +21,7 @@ describe("App", () => {
     vi.unstubAllGlobals();
     clearSession();
     window.history.replaceState(null, "", "/");
+    restoreScrollTo();
   });
 
   it("renders the mobile workbench regions and selected session detail", () => {
@@ -709,6 +712,103 @@ describe("App", () => {
     expect(screen.getByText("Arrived over socket")).toBeInTheDocument();
   });
 
+  it("keeps_event_stream_at_bottom_when_new_events_arrive_near_bottom", async () => {
+    saveActiveSession();
+    const scrollTo = vi.fn();
+    HTMLElement.prototype.scrollTo = scrollTo;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-live", title: "Live thread", preview: "Real session" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-live/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-first",
+            threadId: "thread-live",
+            payload: { role: "assistant", text: "First" },
+          }),
+        ]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("First")).toBeInTheDocument();
+    const stream = screen.getByLabelText("Session event stream");
+    setScrollMetrics(stream, { scrollTop: 720, clientHeight: 200, scrollHeight: 900 });
+    fireEvent.scroll(stream);
+    act(() => {
+      MockWebSocket.instances[0].emit({
+        type: "session_event",
+        payload: sessionEvent({
+          id: "event-second",
+          threadId: "thread-live",
+          payload: { role: "assistant", text: "Second" },
+          createdAt: 1_783_515_390_000,
+        }),
+      });
+    });
+
+    expect(await screen.findByText("Second")).toBeInTheDocument();
+    expect(scrollTo).toHaveBeenLastCalledWith({ top: 900, behavior: "auto" });
+  });
+
+  it("does_not_steal_scroll_when_user_is_reading_history", async () => {
+    saveActiveSession();
+    const scrollTo = vi.fn();
+    HTMLElement.prototype.scrollTo = scrollTo;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-live", title: "Live thread", preview: "Real session" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-live/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-first",
+            threadId: "thread-live",
+            payload: { role: "assistant", text: "First" },
+          }),
+        ]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("First")).toBeInTheDocument();
+    const stream = screen.getByLabelText("Session event stream");
+    scrollTo.mockClear();
+    setScrollMetrics(stream, { scrollTop: 100, clientHeight: 200, scrollHeight: 900 });
+    fireEvent.scroll(stream);
+    act(() => {
+      MockWebSocket.instances[0].emit({
+        type: "session_event",
+        payload: sessionEvent({
+          id: "event-second",
+          threadId: "thread-live",
+          payload: { role: "assistant", text: "Second" },
+          createdAt: 1_783_515_390_000,
+        }),
+      });
+    });
+
+    expect(await screen.findByText("Second")).toBeInTheDocument();
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
   it("reconciles_optimistic_user_message_with_matching_server_echo", async () => {
     const user = userEvent.setup();
     saveActiveSession();
@@ -947,6 +1047,33 @@ function sessionEvent(overrides: Partial<SessionEvent> = {}): SessionEvent {
     createdAt: 1_783_515_380_000,
     ...overrides,
   };
+}
+
+function setScrollMetrics(
+  element: Element,
+  metrics: { scrollTop: number; clientHeight: number; scrollHeight: number },
+) {
+  Object.defineProperty(element, "scrollTop", {
+    configurable: true,
+    writable: true,
+    value: metrics.scrollTop,
+  });
+  Object.defineProperty(element, "clientHeight", {
+    configurable: true,
+    value: metrics.clientHeight,
+  });
+  Object.defineProperty(element, "scrollHeight", {
+    configurable: true,
+    value: metrics.scrollHeight,
+  });
+}
+
+function restoreScrollTo() {
+  if (originalScrollTo) {
+    HTMLElement.prototype.scrollTo = originalScrollTo;
+    return;
+  }
+  delete (HTMLElement.prototype as Partial<HTMLElement>).scrollTo;
 }
 
 class MockWebSocket {

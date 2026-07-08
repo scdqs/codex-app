@@ -1,4 +1,13 @@
-import { FormEvent, useEffect, useMemo, useState, type Dispatch, type SetStateAction } from "react";
+import {
+  FormEvent,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import {
   AlertTriangle,
   Check,
@@ -606,6 +615,45 @@ function SessionDetail({
   events: SessionEvent[];
   session: SessionSnapshot | null;
 }) {
+  const eventStreamRef = useRef<HTMLDivElement | null>(null);
+  const shouldStickToBottomRef = useRef(true);
+  const previousThreadIdRef = useRef<string | null>(null);
+  const threadId = session ? session.threadId : "";
+  const eventTail = sessionEvents.at(-1);
+  const eventTailKey = eventTail
+    ? `${eventTail.id}:${eventTail.createdAt}:${payloadText(eventTail.payload).length}`
+    : "";
+
+  useLayoutEffect(() => {
+    if (!threadId) {
+      return;
+    }
+    const stream = eventStreamRef.current;
+    if (!stream) {
+      return;
+    }
+
+    const threadChanged = previousThreadIdRef.current !== threadId;
+    if (threadChanged || shouldStickToBottomRef.current) {
+      if (typeof stream.scrollTo === "function") {
+        stream.scrollTo({ top: stream.scrollHeight, behavior: "auto" });
+      } else {
+        stream.scrollTop = stream.scrollHeight;
+      }
+      shouldStickToBottomRef.current = true;
+    }
+    previousThreadIdRef.current = threadId;
+  }, [eventTailKey, threadId]);
+
+  function handleEventStreamScroll() {
+    const stream = eventStreamRef.current;
+    if (!stream) {
+      return;
+    }
+    shouldStickToBottomRef.current =
+      stream.scrollHeight - stream.scrollTop - stream.clientHeight < 80;
+  }
+
   if (!session) {
     return (
       <section className="session-detail empty-session-detail" aria-labelledby="session-detail-heading">
@@ -650,7 +698,12 @@ function SessionDetail({
         </div>
       ) : null}
 
-      <div className="event-stream" aria-label="Session event stream">
+      <div
+        className="event-stream"
+        aria-label="Session event stream"
+        ref={eventStreamRef}
+        onScroll={handleEventStreamScroll}
+      >
         {sessionEvents.map((event) => (
           <article className="event-row" key={event.id}>
             <span className="event-icon" aria-hidden="true">
