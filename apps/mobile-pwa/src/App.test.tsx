@@ -1,6 +1,8 @@
+// @ts-ignore - Vitest runs this test in Node, but this package does not include Node ambient types.
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App, { appendOrMergeSessionEvent, mergePolledSessionEvents } from "./App";
 import type { SessionEvent, SessionSnapshot } from "./protocol";
@@ -20,8 +22,7 @@ describe("App", () => {
     window.history.replaceState(null, "", "/");
   });
 
-  it("renders the mobile workbench regions and selected session detail", async () => {
-    const user = userEvent.setup();
+  it("renders the mobile workbench regions and selected session detail", () => {
     render(<App />);
 
     expect(screen.getByLabelText("Connection status")).toHaveTextContent("Unpaired");
@@ -36,11 +37,30 @@ describe("App", () => {
 
     expect(screen.getByRole("button", { name: /Mobile bridge MVP/ })).toHaveAttribute("aria-current", "true");
 
-    await user.click(screen.getByRole("button", { name: /Bridge sidecar API/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Bridge sidecar API/ }));
 
     expect(screen.getByRole("heading", { name: "Bridge sidecar API" })).toBeInTheDocument();
     expect(screen.getByPlaceholderText("Message Bridge sidecar API")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Bridge sidecar API/ })).toHaveAttribute("aria-current", "true");
+  });
+
+  it("uses_independent_scroll_containers_for_sessions_and_events", () => {
+    const stylesUrl = new URL("./styles.css", import.meta.url);
+    const stylesPath =
+      stylesUrl.protocol === "file:"
+        ? stylesUrl
+        : stylesUrl.pathname.startsWith("/@fs/")
+          ? stylesUrl.pathname.slice("/@fs".length)
+          : `.${stylesUrl.pathname}`;
+    const css = readFileSync(stylesPath, "utf8");
+
+    expect(css).toContain(".workbench");
+    expect(css).toContain("overflow: hidden");
+    expect(css).toContain(".session-list,");
+    expect(css).toContain(".event-stream");
+    expect(css).toContain("overflow-y: auto");
+    expect(css).toContain(".session-list-panel,");
+    expect(css).toContain("flex-direction: column");
   });
 
   it("shows_revoked_or_expired_connection_error", async () => {
@@ -733,7 +753,7 @@ describe("App", () => {
     });
   });
 
-  it("keeps_polled_events_newest_first_and_reconciles_pending_echo_with_newline", () => {
+  it("keeps_polled_events_oldest_first_and_reconciles_pending_echo_with_newline", () => {
     const current = [
       sessionEvent({
         id: "old-assistant",
@@ -767,9 +787,9 @@ describe("App", () => {
     const merged = mergePolledSessionEvents(current, polled);
 
     expect(merged.map((event) => event.id)).toEqual([
+      "old-assistant",
       "turn-new:item-1",
       "turn-new:item-2",
-      "old-assistant",
     ]);
     expect(merged.map((event) => event.payload).filter((payload) => payload && typeof payload === "object" && "text" in payload && payload.text === "continue")).toHaveLength(0);
   });

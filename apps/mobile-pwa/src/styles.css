@@ -197,9 +197,10 @@ h3 {
 }
 
 .workbench {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
+  overflow: hidden;
   padding: 12px 12px calc(var(--composer-height) + var(--safe-bottom) + 14px);
 }
 
@@ -214,6 +215,13 @@ h3 {
 
 .approval-queue {
   margin-bottom: 12px;
+}
+
+.session-list-panel,
+.session-detail {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
 }
 
 .section-heading {
@@ -341,13 +349,26 @@ h3 {
   grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.45fr);
   gap: 12px;
   min-height: 0;
+  overflow: hidden;
 }
 
 .session-list,
 .event-stream {
   display: grid;
+  min-height: 0;
   gap: 1px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 8px;
+}
+
+.session-list {
+  flex: 1;
+}
+
+.event-stream {
+  flex: 1;
+  align-content: start;
 }
 
 .session-row {
@@ -623,6 +644,7 @@ h3 {
 
   .session-grid {
     grid-template-columns: 1fr;
+    grid-template-rows: minmax(150px, 0.42fr) minmax(0, 1fr);
   }
 
   .approval-strip {

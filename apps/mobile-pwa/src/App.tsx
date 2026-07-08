@@ -798,7 +798,7 @@ export function mergePolledSessionEvents(current: SessionEvent[], polled: Sessio
 }
 
 function sortSessionEvents(events: SessionEvent[]): SessionEvent[] {
-  return [...events].sort((left, right) => right.createdAt - left.createdAt);
+  return [...events].sort((left, right) => left.createdAt - right.createdAt);
 }
 
 function deltaText(payload: SessionEvent["payload"]): string {
