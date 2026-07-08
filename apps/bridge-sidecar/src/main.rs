@@ -1,11 +1,15 @@
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{
+    env,
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    path::PathBuf,
+};
 
 use anyhow::Context;
 use bridge_core::{
     cdp::CdpClient,
     diagnostics::diagnose_cdp_app_server,
     event_hub::EventHub,
-    http_api::{AppState, serve},
+    http_api::{AppState, serve_with_static_dir},
     pairing::PairingManager,
     storage::Storage,
 };
@@ -13,6 +17,7 @@ use uuid::Uuid;
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:57324";
 const DEFAULT_DEBUG_PORT: u16 = 9229;
+const DEFAULT_PWA_DIR: &str = "apps/mobile-pwa/dist";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -30,9 +35,25 @@ async fn main() -> anyhow::Result<()> {
     let db_path = env::var_os("CODEX_MOBILE_BRIDGE_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("bridge.sqlite"));
+    let pwa_dir = env::var_os("CODEX_MOBILE_BRIDGE_PWA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PWA_DIR));
     let storage = Storage::open(db_path).context("open bridge storage")?;
     let control_token = Uuid::new_v4().to_string();
+    let mut pairing = PairingManager::new(storage);
+    let startup_pairing_token = pairing
+        .create_token()
+        .context("create startup pairing token")?;
+    let bridge_url = bridge_url_for_bind_addr(bind_addr);
+    let pairing_url = format!(
+        "{bridge_url}/?pairingToken={}&bridgeUrl={}",
+        url_encode_component(&startup_pairing_token),
+        url_encode_component(&bridge_url)
+    );
     println!("Codex mobile bridge listening on {bind_addr}");
+    println!("Serving PWA from {}", pwa_dir.display());
+    println!("PWA pairing URL: {pairing_url}");
+    println!("QR text: {pairing_url}");
     let cdp_client = CdpClient::new(debug_port).context("create cdp client")?;
     let diagnostics = diagnose_cdp_app_server(&cdp_client).await;
     println!(
@@ -48,8 +69,42 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "Local control token for starting device pairing: {control_token}. Keep this token on this machine; it is not exposed by the HTTP API."
     );
-    let state = AppState::new(PairingManager::new(storage), EventHub::new(), control_token)
-        .with_diagnostics(diagnostics);
+    let state =
+        AppState::new(pairing, EventHub::new(), control_token).with_diagnostics(diagnostics);
 
-    serve(bind_addr, state).await
+    serve_with_static_dir(bind_addr, state, pwa_dir).await
+}
+
+fn bridge_url_for_bind_addr(bind_addr: SocketAddr) -> String {
+    let ip = if bind_addr.ip().is_unspecified() {
+        lan_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+    } else {
+        bind_addr.ip()
+    };
+    format!("http://{}:{}", host_for_url(ip), bind_addr.port())
+}
+
+fn lan_ip() -> Option<IpAddr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
+fn host_for_url(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+fn url_encode_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }

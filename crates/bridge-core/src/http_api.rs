@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -20,6 +21,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Mutex, RwLock};
+use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 use crate::{
@@ -215,6 +217,13 @@ pub fn build_router(state: AppState) -> Router {
         .merge(authenticated_routes)
         .merge(websocket_route)
         .with_state(state)
+}
+
+pub fn build_router_with_static_dir(state: AppState, static_dir: impl Into<PathBuf>) -> Router {
+    let static_dir = static_dir.into();
+    build_router(state).fallback_service(
+        ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html"))),
+    )
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -545,6 +554,16 @@ impl IntoResponse for ApiError {
 pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, build_router(state)).await?;
+    Ok(())
+}
+
+pub async fn serve_with_static_dir(
+    addr: SocketAddr,
+    state: AppState,
+    static_dir: impl Into<PathBuf>,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, build_router_with_static_dir(state, static_dir)).await?;
     Ok(())
 }
 
