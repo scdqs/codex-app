@@ -187,6 +187,12 @@ impl PairingManager {
         }
     }
 
+    pub fn active_devices(&self) -> Result<Vec<Device>, PairingError> {
+        self.storage
+            .active_devices()
+            .map_err(|_| PairingError::DeviceNotFound)
+    }
+
     fn now(&self) -> u64 {
         (self.now_ms)()
     }
