@@ -90,6 +90,32 @@ impl Storage {
         Ok(())
     }
 
+    pub fn device_by_id(&self, device_id: &str) -> Result<Option<Device>> {
+        let device = self
+            .conn
+            .query_row(
+                r#"
+                SELECT device_id, display_name, secret_hash, created_at, last_seen_at, revoked_at
+                FROM devices
+                WHERE device_id = ?1
+                "#,
+                params![device_id],
+                |row| {
+                    Ok(Device {
+                        device_id: row.get(0)?,
+                        display_name: row.get(1)?,
+                        secret_hash: row.get(2)?,
+                        created_at: row.get(3)?,
+                        last_seen_at: row.get(4)?,
+                        revoked_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        Ok(device)
+    }
+
     pub fn active_devices(&self) -> Result<Vec<Device>> {
         let mut statement = self.conn.prepare(
             r#"
