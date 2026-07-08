@@ -85,6 +85,27 @@ describe("App", () => {
     expect(screen.getByText("No live sessions yet. Use the newest pairing URL from the bridge terminal.")).toBeInTheDocument();
   });
 
+  it("does_not_show_writable_when_desktop_injection_fails", async () => {
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "session-1",
+      sessionExpiresAt: Date.now() + 60_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse({ status: "degraded", connectionState: "inject_failed" }));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Inject failed");
+    });
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("Desktop bridge unavailable");
+    expect(screen.getByLabelText("Connection status")).not.toHaveTextContent("Writable");
+    expect(screen.getByText("No live sessions yet. Use the newest pairing URL from the bridge terminal.")).toBeInTheDocument();
+  });
+
   it("clears_pairing_token_after_successful_pairing", async () => {
     window.history.replaceState(
       null,

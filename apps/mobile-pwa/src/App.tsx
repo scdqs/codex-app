@@ -159,19 +159,7 @@ function App() {
     if (pendingCount > 0) {
       return `${pendingCount} pending`;
     }
-    if (connection.label === "Connection error") {
-      return "Needs new link";
-    }
-    if (connection.label === "Pairing") {
-      return "Pairing";
-    }
-    if (connection.label === "Unpaired") {
-      return "Open pairing link";
-    }
-    if (connection.label === "Read-only") {
-      return "Read-only";
-    }
-    return "Writable";
+    return secondaryStatusText(connection.label);
   }, [connection.label, pendingCount]);
 
   useEffect(() => {
@@ -947,6 +935,26 @@ function connectionErrorText(error: unknown): string {
     return error.message;
   }
   return "Unable to reach bridge";
+}
+
+function secondaryStatusText(label: ConnectionLabel): string {
+  switch (label) {
+    case "Connected":
+    case "Writable":
+      return "Writable";
+    case "Read-only":
+      return "Read-only";
+    case "Inject failed":
+      return "Desktop bridge unavailable";
+    case "Codex not running":
+      return "Start Codex Desktop";
+    case "Connection error":
+      return "Needs new link";
+    case "Pairing":
+      return "Pairing";
+    case "Unpaired":
+      return "Open pairing link";
+  }
 }
 
 function isAuthError(error: unknown): boolean {
