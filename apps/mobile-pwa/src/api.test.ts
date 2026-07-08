@@ -180,6 +180,7 @@ describe("pairing API helpers", () => {
     "api/assets/local-image/asset-1",
     "http:api/assets/local-image/asset-1",
     "/api/assets/local-image/asset-1?download=1",
+    "/api/assets/local-image/asset-1#preview",
   ])("fetchAssetBlob_rejects_traversal_asset_paths_without_fetch", async (src) => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({}));
 
