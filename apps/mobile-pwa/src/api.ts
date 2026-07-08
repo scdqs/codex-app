@@ -46,14 +46,14 @@ export async function completePairing(
   bridgeUrl: string,
   request: CompletePairingRequest,
 ): Promise<SessionResponse> {
-  return postJson<SessionResponse>(bridgeUrl, "/api/pairing/complete", request);
+  return postJson(bridgeUrl, "/api/pairing/complete", request, parseSessionResponse);
 }
 
 export async function refreshSession(
   bridgeUrl: string,
   request: Pick<DeviceSession, "deviceId" | "deviceSecret">,
 ): Promise<SessionResponse> {
-  return postJson<SessionResponse>(bridgeUrl, "/api/session/refresh", request);
+  return postJson(bridgeUrl, "/api/session/refresh", request, parseSessionResponse);
 }
 
 export async function getHealth(bridgeUrl: string, sessionToken?: string): Promise<HealthResponse> {
@@ -85,7 +85,19 @@ export class ApiError extends Error {
   }
 }
 
-async function postJson<T>(bridgeUrl: string, path: string, body: unknown): Promise<T> {
+export class ApiValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ApiValidationError";
+  }
+}
+
+async function postJson<T>(
+  bridgeUrl: string,
+  path: string,
+  body: unknown,
+  parse: (value: unknown) => T,
+): Promise<T> {
   const response = await fetch(apiUrl(bridgeUrl, path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -96,9 +108,31 @@ async function postJson<T>(bridgeUrl: string, path: string, body: unknown): Prom
     throw new ApiError(response.status, `Request failed with ${response.status}`);
   }
 
-  return (await response.json()) as T;
+  return parse(await response.json());
 }
 
 function apiUrl(bridgeUrl: string, path: string): string {
   return new URL(path, bridgeUrl).toString();
+}
+
+function parseSessionResponse(value: unknown): SessionResponse {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiValidationError("Session response must be an object");
+  }
+
+  const response = value as Record<string, unknown>;
+  if (
+    typeof response.deviceId !== "string" ||
+    typeof response.sessionToken !== "string" ||
+    typeof response.sessionExpiresAt !== "number" ||
+    !Number.isFinite(response.sessionExpiresAt)
+  ) {
+    throw new ApiValidationError("Session response is missing required fields");
+  }
+
+  return {
+    deviceId: response.deviceId,
+    sessionToken: response.sessionToken,
+    sessionExpiresAt: response.sessionExpiresAt,
+  };
 }

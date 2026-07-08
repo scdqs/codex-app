@@ -20,6 +20,7 @@ import {
   readPairingPayloadFromUrl,
   refreshSession,
   type HealthResponse,
+  type PairingPayload,
 } from "./api";
 import { createDeviceSession, loadSession, saveSession, type DeviceSession } from "./storage";
 
@@ -113,6 +114,8 @@ interface ConnectionViewState {
   detail?: string;
 }
 
+const pairingAttempts = new Map<string, Promise<DeviceSession>>();
+
 function App() {
   const [selectedThreadId, setSelectedThreadId] = useState(sessions[0].threadId);
   const [draft, setDraft] = useState("");
@@ -135,30 +138,17 @@ function App() {
     async function loadConnection() {
       const pairingPayload = readPairingPayloadFromUrl(window.location.href);
       const savedSession = loadSession();
-      const bridgeUrl = pairingPayload?.bridgeUrl ?? savedSession?.bridgeUrl ?? window.location.origin;
+      const shouldCompletePairing =
+        pairingPayload !== null && (!savedSession || isExpired(savedSession.sessionExpiresAt));
+      const bridgeUrl = shouldCompletePairing
+        ? pairingPayload.bridgeUrl ?? savedSession?.bridgeUrl ?? window.location.origin
+        : savedSession?.bridgeUrl ?? window.location.origin;
 
       try {
-        if (pairingPayload) {
+        if (shouldCompletePairing) {
           setConnection({ label: "Pairing" });
-          const device = createDeviceSession({
-            bridgeUrl,
-            displayName: pairingPayload.displayName,
-            existing: savedSession,
-          });
-          const sessionResponse = await completePairing(bridgeUrl, {
-            pairingToken: pairingPayload.pairingToken,
-            deviceId: device.deviceId,
-            displayName: device.displayName,
-            deviceSecret: device.deviceSecret,
-          });
-          const pairedSession: DeviceSession = {
-            ...device,
-            deviceId: sessionResponse.deviceId,
-            sessionToken: sessionResponse.sessionToken,
-            sessionExpiresAt: sessionResponse.sessionExpiresAt,
-            bridgeUrl,
-          };
-          saveSession(pairedSession);
+          const pairedSession = await completePairingOnce(bridgeUrl, pairingPayload, savedSession);
+          clearPairingParamsFromUrl();
           const health = await getHealth(bridgeUrl, pairedSession.sessionToken);
           if (!cancelled) {
             setConnection(mapHealthToConnection(health));
@@ -190,7 +180,10 @@ function App() {
         }
 
         setConnection({ label: "Connected" });
-        const health = await getHealth(bridgeUrl, savedSession.sessionToken);
+        if (pairingPayload) {
+          clearPairingParamsFromUrl();
+        }
+        const health = await getHealthWithRefresh(bridgeUrl, savedSession);
         if (!cancelled) {
           setConnection(mapHealthToConnection(health));
         }
@@ -469,6 +462,72 @@ function isExpired(expiresAt: number): boolean {
   return expiresAt <= Date.now();
 }
 
+function completePairingOnce(
+  bridgeUrl: string,
+  pairingPayload: PairingPayload,
+  savedSession: DeviceSession | null,
+): Promise<DeviceSession> {
+  const attemptKey = `${bridgeUrl}:${pairingPayload.pairingToken}`;
+  const existingAttempt = pairingAttempts.get(attemptKey);
+  if (existingAttempt) {
+    return existingAttempt;
+  }
+
+  const attempt = completePairingWithDevice(bridgeUrl, pairingPayload, savedSession).finally(() => {
+    pairingAttempts.delete(attemptKey);
+  });
+  pairingAttempts.set(attemptKey, attempt);
+  return attempt;
+}
+
+async function completePairingWithDevice(
+  bridgeUrl: string,
+  pairingPayload: PairingPayload,
+  savedSession: DeviceSession | null,
+): Promise<DeviceSession> {
+  const device = createDeviceSession({
+    bridgeUrl,
+    displayName: pairingPayload.displayName,
+    existing: savedSession,
+  });
+  const sessionResponse = await completePairing(bridgeUrl, {
+    pairingToken: pairingPayload.pairingToken,
+    deviceId: device.deviceId,
+    displayName: device.displayName,
+    deviceSecret: device.deviceSecret,
+  });
+  const pairedSession: DeviceSession = {
+    ...device,
+    deviceId: sessionResponse.deviceId,
+    sessionToken: sessionResponse.sessionToken,
+    sessionExpiresAt: sessionResponse.sessionExpiresAt,
+    bridgeUrl,
+  };
+  saveSession(pairedSession);
+  return pairedSession;
+}
+
+async function getHealthWithRefresh(bridgeUrl: string, session: DeviceSession): Promise<HealthResponse> {
+  try {
+    return await getHealth(bridgeUrl, session.sessionToken);
+  } catch (error) {
+    if (!isAuthError(error)) {
+      throw error;
+    }
+  }
+
+  const refreshed = await refreshSession(bridgeUrl, session);
+  const nextSession = {
+    ...session,
+    deviceId: refreshed.deviceId,
+    sessionToken: refreshed.sessionToken,
+    sessionExpiresAt: refreshed.sessionExpiresAt,
+    bridgeUrl,
+  };
+  saveSession(nextSession);
+  return getHealth(bridgeUrl, nextSession.sessionToken);
+}
+
 function mapHealthToConnection(health: HealthResponse): ConnectionViewState {
   const state = health.connectionState.toLowerCase().replaceAll("-", "_");
   if (state === "codex_not_running" || state === "not_running") {
@@ -490,13 +549,32 @@ function mapHealthToConnection(health: HealthResponse): ConnectionViewState {
 }
 
 function connectionErrorText(error: unknown): string {
-  if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+  if (isAuthError(error)) {
     return "Session revoked or expired";
   }
   if (error instanceof Error) {
     return error.message;
   }
   return "Unable to reach bridge";
+}
+
+function isAuthError(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 401 || error.status === 403);
+}
+
+function clearPairingParamsFromUrl(): void {
+  const url = new URL(window.location.href);
+  let changed = false;
+  for (const param of ["pairingToken", "token", "bridgeUrl", "displayName", "deviceName"]) {
+    if (url.searchParams.has(param)) {
+      url.searchParams.delete(param);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+  }
 }
 
 function connectionClass(label: ConnectionLabel): string {

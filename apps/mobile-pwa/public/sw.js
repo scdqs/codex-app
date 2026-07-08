@@ -17,7 +17,7 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
 
   // API and WebSocket traffic must stay network-first so stale approvals or session events are never replayed.
-  if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/ws/")) {
+  if (url.pathname.startsWith("/api/") || url.pathname === "/ws" || url.pathname.startsWith("/ws/")) {
     return;
   }
 

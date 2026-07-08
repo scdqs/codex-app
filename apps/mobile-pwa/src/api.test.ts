@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { completePairing, readPairingPayloadFromUrl } from "./api";
+import { ApiValidationError, completePairing, connectWebSocket, readPairingPayloadFromUrl } from "./api";
 import { clearSession, loadSession, saveSession } from "./storage";
 
 describe("pairing API helpers", () => {
@@ -7,6 +7,7 @@ describe("pairing API helpers", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     clearSession();
   });
 
@@ -86,5 +87,56 @@ describe("pairing API helpers", () => {
       }),
     );
     expect(loadSession()).toBeNull();
+  });
+
+  it("rejects_malformed_pairing_response", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ deviceId: "device-1" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    await expect(
+      completePairing("http://bridge.local", {
+        pairingToken: "pair-1",
+        deviceId: "device-1",
+        displayName: "Damon Phone",
+        deviceSecret: "secret-1",
+      }),
+    ).rejects.toBeInstanceOf(ApiValidationError);
+    expect(loadSession()).toBeNull();
+  });
+
+  it("connectWebSocket_builds_ws_url_from_http_bridge", () => {
+    const urls: string[] = [];
+    vi.stubGlobal(
+      "WebSocket",
+      class {
+        constructor(url: string) {
+          urls.push(url);
+        }
+      },
+    );
+
+    connectWebSocket("http://bridge.local:4545", "token with spaces");
+
+    expect(urls).toEqual(["ws://bridge.local:4545/ws?token=token+with+spaces"]);
+  });
+
+  it("connectWebSocket_builds_wss_url_from_https_bridge", () => {
+    const urls: string[] = [];
+    vi.stubGlobal(
+      "WebSocket",
+      class {
+        constructor(url: string) {
+          urls.push(url);
+        }
+      },
+    );
+
+    connectWebSocket("https://bridge.local", "session-1");
+
+    expect(urls).toEqual(["wss://bridge.local/ws?token=session-1"]);
   });
 });
