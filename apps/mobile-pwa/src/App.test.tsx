@@ -127,6 +127,58 @@ describe("App", () => {
     });
   });
 
+  it("refreshes_expired_saved_session_instead_of_reusing_stale_pairing_token", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/?pairingToken=stale-token&bridgeUrl=http%3A%2F%2Fstale.local&keep=1",
+    );
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "old-token",
+      sessionExpiresAt: Date.now() - 60_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    const replaceState = vi.spyOn(window.history, "replaceState");
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            deviceId: "device-1",
+            sessionToken: "new-token",
+            sessionExpiresAt: Date.now() + 120_000,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ status: "ok", connectionState: "connected" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Connected");
+    });
+    expect(replaceState).toHaveBeenCalledWith(null, "", "/?keep=1");
+    expect(loadSession()?.sessionToken).toBe("new-token");
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "http://bridge.local/api/session/refresh",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(
+      vi
+        .mocked(globalThis.fetch)
+        .mock.calls.some(([input]) => String(input) === "http://bridge.local/api/pairing/complete"),
+    ).toBe(false);
+  });
+
   it("shares_in_flight_pairing_request_under_strict_mode", async () => {
     window.history.replaceState(null, "", "/?pairingToken=pair-1&bridgeUrl=http%3A%2F%2Fbridge.local");
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {

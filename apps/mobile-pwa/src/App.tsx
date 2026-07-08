@@ -138,10 +138,9 @@ function App() {
     async function loadConnection() {
       const pairingPayload = readPairingPayloadFromUrl(window.location.href);
       const savedSession = loadSession();
-      const shouldCompletePairing =
-        pairingPayload !== null && (!savedSession || isExpired(savedSession.sessionExpiresAt));
+      const shouldCompletePairing = pairingPayload !== null && !savedSession;
       const bridgeUrl = shouldCompletePairing
-        ? pairingPayload.bridgeUrl ?? savedSession?.bridgeUrl ?? window.location.origin
+        ? pairingPayload.bridgeUrl ?? window.location.origin
         : savedSession?.bridgeUrl ?? window.location.origin;
 
       try {
@@ -159,6 +158,10 @@ function App() {
         if (!savedSession) {
           setConnection({ label: "Unpaired" });
           return;
+        }
+
+        if (pairingPayload) {
+          clearPairingParamsFromUrl();
         }
 
         if (isExpired(savedSession.sessionExpiresAt)) {
@@ -180,9 +183,6 @@ function App() {
         }
 
         setConnection({ label: "Connected" });
-        if (pairingPayload) {
-          clearPairingParamsFromUrl();
-        }
         const health = await getHealthWithRefresh(bridgeUrl, savedSession);
         if (!cancelled) {
           setConnection(mapHealthToConnection(health));
