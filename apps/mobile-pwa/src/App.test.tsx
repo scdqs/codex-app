@@ -39,7 +39,7 @@ describe("App", () => {
       deviceSecret: "secret-1",
       displayName: "Damon Phone",
       sessionToken: "expired-token",
-      sessionExpiresAt: "2026-01-01T00:00:00.000Z",
+      sessionExpiresAt: 1_767_225_600_000,
       bridgeUrl: "http://bridge.local",
     });
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(

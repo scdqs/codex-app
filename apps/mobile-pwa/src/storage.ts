@@ -4,10 +4,14 @@ export interface DeviceSession {
   deviceId: string;
   deviceSecret: string;
   displayName: string;
-  sessionToken?: string;
-  sessionExpiresAt?: string;
-  bridgeUrl?: string;
+  sessionToken: string;
+  sessionExpiresAt: number;
+  bridgeUrl: string;
 }
+
+export type DeviceIdentity = Pick<DeviceSession, "deviceId" | "deviceSecret" | "displayName"> & {
+  bridgeUrl?: string;
+};
 
 export function saveSession(session: DeviceSession): void {
   localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(session));
@@ -20,11 +24,11 @@ export function loadSession(): DeviceSession | null {
   }
 
   try {
-    const value = JSON.parse(raw) as Partial<DeviceSession>;
-    if (!value.deviceId || !value.deviceSecret || !value.displayName) {
+    const value = JSON.parse(raw) as unknown;
+    if (!isDeviceSession(value)) {
       return null;
     }
-    return value as DeviceSession;
+    return value;
   } catch {
     return null;
   }
@@ -38,15 +42,30 @@ export function createDeviceSession(input: {
   bridgeUrl?: string;
   displayName?: string;
   existing?: DeviceSession | null;
-}): DeviceSession {
+}): DeviceIdentity {
   return {
     deviceId: input.existing?.deviceId ?? randomId(),
     deviceSecret: input.existing?.deviceSecret ?? randomId(),
     displayName: input.displayName ?? input.existing?.displayName ?? defaultDisplayName(),
-    sessionToken: input.existing?.sessionToken,
-    sessionExpiresAt: input.existing?.sessionExpiresAt,
     bridgeUrl: input.bridgeUrl ?? input.existing?.bridgeUrl,
   };
+}
+
+function isDeviceSession(value: unknown): value is DeviceSession {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const session = value as Record<string, unknown>;
+  return (
+    typeof session.deviceId === "string" &&
+    typeof session.deviceSecret === "string" &&
+    typeof session.displayName === "string" &&
+    typeof session.sessionToken === "string" &&
+    typeof session.sessionExpiresAt === "number" &&
+    Number.isFinite(session.sessionExpiresAt) &&
+    typeof session.bridgeUrl === "string"
+  );
 }
 
 function defaultDisplayName(): string {

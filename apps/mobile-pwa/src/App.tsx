@@ -171,7 +171,7 @@ function App() {
           return;
         }
 
-        if (!savedSession.sessionToken || isExpired(savedSession.sessionExpiresAt)) {
+        if (isExpired(savedSession.sessionExpiresAt)) {
           setConnection({ label: "Pairing", detail: "Refreshing session" });
           const refreshed = await refreshSession(bridgeUrl, savedSession);
           const nextSession = {
@@ -465,12 +465,8 @@ function payloadText(payload: SessionEvent["payload"]) {
   return JSON.stringify(payload);
 }
 
-function isExpired(expiresAt?: string): boolean {
-  if (!expiresAt) {
-    return true;
-  }
-  const parsed = Date.parse(expiresAt);
-  return Number.isNaN(parsed) || parsed <= Date.now();
+function isExpired(expiresAt: number): boolean {
+  return expiresAt <= Date.now();
 }
 
 function mapHealthToConnection(health: HealthResponse): ConnectionViewState {

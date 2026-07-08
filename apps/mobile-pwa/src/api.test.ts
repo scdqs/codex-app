@@ -3,6 +3,8 @@ import { completePairing, readPairingPayloadFromUrl } from "./api";
 import { clearSession, loadSession, saveSession } from "./storage";
 
 describe("pairing API helpers", () => {
+  const expiresAt = 1_783_584_000_000;
+
   afterEach(() => {
     vi.restoreAllMocks();
     clearSession();
@@ -27,7 +29,7 @@ describe("pairing API helpers", () => {
         JSON.stringify({
           deviceId: "device-1",
           sessionToken: "session-1",
-          sessionExpiresAt: "2026-07-09T00:00:00.000Z",
+          sessionExpiresAt: expiresAt,
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       ),
@@ -54,7 +56,35 @@ describe("pairing API helpers", () => {
       deviceSecret: "secret-1",
       displayName: "Damon Phone",
       sessionToken: "session-1",
+      sessionExpiresAt: expiresAt,
       bridgeUrl: "http://bridge.local",
     });
+  });
+
+  it("rejects_incomplete_or_wrongly_typed_stored_sessions", () => {
+    localStorage.setItem(
+      "codex.mobilePwa.deviceSession.v1",
+      JSON.stringify({
+        deviceId: "device-1",
+        deviceSecret: "secret-1",
+        displayName: "Damon Phone",
+        sessionToken: "session-1",
+        sessionExpiresAt: expiresAt,
+      }),
+    );
+    expect(loadSession()).toBeNull();
+
+    localStorage.setItem(
+      "codex.mobilePwa.deviceSession.v1",
+      JSON.stringify({
+        deviceId: "device-1",
+        deviceSecret: "secret-1",
+        displayName: "Damon Phone",
+        sessionToken: "session-1",
+        sessionExpiresAt: "2026-07-09T00:00:00.000Z",
+        bridgeUrl: "http://bridge.local",
+      }),
+    );
+    expect(loadSession()).toBeNull();
   });
 });

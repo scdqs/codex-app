@@ -16,7 +16,7 @@ export interface CompletePairingRequest {
 export interface SessionResponse {
   deviceId: string;
   sessionToken: string;
-  sessionExpiresAt: string;
+  sessionExpiresAt: number;
 }
 
 export interface HealthResponse {
