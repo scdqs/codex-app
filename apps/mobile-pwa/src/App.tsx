@@ -1,4 +1,4 @@
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
   Check,
@@ -13,6 +13,15 @@ import {
   X,
 } from "lucide-react";
 import type { ApprovalKind, ApprovalRequest, SessionEvent, SessionSnapshot } from "./protocol";
+import {
+  ApiError,
+  completePairing,
+  getHealth,
+  readPairingPayloadFromUrl,
+  refreshSession,
+  type HealthResponse,
+} from "./api";
+import { createDeviceSession, loadSession, saveSession, type DeviceSession } from "./storage";
 
 const sessions: SessionSnapshot[] = [
   {
@@ -89,9 +98,25 @@ const events: SessionEvent[] = [
   },
 ];
 
+type ConnectionLabel =
+  | "Unpaired"
+  | "Pairing"
+  | "Connected"
+  | "Codex not running"
+  | "Inject failed"
+  | "Read-only"
+  | "Writable"
+  | "Connection error";
+
+interface ConnectionViewState {
+  label: ConnectionLabel;
+  detail?: string;
+}
+
 function App() {
   const [selectedThreadId, setSelectedThreadId] = useState(sessions[0].threadId);
   const [draft, setDraft] = useState("");
+  const [connection, setConnection] = useState<ConnectionViewState>({ label: "Unpaired" });
   const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? sessions[0];
   const selectedApprovals = approvals.filter((approval) => approval.threadId === selectedSession.threadId);
   const selectedEvents = events.filter((event) => event.threadId === selectedSession.threadId);
@@ -104,6 +129,89 @@ function App() {
     return "Writable";
   }, [pendingCount]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadConnection() {
+      const pairingPayload = readPairingPayloadFromUrl(window.location.href);
+      const savedSession = loadSession();
+      const bridgeUrl = pairingPayload?.bridgeUrl ?? savedSession?.bridgeUrl ?? window.location.origin;
+
+      try {
+        if (pairingPayload) {
+          setConnection({ label: "Pairing" });
+          const device = createDeviceSession({
+            bridgeUrl,
+            displayName: pairingPayload.displayName,
+            existing: savedSession,
+          });
+          const sessionResponse = await completePairing(bridgeUrl, {
+            pairingToken: pairingPayload.pairingToken,
+            deviceId: device.deviceId,
+            displayName: device.displayName,
+            deviceSecret: device.deviceSecret,
+          });
+          const pairedSession: DeviceSession = {
+            ...device,
+            deviceId: sessionResponse.deviceId,
+            sessionToken: sessionResponse.sessionToken,
+            sessionExpiresAt: sessionResponse.sessionExpiresAt,
+            bridgeUrl,
+          };
+          saveSession(pairedSession);
+          const health = await getHealth(bridgeUrl, pairedSession.sessionToken);
+          if (!cancelled) {
+            setConnection(mapHealthToConnection(health));
+          }
+          return;
+        }
+
+        if (!savedSession) {
+          setConnection({ label: "Unpaired" });
+          return;
+        }
+
+        if (!savedSession.sessionToken || isExpired(savedSession.sessionExpiresAt)) {
+          setConnection({ label: "Pairing", detail: "Refreshing session" });
+          const refreshed = await refreshSession(bridgeUrl, savedSession);
+          const nextSession = {
+            ...savedSession,
+            deviceId: refreshed.deviceId,
+            sessionToken: refreshed.sessionToken,
+            sessionExpiresAt: refreshed.sessionExpiresAt,
+            bridgeUrl,
+          };
+          saveSession(nextSession);
+          const health = await getHealth(bridgeUrl, nextSession.sessionToken);
+          if (!cancelled) {
+            setConnection(mapHealthToConnection(health));
+          }
+          return;
+        }
+
+        setConnection({ label: "Connected" });
+        const health = await getHealth(bridgeUrl, savedSession.sessionToken);
+        if (!cancelled) {
+          setConnection(mapHealthToConnection(health));
+        }
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        setConnection({
+          label: "Connection error",
+          detail: connectionErrorText(error),
+        });
+      }
+    }
+
+    void loadConnection();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setDraft("");
@@ -111,7 +219,7 @@ function App() {
 
   return (
     <main className="app-shell" aria-label="Codex mobile workbench">
-      <ConnectionBar statusText={statusText} />
+      <ConnectionBar connection={connection} statusText={statusText} />
 
       <section className="workbench" aria-label="Workbench">
         <ApprovalQueue approvals={approvals} />
@@ -140,18 +248,25 @@ function App() {
   );
 }
 
-function ConnectionBar({ statusText }: { statusText: string }) {
+function ConnectionBar({
+  connection,
+  statusText,
+}: {
+  connection: ConnectionViewState;
+  statusText: string;
+}) {
   return (
     <header className="connection-bar" aria-label="Connection status">
       <div className="connection-primary">
-        <span className="status-dot" aria-hidden="true" />
+        <span className={`status-dot ${connectionClass(connection.label)}`} aria-hidden="true" />
         <div>
           <p className="eyebrow">LAN bridge</p>
           <h1>Codex Mobile</h1>
+          {connection.detail ? <p className="connection-detail">{connection.detail}</p> : null}
         </div>
       </div>
       <div className="connection-meta">
-        <span className="meta-chip">Connected</span>
+        <span className={`meta-chip ${connectionClass(connection.label)}`}>{connection.label}</span>
         <span className="meta-chip muted">{statusText}</span>
       </div>
     </header>
@@ -348,6 +463,59 @@ function payloadText(payload: SessionEvent["payload"]) {
     return typeof value === "string" ? value : JSON.stringify(value);
   }
   return JSON.stringify(payload);
+}
+
+function isExpired(expiresAt?: string): boolean {
+  if (!expiresAt) {
+    return true;
+  }
+  const parsed = Date.parse(expiresAt);
+  return Number.isNaN(parsed) || parsed <= Date.now();
+}
+
+function mapHealthToConnection(health: HealthResponse): ConnectionViewState {
+  const state = health.connectionState.toLowerCase().replaceAll("-", "_");
+  if (state === "codex_not_running" || state === "not_running") {
+    return { label: "Codex not running" };
+  }
+  if (state === "inject_failed" || state === "injection_failed") {
+    return { label: "Inject failed" };
+  }
+  if (state === "read_only" || state === "readonly") {
+    return { label: "Read-only" };
+  }
+  if (state === "writable" || state === "ready") {
+    return { label: "Writable" };
+  }
+  if (state === "connected" || health.status.toLowerCase() === "ok") {
+    return { label: "Connected" };
+  }
+  return { label: "Connection error", detail: health.connectionState };
+}
+
+function connectionErrorText(error: unknown): string {
+  if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+    return "Session revoked or expired";
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return "Unable to reach bridge";
+}
+
+function connectionClass(label: ConnectionLabel): string {
+  switch (label) {
+    case "Connected":
+    case "Writable":
+      return "ok";
+    case "Pairing":
+    case "Read-only":
+      return "warn";
+    case "Unpaired":
+      return "muted";
+    default:
+      return "error";
+  }
 }
 
 export default App;

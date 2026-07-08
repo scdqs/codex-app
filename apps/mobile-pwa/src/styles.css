@@ -100,6 +100,21 @@ button {
   box-shadow: 0 0 0 4px rgb(66 184 155 / 14%);
 }
 
+.status-dot.warn {
+  background: var(--warning);
+  box-shadow: 0 0 0 4px rgb(214 168 79 / 15%);
+}
+
+.status-dot.error {
+  background: var(--danger);
+  box-shadow: 0 0 0 4px rgb(211 93 85 / 15%);
+}
+
+.status-dot.muted {
+  background: var(--text-muted);
+  box-shadow: 0 0 0 4px rgb(154 167 177 / 12%);
+}
+
 .eyebrow {
   margin: 0 0 2px;
   color: var(--text-muted);
@@ -160,6 +175,25 @@ h3 {
   border-color: var(--border-strong);
   background: var(--surface-strong);
   color: var(--text-soft);
+}
+
+.meta-chip.warn {
+  border-color: rgb(214 168 79 / 38%);
+  background: rgb(214 168 79 / 12%);
+  color: #e4c980;
+}
+
+.meta-chip.error {
+  border-color: rgb(211 93 85 / 36%);
+  background: rgb(211 93 85 / 12%);
+  color: #f0aaa5;
+}
+
+.connection-detail {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  line-height: 1.2;
 }
 
 .workbench {
