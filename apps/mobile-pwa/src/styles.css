@@ -557,6 +557,12 @@ h3 {
   box-shadow: 0 0 0 3px rgb(47 143 123 / 18%);
 }
 
+.composer textarea:disabled {
+  cursor: not-allowed;
+  background: var(--surface-strong);
+  color: #69747d;
+}
+
 .composer textarea::placeholder {
   color: #75818b;
 }

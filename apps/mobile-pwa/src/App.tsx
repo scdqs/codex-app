@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import {
   AlertTriangle,
   Check,
@@ -12,19 +12,23 @@ import {
   TerminalSquare,
   X,
 } from "lucide-react";
-import type { ApprovalKind, ApprovalRequest, SessionEvent, SessionSnapshot } from "./protocol";
+import type { ApprovalDecision, ApprovalKind, ApprovalRequest, ServerEnvelope, SessionEvent, SessionSnapshot } from "./protocol";
 import {
   ApiError,
   completePairing,
+  connectWebSocket,
   getHealth,
+  listSessionEvents,
+  listSessions,
   readPairingPayloadFromUrl,
   refreshSession,
+  sendTextMessage,
   type HealthResponse,
   type PairingPayload,
 } from "./api";
 import { createDeviceSession, loadSession, saveSession, type DeviceSession } from "./storage";
 
-const sessions: SessionSnapshot[] = [
+const sampleSessions: SessionSnapshot[] = [
   {
     threadId: "thread-mobile-bridge",
     title: "Mobile bridge MVP",
@@ -55,7 +59,7 @@ const sessions: SessionSnapshot[] = [
   },
 ];
 
-const approvals: ApprovalRequest[] = [
+const sampleApprovals: ApprovalRequest[] = [
   {
     id: "approval-install",
     threadId: "thread-mobile-bridge",
@@ -75,7 +79,7 @@ const approvals: ApprovalRequest[] = [
   },
 ];
 
-const events: SessionEvent[] = [
+const sampleEvents: SessionEvent[] = [
   {
     id: "event-1",
     threadId: "thread-mobile-bridge",
@@ -117,13 +121,22 @@ interface ConnectionViewState {
 const pairingAttempts = new Map<string, Promise<DeviceSession>>();
 
 function App() {
-  const [selectedThreadId, setSelectedThreadId] = useState(sessions[0].threadId);
+  const [selectedThreadId, setSelectedThreadId] = useState(sampleSessions[0].threadId);
   const [draft, setDraft] = useState("");
   const [connection, setConnection] = useState<ConnectionViewState>({ label: "Unpaired" });
+  const [deviceSession, setDeviceSession] = useState<DeviceSession | null>(null);
+  const [liveSessions, setLiveSessions] = useState<SessionSnapshot[] | null>(null);
+  const [eventsByThread, setEventsByThread] = useState<Record<string, SessionEvent[]>>({});
+  const [approvals, setApprovals] = useState<ApprovalRequest[]>(sampleApprovals);
+  const [sending, setSending] = useState(false);
+  const sessions = liveSessions ?? sampleSessions;
   const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? sessions[0];
   const selectedApprovals = approvals.filter((approval) => approval.threadId === selectedSession.threadId);
-  const selectedEvents = events.filter((event) => event.threadId === selectedSession.threadId);
+  const selectedEvents =
+    eventsByThread[selectedSession.threadId] ??
+    (liveSessions ? [] : sampleEvents.filter((event) => event.threadId === selectedSession.threadId));
   const pendingCount = approvals.length;
+  const canSend = (connection.label === "Connected" || connection.label === "Writable") && Boolean(deviceSession) && Boolean(selectedSession);
 
   const statusText = useMemo(() => {
     if (pendingCount > 0) {
@@ -151,12 +164,14 @@ function App() {
           const health = await getHealth(bridgeUrl, pairedSession.sessionToken);
           if (!cancelled) {
             setConnection(mapHealthToConnection(health));
+            setDeviceSession(pairedSession);
           }
           return;
         }
 
         if (!savedSession) {
           setConnection({ label: "Unpaired" });
+          setDeviceSession(null);
           return;
         }
 
@@ -178,14 +193,16 @@ function App() {
           const health = await getHealth(bridgeUrl, nextSession.sessionToken);
           if (!cancelled) {
             setConnection(mapHealthToConnection(health));
+            setDeviceSession(nextSession);
           }
           return;
         }
 
         setConnection({ label: "Connected" });
-        const health = await getHealthWithRefresh(bridgeUrl, savedSession);
+        const { health, session } = await getHealthWithRefresh(bridgeUrl, savedSession);
         if (!cancelled) {
           setConnection(mapHealthToConnection(health));
+          setDeviceSession(session);
         }
       } catch (error) {
         if (cancelled) {
@@ -205,9 +222,127 @@ function App() {
     };
   }, []);
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  useEffect(() => {
+    if (!deviceSession || !isSessionDataEnabled(connection.label)) {
+      return;
+    }
+
+    let cancelled = false;
+    const activeSession = deviceSession;
+
+    async function loadSessionList() {
+      try {
+        const items = await listSessions(activeSession.bridgeUrl, activeSession.sessionToken);
+        if (cancelled) {
+          return;
+        }
+        const sorted = sortSessions(items);
+        setLiveSessions(sorted);
+        setSelectedThreadId((current) => {
+          if (sorted.some((session) => session.threadId === current)) {
+            return current;
+          }
+          return sorted[0]?.threadId ?? current;
+        });
+      } catch (error) {
+        if (!cancelled) {
+          setConnection({
+            label: "Connection error",
+            detail: connectionErrorText(error),
+          });
+        }
+      }
+    }
+
+    void loadSessionList();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connection.label, deviceSession]);
+
+  useEffect(() => {
+    if (!deviceSession || !liveSessions || !selectedSession) {
+      return;
+    }
+
+    let cancelled = false;
+    const activeSession = deviceSession;
+    const threadId = selectedSession.threadId;
+
+    async function loadEvents() {
+      try {
+        const items = await listSessionEvents(activeSession.bridgeUrl, activeSession.sessionToken, threadId);
+        if (!cancelled) {
+          setEventsByThread((current) => ({ ...current, [threadId]: mergeSessionEvents(items) }));
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setConnection({
+            label: "Connection error",
+            detail: connectionErrorText(error),
+          });
+        }
+      }
+    }
+
+    void loadEvents();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceSession, liveSessions, selectedSession]);
+
+  useEffect(() => {
+    if (!deviceSession || typeof WebSocket === "undefined") {
+      return;
+    }
+
+    const ws = connectWebSocket(deviceSession.bridgeUrl, deviceSession.sessionToken);
+    ws.onmessage = (message) => {
+      const envelope = parseServerEnvelope(message.data);
+      if (!envelope) {
+        return;
+      }
+      handleServerEnvelope(envelope, setLiveSessions, setEventsByThread, setApprovals);
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, [deviceSession]);
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const activeSession = deviceSession;
+    if (!canSend || sending || !draft.trim() || !activeSession) {
+      return;
+    }
+
+    const text = draft.trim();
+    const threadId = selectedSession.threadId;
+    setSending(true);
+    setEventsByThread((current) => ({
+      ...current,
+      [threadId]: [
+        ...(current[threadId] ?? []),
+        {
+          id: `local-${Date.now()}`,
+          threadId,
+          type: "message",
+          payload: { role: "user", text },
+          createdAt: Date.now(),
+        },
+      ],
+    }));
     setDraft("");
+    try {
+      await sendTextMessage(activeSession.bridgeUrl, activeSession.sessionToken, threadId, text);
+    } catch (error) {
+      setConnection({ label: "Connection error", detail: connectionErrorText(error) });
+    } finally {
+      setSending(false);
+    }
   }
 
   return (
@@ -234,6 +369,7 @@ function App() {
       <Composer
         draft={draft}
         selectedTitle={selectedSession.title}
+        disabled={!canSend || sending}
         onDraftChange={setDraft}
         onSubmit={handleSubmit}
       />
@@ -409,11 +545,13 @@ function SessionDetail({
 }
 
 function Composer({
+  disabled,
   draft,
   onDraftChange,
   onSubmit,
   selectedTitle,
 }: {
+  disabled: boolean;
   draft: string;
   onDraftChange: (value: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
@@ -430,9 +568,10 @@ function Composer({
         onChange={(event) => onDraftChange(event.target.value)}
         placeholder={`Message ${selectedTitle}`}
         rows={1}
+        disabled={disabled}
         value={draft}
       />
-      <button className="send-button" type="submit" aria-label="Send message" disabled={!draft.trim()}>
+      <button className="send-button" type="submit" aria-label="Send message" disabled={disabled || !draft.trim()}>
         <Send size={17} />
       </button>
     </form>
@@ -456,6 +595,74 @@ function payloadText(payload: SessionEvent["payload"]) {
     return typeof value === "string" ? value : JSON.stringify(value);
   }
   return JSON.stringify(payload);
+}
+
+export function mergeSessionEvents(events: SessionEvent[]): SessionEvent[] {
+  return events.reduce<SessionEvent[]>((merged, event) => appendOrMergeSessionEvent(merged, event), []);
+}
+
+export function appendOrMergeSessionEvent(events: SessionEvent[], event: SessionEvent): SessionEvent[] {
+  if (event.type !== "message_delta") {
+    return [...events, event];
+  }
+
+  const delta = deltaText(event.payload);
+  if (!delta) {
+    return [...events, event];
+  }
+
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const candidate = events[index];
+    if (candidate.threadId !== event.threadId) {
+      continue;
+    }
+    if (candidate.type !== "message_delta" && !isAssistantMessage(candidate)) {
+      continue;
+    }
+
+    const nextEvents = [...events];
+    nextEvents[index] = {
+      ...candidate,
+      payload: {
+        role: "assistant",
+        text: `${payloadText(candidate.payload)}${delta}`,
+      },
+      createdAt: event.createdAt,
+    };
+    return nextEvents;
+  }
+
+  return [
+    ...events,
+    {
+      ...event,
+      payload: { role: "assistant", text: delta },
+    },
+  ];
+}
+
+function deltaText(payload: SessionEvent["payload"]): string {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return "";
+  }
+  if (typeof payload.text === "string") {
+    return payload.text;
+  }
+  if (typeof payload.delta === "string") {
+    return payload.delta;
+  }
+  return "";
+}
+
+function isAssistantMessage(event: SessionEvent): boolean {
+  const payload = event.payload;
+  return (
+    event.type === "message" &&
+    payload !== null &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    payload.role === "assistant"
+  );
 }
 
 function isExpired(expiresAt: number): boolean {
@@ -507,9 +714,12 @@ async function completePairingWithDevice(
   return pairedSession;
 }
 
-async function getHealthWithRefresh(bridgeUrl: string, session: DeviceSession): Promise<HealthResponse> {
+async function getHealthWithRefresh(
+  bridgeUrl: string,
+  session: DeviceSession,
+): Promise<{ health: HealthResponse; session: DeviceSession }> {
   try {
-    return await getHealth(bridgeUrl, session.sessionToken);
+    return { health: await getHealth(bridgeUrl, session.sessionToken), session };
   } catch (error) {
     if (!isAuthError(error)) {
       throw error;
@@ -525,7 +735,7 @@ async function getHealthWithRefresh(bridgeUrl: string, session: DeviceSession): 
     bridgeUrl,
   };
   saveSession(nextSession);
-  return getHealth(bridgeUrl, nextSession.sessionToken);
+  return { health: await getHealth(bridgeUrl, nextSession.sessionToken), session: nextSession };
 }
 
 function mapHealthToConnection(health: HealthResponse): ConnectionViewState {
@@ -560,6 +770,80 @@ function connectionErrorText(error: unknown): string {
 
 function isAuthError(error: unknown): boolean {
   return error instanceof ApiError && (error.status === 401 || error.status === 403);
+}
+
+function isSessionDataEnabled(label: ConnectionLabel): boolean {
+  return label === "Connected" || label === "Writable" || label === "Read-only";
+}
+
+function sortSessions(items: SessionSnapshot[]): SessionSnapshot[] {
+  return [...items].sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function parseServerEnvelope(data: unknown): ServerEnvelope | null {
+  if (typeof data !== "string") {
+    return null;
+  }
+  try {
+    const value = JSON.parse(data) as ServerEnvelope;
+    return value && typeof value === "object" && "type" in value ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function handleServerEnvelope(
+  envelope: ServerEnvelope,
+  setLiveSessions: Dispatch<SetStateAction<SessionSnapshot[] | null>>,
+  setEventsByThread: Dispatch<SetStateAction<Record<string, SessionEvent[]>>>,
+  setApprovals: Dispatch<SetStateAction<ApprovalRequest[]>>,
+): void {
+  switch (envelope.type) {
+    case "session_snapshot":
+      setLiveSessions((current) => sortSessions(upsertSession(current ?? [], envelope.payload)));
+      break;
+    case "session_event":
+      setEventsByThread((current) => ({
+        ...current,
+        [envelope.payload.threadId]: appendOrMergeSessionEvent(
+          current[envelope.payload.threadId] ?? [],
+          envelope.payload,
+        ),
+      }));
+      break;
+    case "approval_request":
+      setApprovals((current) => upsertApproval(current, envelope.payload));
+      break;
+    case "approval_resolved":
+      setApprovals((current) => removeResolvedApproval(current, envelope.payload));
+      break;
+    case "error":
+      break;
+  }
+}
+
+function upsertSession(items: SessionSnapshot[], next: SessionSnapshot): SessionSnapshot[] {
+  const index = items.findIndex((item) => item.threadId === next.threadId);
+  if (index === -1) {
+    return [...items, next];
+  }
+  const updated = [...items];
+  updated[index] = next;
+  return updated;
+}
+
+function upsertApproval(items: ApprovalRequest[], next: ApprovalRequest): ApprovalRequest[] {
+  const index = items.findIndex((item) => item.id === next.id);
+  if (index === -1) {
+    return [...items, next];
+  }
+  const updated = [...items];
+  updated[index] = next;
+  return updated;
+}
+
+function removeResolvedApproval(items: ApprovalRequest[], decision: ApprovalDecision): ApprovalRequest[] {
+  return items.filter((item) => item.id !== decision.approvalId);
 }
 
 function clearPairingParamsFromUrl(): void {

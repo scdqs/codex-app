@@ -1,13 +1,19 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import App from "./App";
+import App, { appendOrMergeSessionEvent } from "./App";
+import type { SessionEvent, SessionSnapshot } from "./protocol";
 import { clearSession, loadSession, saveSession } from "./storage";
 
 describe("App", () => {
+  beforeEach(() => {
+    vi.stubGlobal("WebSocket", MockWebSocket);
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     clearSession();
     window.history.replaceState(null, "", "/");
   });
@@ -167,7 +173,7 @@ describe("App", () => {
     });
     expect(replaceState).toHaveBeenCalledWith(null, "", "/?keep=1");
     expect(loadSession()?.sessionToken).toBe("new-token");
-    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(3);
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "http://bridge.local/api/session/refresh",
       expect.objectContaining({ method: "POST" }),
@@ -249,7 +255,7 @@ describe("App", () => {
       expect(screen.getByLabelText("Connection status")).toHaveTextContent("Writable");
     });
     expect(loadSession()?.sessionToken).toBe("new-token");
-    expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(4);
   });
 
   it("rejects_malformed_pairing_response_without_saving_session", async () => {
@@ -268,4 +274,179 @@ describe("App", () => {
     });
     expect(loadSession()).toBeNull();
   });
+
+  it("renders_session_list_and_selects_thread", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-a", title: "Implement bridge UI", preview: "First thread" }),
+          sessionSnapshot({ threadId: "thread-b", title: "Review sidecar API", preview: "Second thread" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-a/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-a",
+            threadId: "thread-a",
+            payload: { role: "assistant", text: "Loaded first thread." },
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-b/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-b",
+            threadId: "thread-b",
+            payload: { role: "assistant", text: "Loaded second thread." },
+          }),
+        ]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Implement bridge UI/ })).toBeInTheDocument();
+    });
+    expect(await screen.findByText("Loaded first thread.")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /Review sidecar API/ }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Review sidecar API" })).toBeInTheDocument();
+    });
+    expect(screen.getByText("Loaded second thread.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Review sidecar API/ })).toHaveAttribute("aria-current", "true");
+  });
+
+  it("merges_message_delta_into_current_assistant_message", () => {
+    const base: SessionEvent[] = [
+      sessionEvent({
+        id: "assistant-1",
+        threadId: "thread-a",
+        payload: { role: "assistant", text: "Hel" },
+      }),
+    ];
+
+    const merged = appendOrMergeSessionEvent(
+      appendOrMergeSessionEvent(
+        base,
+        sessionEvent({
+          id: "delta-1",
+          threadId: "thread-a",
+          type: "message_delta",
+          payload: { delta: "lo" },
+        }),
+      ),
+      sessionEvent({
+        id: "delta-2",
+        threadId: "thread-a",
+        type: "message_delta",
+        payload: { text: "!" },
+      }),
+    );
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].payload).toEqual({ role: "assistant", text: "Hello!" });
+  });
+
+  it("send_text_posts_to_selected_thread", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-send", title: "Reply target", preview: "Waiting" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-send/events") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-send/messages" && init?.method === "POST") {
+        return jsonResponse({ accepted: true });
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const input = await screen.findByPlaceholderText("Message Reply target");
+    await user.type(input, "continue from phone");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(globalThis.fetch).toHaveBeenCalledWith(
+        "http://bridge.local/api/sessions/thread-send/messages",
+        expect.objectContaining({
+          method: "POST",
+          headers: {
+            Authorization: "Bearer session-1",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ text: "continue from phone" }),
+        }),
+      );
+    });
+    expect(input).toHaveValue("");
+  });
 });
+
+function saveActiveSession() {
+  saveSession({
+    deviceId: "device-1",
+    deviceSecret: "secret-1",
+    displayName: "Damon Phone",
+    sessionToken: "session-1",
+    sessionExpiresAt: Date.now() + 60_000,
+    bridgeUrl: "http://bridge.local",
+  });
+}
+
+function jsonResponse(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function sessionSnapshot(overrides: Partial<SessionSnapshot> = {}): SessionSnapshot {
+  return {
+    threadId: "thread-a",
+    title: "Thread A",
+    preview: "Preview",
+    updatedAt: 1_783_515_380_000,
+    status: "idle",
+    pendingApprovalIds: [],
+    ...overrides,
+  };
+}
+
+function sessionEvent(overrides: Partial<SessionEvent> = {}): SessionEvent {
+  return {
+    id: "event-1",
+    threadId: "thread-a",
+    type: "message",
+    payload: { role: "assistant", text: "Hello" },
+    createdAt: 1_783_515_380_000,
+    ...overrides,
+  };
+}
+
+class MockWebSocket {
+  onmessage: ((message: MessageEvent) => void) | null = null;
+
+  constructor(readonly url: string) {}
+
+  close() {}
+}
