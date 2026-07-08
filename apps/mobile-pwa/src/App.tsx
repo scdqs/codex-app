@@ -130,11 +130,15 @@ function App() {
   const [approvals, setApprovals] = useState<ApprovalRequest[]>(sampleApprovals);
   const [sending, setSending] = useState(false);
   const sessions = liveSessions ?? sampleSessions;
-  const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? sessions[0];
-  const selectedApprovals = approvals.filter((approval) => approval.threadId === selectedSession.threadId);
+  const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? null;
+  const selectedApprovals = selectedSession
+    ? approvals.filter((approval) => approval.threadId === selectedSession.threadId)
+    : [];
   const selectedEvents =
-    eventsByThread[selectedSession.threadId] ??
-    (liveSessions ? [] : sampleEvents.filter((event) => event.threadId === selectedSession.threadId));
+    selectedSession
+      ? eventsByThread[selectedSession.threadId] ??
+        (liveSessions ? [] : sampleEvents.filter((event) => event.threadId === selectedSession.threadId))
+      : [];
   const pendingCount = approvals.length;
   const canSend = (connection.label === "Connected" || connection.label === "Writable") && Boolean(deviceSession) && Boolean(selectedSession);
 
@@ -242,7 +246,7 @@ function App() {
           if (sorted.some((session) => session.threadId === current)) {
             return current;
           }
-          return sorted[0]?.threadId ?? current;
+          return sorted[0]?.threadId ?? "";
         });
       } catch (error) {
         if (!cancelled) {
@@ -315,7 +319,7 @@ function App() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const activeSession = deviceSession;
-    if (!canSend || sending || !draft.trim() || !activeSession) {
+    if (!canSend || sending || !draft.trim() || !activeSession || !selectedSession) {
       return;
     }
 
@@ -355,7 +359,7 @@ function App() {
         <section className="session-grid" aria-label="Sessions and detail">
           <SessionList
             sessions={sessions}
-            selectedThreadId={selectedSession.threadId}
+            selectedThreadId={selectedSession?.threadId ?? ""}
             onSelect={setSelectedThreadId}
           />
           <SessionDetail
@@ -368,7 +372,7 @@ function App() {
 
       <Composer
         draft={draft}
-        selectedTitle={selectedSession.title}
+        selectedTitle={selectedSession?.title ?? "No session selected"}
         disabled={!canSend || sending}
         onDraftChange={setDraft}
         onSubmit={handleSubmit}
@@ -497,8 +501,24 @@ function SessionDetail({
 }: {
   approvals: ApprovalRequest[];
   events: SessionEvent[];
-  session: SessionSnapshot;
+  session: SessionSnapshot | null;
 }) {
+  if (!session) {
+    return (
+      <section className="session-detail empty-session-detail" aria-labelledby="session-detail-heading">
+        <div className="detail-header">
+          <div>
+            <p className="eyebrow">Selected thread</p>
+            <h2 id="session-detail-heading">No sessions available</h2>
+          </div>
+        </div>
+        <div className="empty-state" role="status">
+          Pair with an active Codex bridge session to view thread events.
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section className="session-detail" aria-labelledby="session-detail-heading">
       <div className="detail-header">
@@ -611,17 +631,14 @@ export function appendOrMergeSessionEvent(events: SessionEvent[], event: Session
     return [...events, event];
   }
 
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const candidate = events[index];
-    if (candidate.threadId !== event.threadId) {
-      continue;
-    }
-    if (candidate.type !== "message_delta" && !isAssistantMessage(candidate)) {
-      continue;
-    }
-
+  const candidate = events.at(-1);
+  if (
+    candidate &&
+    candidate.threadId === event.threadId &&
+    (candidate.type === "message_delta" || isAssistantMessage(candidate))
+  ) {
     const nextEvents = [...events];
-    nextEvents[index] = {
+    nextEvents[nextEvents.length - 1] = {
       ...candidate,
       payload: {
         role: "assistant",

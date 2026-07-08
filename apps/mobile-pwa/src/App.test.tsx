@@ -357,6 +357,33 @@ describe("App", () => {
     expect(merged[0].payload).toEqual({ role: "assistant", text: "Hello!" });
   });
 
+  it("starts_new_delta_tail_after_intervening_user_message", () => {
+    const merged = appendOrMergeSessionEvent(
+      [
+        sessionEvent({
+          id: "assistant-1",
+          threadId: "thread-a",
+          payload: { role: "assistant", text: "Old assistant" },
+        }),
+        sessionEvent({
+          id: "user-1",
+          threadId: "thread-a",
+          payload: { role: "user", text: "New prompt" },
+        }),
+      ],
+      sessionEvent({
+        id: "delta-1",
+        threadId: "thread-a",
+        type: "message_delta",
+        payload: { delta: "Fresh answer" },
+      }),
+    );
+
+    expect(merged).toHaveLength(3);
+    expect(merged[0].payload).toEqual({ role: "assistant", text: "Old assistant" });
+    expect(merged[2].payload).toEqual({ role: "assistant", text: "Fresh answer" });
+  });
+
   it("send_text_posts_to_selected_thread", async () => {
     const user = userEvent.setup();
     saveActiveSession();
@@ -399,6 +426,31 @@ describe("App", () => {
       );
     });
     expect(input).toHaveValue("");
+  });
+
+  it("renders_empty_state_and_disables_composer_when_sessions_are_empty", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("No sessions available")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Message No session selected")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    expect(
+      vi
+        .mocked(globalThis.fetch)
+        .mock.calls.some(([input]) => String(input).includes("/events")),
+    ).toBe(false);
   });
 });
 
