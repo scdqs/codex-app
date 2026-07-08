@@ -2,6 +2,7 @@ use std::{
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::PathBuf,
+    process::Command,
 };
 
 use anyhow::Context;
@@ -77,17 +78,41 @@ async fn main() -> anyhow::Result<()> {
 
 fn bridge_url_for_bind_addr(bind_addr: SocketAddr) -> String {
     let ip = if bind_addr.ip().is_unspecified() {
-        lan_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        macos_wifi_ip()
+            .or_else(lan_ip)
+            .filter(|ip| is_phone_reachable_ip(*ip))
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
     } else {
         bind_addr.ip()
     };
     format!("http://{}:{}", host_for_url(ip), bind_addr.port())
 }
 
+fn macos_wifi_ip() -> Option<IpAddr> {
+    let output = Command::new("ipconfig")
+        .args(["getifaddr", "en0"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.trim().parse().ok()
+}
+
 fn lan_ip() -> Option<IpAddr> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
     Some(socket.local_addr().ok()?.ip())
+}
+
+fn is_phone_reachable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_loopback() && !ip.is_link_local() && !matches!(ip.octets(), [198, 18 | 19, _, _])
+        }
+        IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+    }
 }
 
 fn host_for_url(ip: IpAddr) -> String {
