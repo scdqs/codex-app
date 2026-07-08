@@ -26,6 +26,7 @@ import type {
   ApprovalKind,
   ApprovalRequest,
   DecisionKind,
+  ImageAttachment,
   ServerEnvelope,
   SessionEvent,
   SessionSnapshot,
@@ -35,6 +36,7 @@ import {
   completePairing,
   connectWebSocket,
   decideApproval,
+  fetchAssetBlob,
   getHealth,
   listSessionEvents,
   listSessions,
@@ -446,6 +448,7 @@ function App() {
             onSelect={setSelectedThreadId}
           />
           <SessionDetail
+            assetSession={deviceSession}
             approvals={selectedApprovals}
             events={selectedEvents}
             session={selectedSession}
@@ -607,10 +610,12 @@ function SessionList({
 }
 
 function SessionDetail({
+  assetSession,
   approvals: sessionApprovals,
   events: sessionEvents,
   session,
 }: {
+  assetSession: DeviceSession | null;
   approvals: ApprovalRequest[];
   events: SessionEvent[];
   session: SessionSnapshot | null;
@@ -705,19 +710,105 @@ function SessionDetail({
         onScroll={handleEventStreamScroll}
       >
         {sessionEvents.map((event) => (
-          <article className="event-row" key={event.id}>
-            <span className="event-icon" aria-hidden="true">
-              {event.type === "tool_call" ? <TerminalSquare size={14} /> : <Clock3 size={14} />}
-            </span>
-            <div>
-              <p>{event.type.replace("_", " ")}</p>
-              <span>{payloadText(event.payload)}</span>
-            </div>
-          </article>
+          <EventRow assetSession={assetSession} event={event} key={event.id} />
         ))}
       </div>
     </section>
   );
+}
+
+function EventRow({
+  assetSession,
+  event,
+}: {
+  assetSession: DeviceSession | null;
+  event: SessionEvent;
+}) {
+  const attachments = payloadImageAttachments(event.payload);
+
+  return (
+    <article className="event-row">
+      <span className="event-icon" aria-hidden="true">
+        {event.type === "tool_call" ? <TerminalSquare size={14} /> : <Clock3 size={14} />}
+      </span>
+      <div className="event-content">
+        <p>{event.type.replace("_", " ")}</p>
+        <span>{payloadText(event.payload)}</span>
+        {attachments.length > 0 ? (
+          <div className="attachment-list">
+            {attachments.map((attachment, index) => (
+              <AttachmentImage
+                assetSession={assetSession}
+                attachment={attachment}
+                key={`${attachment.src}:${attachment.name}:${index}`}
+              />
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </article>
+  );
+}
+
+function AttachmentImage({
+  assetSession,
+  attachment,
+}: {
+  assetSession: DeviceSession | null;
+  attachment: ImageAttachment;
+}) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    let createdObjectUrl: string | null = null;
+
+    setObjectUrl(null);
+    setFailed(false);
+
+    const activeSession = assetSession;
+    if (!activeSession) {
+      setFailed(true);
+      return;
+    }
+    const bridgeUrl = activeSession.bridgeUrl;
+    const sessionToken = activeSession.sessionToken;
+
+    async function loadAttachment() {
+      try {
+        const blob = await fetchAssetBlob(bridgeUrl, sessionToken, attachment.src);
+        if (cancelled) {
+          return;
+        }
+        createdObjectUrl = URL.createObjectURL(blob);
+        setObjectUrl(createdObjectUrl);
+      } catch {
+        if (!cancelled) {
+          setFailed(true);
+        }
+      }
+    }
+
+    void loadAttachment();
+
+    return () => {
+      cancelled = true;
+      if (createdObjectUrl) {
+        URL.revokeObjectURL(createdObjectUrl);
+      }
+    };
+  }, [assetSession, attachment.src]);
+
+  if (failed) {
+    return <span className="attachment-error">Image unavailable: {attachment.name}</span>;
+  }
+
+  if (!objectUrl) {
+    return <span className="attachment-loading">Loading image: {attachment.name}</span>;
+  }
+
+  return <img className="attachment-image" src={objectUrl} alt={attachment.name} />;
 }
 
 function Composer({
@@ -771,6 +862,38 @@ function payloadText(payload: SessionEvent["payload"]) {
     return typeof value === "string" ? value : JSON.stringify(value);
   }
   return JSON.stringify(payload);
+}
+
+function payloadImageAttachments(payload: SessionEvent["payload"]): ImageAttachment[] {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return [];
+  }
+
+  const attachments = payload.attachments;
+  if (!Array.isArray(attachments)) {
+    return [];
+  }
+
+  const images: ImageAttachment[] = [];
+  for (const attachment of attachments as unknown[]) {
+    if (isImageAttachment(attachment)) {
+      images.push(attachment);
+    }
+  }
+  return images;
+}
+
+function isImageAttachment(value: unknown): value is ImageAttachment {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const attachment = value as Record<string, unknown>;
+  return (
+    attachment.type === "image" &&
+    typeof attachment.src === "string" &&
+    typeof attachment.name === "string"
+  );
 }
 
 export function mergeSessionEvents(events: SessionEvent[]): SessionEvent[] {

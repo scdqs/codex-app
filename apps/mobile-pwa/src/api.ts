@@ -100,6 +100,27 @@ export async function listSessionEvents(
   return parseSessionEvents(await response.json());
 }
 
+export async function fetchAssetBlob(
+  bridgeUrl: string,
+  sessionToken: string,
+  src: string,
+): Promise<Blob> {
+  const response = await fetch(apiUrl(bridgeUrl, src), {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status, `Asset request failed with ${response.status}`);
+  }
+
+  const contentType = response.headers.get("Content-Type") || "";
+  if (!contentType.startsWith("image/")) {
+    throw new ApiError(response.status, "Asset response is not an image");
+  }
+
+  return response.blob();
+}
+
 export async function sendTextMessage(
   bridgeUrl: string,
   sessionToken: string,

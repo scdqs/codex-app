@@ -447,6 +447,92 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /Review sidecar API/ })).toHaveAttribute("aria-current", "true");
   });
 
+  it("renders_image_attachments_with_authenticated_asset_fetch", async () => {
+    stubObjectUrls();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-image", title: "Image thread", preview: "Attachment" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-image/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-image",
+            threadId: "thread-image",
+            payload: {
+              role: "user",
+              text: "see attached",
+              attachments: [
+                { type: "image", src: "/api/assets/local-image/asset-1", name: "codex-clipboard.png" },
+              ],
+            },
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/assets/local-image/asset-1") {
+        return new Response(new Blob(["png"], { type: "image/png" }), {
+          status: 200,
+          headers: { "Content-Type": "image/png" },
+        });
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("see attached")).toBeInTheDocument();
+    expect(await screen.findByRole("img", { name: "codex-clipboard.png" })).toHaveAttribute("src", "blob:codex-image");
+    expect(globalThis.fetch).toHaveBeenCalledWith("http://bridge.local/api/assets/local-image/asset-1", {
+      headers: { Authorization: "Bearer session-1" },
+    });
+  });
+
+  it("shows_attachment_failure_when_image_proxy_rejects_asset", async () => {
+    stubObjectUrls();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-image", title: "Image thread", preview: "Attachment" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-image/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-image",
+            threadId: "thread-image",
+            payload: {
+              role: "user",
+              text: "see attached",
+              attachments: [
+                { type: "image", src: "/api/assets/local-image/missing", name: "missing.png" },
+              ],
+            },
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/assets/local-image/missing") {
+        return jsonResponse({ error: "asset not found" }, 404);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("see attached")).toBeInTheDocument();
+    expect(await screen.findByText("Image unavailable: missing.png")).toBeInTheDocument();
+  });
+
   it("merges_message_delta_into_current_assistant_message", () => {
     const base: SessionEvent[] = [
       sessionEvent({
@@ -1100,6 +1186,17 @@ function saveActiveSession() {
     sessionToken: "session-1",
     sessionExpiresAt: Date.now() + 60_000,
     bridgeUrl: "http://bridge.local",
+  });
+}
+
+function stubObjectUrls() {
+  Object.defineProperty(URL, "createObjectURL", {
+    configurable: true,
+    value: vi.fn(() => "blob:codex-image"),
+  });
+  Object.defineProperty(URL, "revokeObjectURL", {
+    configurable: true,
+    value: vi.fn(),
   });
 }
 

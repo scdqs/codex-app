@@ -42,6 +42,19 @@ export interface SessionEvent {
   createdAt: number;
 }
 
+export interface ImageAttachment {
+  type: "image";
+  src: string;
+  name: string;
+}
+
+export interface MessagePayload {
+  role?: string;
+  text?: string;
+  pending?: boolean;
+  attachments?: ImageAttachment[];
+}
+
 export type ApprovalKind = "command" | "file_edit" | "network" | "mcp" | "unknown";
 
 export interface ApprovalRequest {

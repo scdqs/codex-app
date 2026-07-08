@@ -560,6 +560,39 @@ h3 {
   overflow-wrap: anywhere;
 }
 
+.event-content {
+  min-width: 0;
+}
+
+.attachment-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.attachment-image {
+  width: min(220px, 100%);
+  max-height: 180px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  object-fit: contain;
+}
+
+.attachment-loading,
+.attachment-error {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-subtle);
+  color: var(--text-muted);
+  font-size: 0.76rem;
+}
+
 .composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
