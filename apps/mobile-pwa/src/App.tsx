@@ -127,9 +127,10 @@ function App() {
   const [deviceSession, setDeviceSession] = useState<DeviceSession | null>(null);
   const [liveSessions, setLiveSessions] = useState<SessionSnapshot[] | null>(null);
   const [eventsByThread, setEventsByThread] = useState<Record<string, SessionEvent[]>>({});
-  const [approvals, setApprovals] = useState<ApprovalRequest[]>(sampleApprovals);
+  const [liveApprovals, setLiveApprovals] = useState<ApprovalRequest[]>([]);
   const [sending, setSending] = useState(false);
   const sessions = liveSessions ?? sampleSessions;
+  const approvals = liveSessions === null ? sampleApprovals : liveApprovals;
   const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? null;
   const selectedApprovals = selectedSession
     ? approvals.filter((approval) => approval.threadId === selectedSession.threadId)
@@ -278,7 +279,10 @@ function App() {
       try {
         const items = await listSessionEvents(activeSession.bridgeUrl, activeSession.sessionToken, threadId);
         if (!cancelled) {
-          setEventsByThread((current) => ({ ...current, [threadId]: mergeSessionEvents(items) }));
+          setEventsByThread((current) => ({
+            ...current,
+            [threadId]: mergeSessionEvents([...(current[threadId] ?? []), ...items]),
+          }));
         }
       } catch (error) {
         if (!cancelled) {
@@ -298,7 +302,7 @@ function App() {
   }, [deviceSession, liveSessions, selectedSession]);
 
   useEffect(() => {
-    if (!deviceSession || typeof WebSocket === "undefined") {
+    if (!deviceSession || !isSessionDataEnabled(connection.label) || typeof WebSocket === "undefined") {
       return;
     }
 
@@ -308,13 +312,13 @@ function App() {
       if (!envelope) {
         return;
       }
-      handleServerEnvelope(envelope, setLiveSessions, setEventsByThread, setApprovals);
+      handleServerEnvelope(envelope, setLiveSessions, setEventsByThread, setLiveApprovals);
     };
 
     return () => {
       ws.close();
     };
-  }, [deviceSession]);
+  }, [connection.label, deviceSession]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -334,7 +338,7 @@ function App() {
           id: `local-${Date.now()}`,
           threadId,
           type: "message",
-          payload: { role: "user", text },
+          payload: { role: "user", text, pending: true },
           createdAt: Date.now(),
         },
       ],
@@ -622,6 +626,19 @@ export function mergeSessionEvents(events: SessionEvent[]): SessionEvent[] {
 }
 
 export function appendOrMergeSessionEvent(events: SessionEvent[], event: SessionEvent): SessionEvent[] {
+  if (events.some((existing) => existing.id === event.id)) {
+    return events;
+  }
+
+  if (isUserMessage(event)) {
+    const pendingIndex = events.findIndex((existing) => isMatchingPendingUserMessage(existing, event));
+    if (pendingIndex !== -1) {
+      const nextEvents = [...events];
+      nextEvents[pendingIndex] = event;
+      return nextEvents;
+    }
+  }
+
   if (event.type !== "message_delta") {
     return [...events, event];
   }
@@ -679,6 +696,51 @@ function isAssistantMessage(event: SessionEvent): boolean {
     typeof payload === "object" &&
     !Array.isArray(payload) &&
     payload.role === "assistant"
+  );
+}
+
+function isUserMessage(event: SessionEvent): boolean {
+  const payload = event.payload;
+  return (
+    event.type === "message" &&
+    payload !== null &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    payload.role === "user" &&
+    typeof payload.text === "string"
+  );
+}
+
+function isMatchingPendingUserMessage(existing: SessionEvent, next: SessionEvent): boolean {
+  const nextText = userMessageText(next);
+  if (existing.threadId !== next.threadId || nextText === null) {
+    return false;
+  }
+  if (!isPendingPayload(existing.payload) || isPendingPayload(next.payload)) {
+    return false;
+  }
+  return existing.payload.text === nextText;
+}
+
+function userMessageText(event: SessionEvent): string | null {
+  if (!isUserMessage(event)) {
+    return null;
+  }
+  const payload = event.payload;
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return null;
+  }
+  return typeof payload.text === "string" ? payload.text : null;
+}
+
+function isPendingPayload(payload: SessionEvent["payload"]): payload is { role: "user"; text: string; pending: true } {
+  return (
+    payload !== null &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    payload.role === "user" &&
+    typeof payload.text === "string" &&
+    payload.pending === true
   );
 }
 
@@ -802,11 +864,160 @@ function parseServerEnvelope(data: unknown): ServerEnvelope | null {
     return null;
   }
   try {
-    const value = JSON.parse(data) as ServerEnvelope;
-    return value && typeof value === "object" && "type" in value ? value : null;
+    const value = JSON.parse(data) as unknown;
+    return isServerEnvelope(value) ? value : null;
   } catch {
     return null;
   }
+}
+
+function isServerEnvelope(value: unknown): value is ServerEnvelope {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const envelope = value as Record<string, unknown>;
+  switch (envelope.type) {
+    case "session_snapshot":
+      return isSessionSnapshot(envelope.payload);
+    case "session_event":
+      return isSessionEvent(envelope.payload);
+    case "approval_request":
+      return isApprovalRequest(envelope.payload);
+    case "approval_resolved":
+      return isApprovalDecision(envelope.payload);
+    case "error":
+      return isErrorPayload(envelope.payload);
+    default:
+      return false;
+  }
+}
+
+function isSessionSnapshot(value: unknown): value is SessionSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const session = value as Record<string, unknown>;
+  return (
+    typeof session.threadId === "string" &&
+    typeof session.title === "string" &&
+    (session.cwd === undefined || typeof session.cwd === "string") &&
+    (session.modelProvider === undefined || typeof session.modelProvider === "string") &&
+    (session.preview === undefined || typeof session.preview === "string") &&
+    typeof session.updatedAt === "number" &&
+    Number.isFinite(session.updatedAt) &&
+    isSessionStatus(session.status) &&
+    Array.isArray(session.pendingApprovalIds) &&
+    session.pendingApprovalIds.every((id) => typeof id === "string")
+  );
+}
+
+function isSessionEvent(value: unknown): value is SessionEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const event = value as Record<string, unknown>;
+  return (
+    typeof event.id === "string" &&
+    typeof event.threadId === "string" &&
+    isSessionEventType(event.type) &&
+    isJsonValue(event.payload) &&
+    typeof event.createdAt === "number" &&
+    Number.isFinite(event.createdAt)
+  );
+}
+
+function isApprovalRequest(value: unknown): value is ApprovalRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const approval = value as Record<string, unknown>;
+  return (
+    typeof approval.id === "string" &&
+    typeof approval.threadId === "string" &&
+    isApprovalKind(approval.kind) &&
+    typeof approval.title === "string" &&
+    typeof approval.detail === "string" &&
+    (approval.riskHint === undefined || typeof approval.riskHint === "string") &&
+    (approval.raw === undefined || isJsonValue(approval.raw)) &&
+    typeof approval.createdAt === "number" &&
+    Number.isFinite(approval.createdAt) &&
+    (approval.expiresAt === undefined ||
+      (typeof approval.expiresAt === "number" && Number.isFinite(approval.expiresAt)))
+  );
+}
+
+function isApprovalDecision(value: unknown): value is ApprovalDecision {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const decision = value as Record<string, unknown>;
+  return (
+    typeof decision.approvalId === "string" &&
+    (decision.decision === "approve" || decision.decision === "reject") &&
+    (decision.comment === undefined || typeof decision.comment === "string") &&
+    typeof decision.deviceId === "string" &&
+    typeof decision.decidedAt === "number" &&
+    Number.isFinite(decision.decidedAt)
+  );
+}
+
+function isErrorPayload(value: unknown): value is { message: string } {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    typeof (value as Record<string, unknown>).message === "string"
+  );
+}
+
+function isSessionStatus(value: unknown): value is SessionSnapshot["status"] {
+  return (
+    value === "idle" ||
+    value === "running" ||
+    value === "waiting_for_input" ||
+    value === "waiting_for_approval" ||
+    value === "error"
+  );
+}
+
+function isSessionEventType(value: unknown): value is SessionEvent["type"] {
+  return (
+    value === "message" ||
+    value === "message_delta" ||
+    value === "tool_call" ||
+    value === "tool_result" ||
+    value === "approval_requested" ||
+    value === "approval_resolved" ||
+    value === "status_changed" ||
+    value === "error"
+  );
+}
+
+function isApprovalKind(value: unknown): value is ApprovalKind {
+  return value === "command" || value === "file_edit" || value === "network" || value === "mcp" || value === "unknown";
+}
+
+function isJsonValue(value: unknown): value is SessionEvent["payload"] {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.every(isJsonValue);
+  }
+  if (typeof value === "object") {
+    return Object.values(value).every(isJsonValue);
+  }
+  return false;
 }
 
 function handleServerEnvelope(

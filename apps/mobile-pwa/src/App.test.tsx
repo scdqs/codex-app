@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App, { appendOrMergeSessionEvent } from "./App";
 import type { SessionEvent, SessionSnapshot } from "./protocol";
@@ -8,6 +8,7 @@ import { clearSession, loadSession, saveSession } from "./storage";
 
 describe("App", () => {
   beforeEach(() => {
+    MockWebSocket.instances = [];
     vi.stubGlobal("WebSocket", MockWebSocket);
   });
 
@@ -452,6 +453,189 @@ describe("App", () => {
         .mock.calls.some(([input]) => String(input).includes("/events")),
     ).toBe(false);
   });
+
+  it("hides_sample_approvals_after_live_sessions_loads_until_real_approval_arrives", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-live", title: "Live thread", preview: "Real session" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-live/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Live thread" });
+    await waitFor(() => {
+      expect(screen.queryByText("Run npm install")).not.toBeInTheDocument();
+    });
+
+    act(() => {
+      MockWebSocket.instances[0].emit({
+        type: "approval_request",
+        payload: {
+          id: "approval-real",
+          threadId: "thread-live",
+          kind: "command",
+          title: "Run real check",
+          detail: "npm test",
+          createdAt: 1_783_515_390_000,
+        },
+      });
+    });
+
+    expect(await screen.findByText("Run real check")).toBeInTheDocument();
+  });
+
+  it("preserves_newer_ws_event_when_http_events_resolve_later", async () => {
+    saveActiveSession();
+    let resolveEvents: (response: Response) => void = () => {};
+    const eventsResponse = new Promise<Response>((resolve) => {
+      resolveEvents = resolve;
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-live", title: "Live thread", preview: "Real session" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-live/events") {
+        return eventsResponse;
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Live thread" });
+    act(() => {
+      MockWebSocket.instances[0].emit({
+        type: "session_event",
+        payload: sessionEvent({
+          id: "event-ws",
+          threadId: "thread-live",
+          payload: { role: "assistant", text: "Arrived over socket" },
+        }),
+      });
+    });
+    expect(await screen.findByText("Arrived over socket")).toBeInTheDocument();
+
+    await act(async () => {
+      resolveEvents(
+        jsonResponse([
+          sessionEvent({
+            id: "event-http",
+            threadId: "thread-live",
+            payload: { role: "assistant", text: "Loaded over HTTP" },
+          }),
+        ]),
+      );
+    });
+
+    expect(await screen.findByText("Loaded over HTTP")).toBeInTheDocument();
+    expect(screen.getByText("Arrived over socket")).toBeInTheDocument();
+  });
+
+  it("reconciles_optimistic_user_message_with_matching_server_echo", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-send", title: "Reply target", preview: "Waiting" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-send/events") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-send/messages" && init?.method === "POST") {
+        return jsonResponse({ accepted: true });
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const input = await screen.findByPlaceholderText("Message Reply target");
+    await user.type(input, "same text");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(await screen.findByText("same text")).toBeInTheDocument();
+
+    act(() => {
+      MockWebSocket.instances[0].emit({
+        type: "session_event",
+        payload: sessionEvent({
+          id: "event-echo",
+          threadId: "thread-send",
+          payload: { role: "user", text: "same text" },
+        }),
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText("same text")).toHaveLength(1);
+    });
+  });
+
+  it("ignores_malformed_ws_event_and_handles_valid_approval_request", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-live", title: "Live thread", preview: "Real session" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-live/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Live thread" });
+    act(() => {
+      MockWebSocket.instances[0].emit({
+        type: "session_event",
+        payload: { id: "bad-event", threadId: "thread-live", type: "message" },
+      });
+      MockWebSocket.instances[0].emit({
+        type: "approval_request",
+        payload: {
+          id: "approval-valid",
+          threadId: "thread-live",
+          kind: "command",
+          title: "Approve valid command",
+          detail: "echo ok",
+          createdAt: 1_783_515_390_000,
+        },
+      });
+    });
+
+    expect(screen.queryByText("bad-event")).not.toBeInTheDocument();
+    expect(await screen.findByText("Approve valid command")).toBeInTheDocument();
+  });
 });
 
 function saveActiveSession() {
@@ -496,9 +680,19 @@ function sessionEvent(overrides: Partial<SessionEvent> = {}): SessionEvent {
 }
 
 class MockWebSocket {
+  static instances: MockWebSocket[] = [];
   onmessage: ((message: MessageEvent) => void) | null = null;
+  closed = false;
 
-  constructor(readonly url: string) {}
+  constructor(readonly url: string) {
+    MockWebSocket.instances.push(this);
+  }
 
-  close() {}
+  emit(envelope: unknown) {
+    this.onmessage?.({ data: JSON.stringify(envelope) } as MessageEvent);
+  }
+
+  close() {
+    this.closed = true;
+  }
 }
