@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 
 use tokio::sync::{RwLock, broadcast};
 
@@ -9,6 +12,11 @@ const DEFAULT_EVENT_BUFFER_CAPACITY: usize = 256;
 #[derive(Debug, Clone)]
 pub struct EventHub {
     inner: Arc<EventHubInner>,
+}
+
+pub struct EventSubscriber {
+    replay: VecDeque<ServerEnvelope>,
+    receiver: broadcast::Receiver<ServerEnvelope>,
 }
 
 #[derive(Debug)]
@@ -37,8 +45,16 @@ impl EventHub {
         self.inner.events.send(envelope).unwrap_or(0)
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<ServerEnvelope> {
-        self.inner.events.subscribe()
+    pub async fn subscribe(&self) -> EventSubscriber {
+        let receiver = self.inner.events.subscribe();
+        let replay = self
+            .all_snapshots()
+            .await
+            .into_iter()
+            .map(ServerEnvelope::SessionSnapshot)
+            .collect();
+
+        EventSubscriber { replay, receiver }
     }
 
     pub async fn set_snapshot(&self, snapshot: SessionSnapshot) -> usize {
@@ -82,6 +98,16 @@ impl Default for EventHub {
     }
 }
 
+impl EventSubscriber {
+    pub async fn recv(&mut self) -> Result<ServerEnvelope, broadcast::error::RecvError> {
+        if let Some(envelope) = self.replay.pop_front() {
+            return Ok(envelope);
+        }
+
+        self.receiver.recv().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,7 +117,7 @@ mod tests {
     #[tokio::test]
     async fn subscriber_receives_published_session_event() {
         let hub = EventHub::new();
-        let mut subscriber = hub.subscribe();
+        let mut subscriber = hub.subscribe().await;
         let event = SessionEvent {
             id: "event-1".to_string(),
             thread_id: "thread-1".to_string(),
@@ -115,20 +141,32 @@ mod tests {
         let hub = EventHub::new();
         let older_snapshot = snapshot("thread-old", 1_725_000_000_000);
         let newest_snapshot = snapshot("thread-new", 1_725_000_000_100);
+        let same_time_snapshot = snapshot("thread-alpha", 1_725_000_000_100);
 
         hub.set_snapshot(older_snapshot.clone()).await;
         hub.set_snapshot(newest_snapshot.clone()).await;
+        hub.set_snapshot(same_time_snapshot.clone()).await;
 
-        let _subscriber = hub.subscribe();
+        let mut subscriber = hub.subscribe().await;
 
         assert_eq!(
-            hub.snapshot_for_thread("thread-new").await,
-            Some(newest_snapshot.clone())
+            subscriber.recv().await.expect("newest snapshot replays"),
+            ServerEnvelope::SessionSnapshot(same_time_snapshot.clone())
         );
-        assert_eq!(hub.snapshot_for_thread("missing").await, None);
+        assert_eq!(
+            subscriber
+                .recv()
+                .await
+                .expect("same-time snapshot replays by thread id"),
+            ServerEnvelope::SessionSnapshot(newest_snapshot.clone())
+        );
+        assert_eq!(
+            subscriber.recv().await.expect("older snapshot replays"),
+            ServerEnvelope::SessionSnapshot(older_snapshot.clone())
+        );
         assert_eq!(
             hub.all_snapshots().await,
-            vec![newest_snapshot, older_snapshot]
+            vec![same_time_snapshot, newest_snapshot, older_snapshot]
         );
     }
 
