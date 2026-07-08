@@ -41,6 +41,7 @@ pub struct AppState {
 }
 
 const EVENT_HISTORY_LIMIT_PER_THREAD: usize = 256;
+#[cfg(test)]
 const MAX_REFRESH_FAILURES_PER_DEVICE: usize = 5;
 const BRIDGE_CONTROL_TOKEN_HEADER: &str = "x-bridge-control-token";
 
@@ -225,21 +226,21 @@ async fn refresh_session(
     Json(request): Json<SessionRefreshRequest>,
 ) -> Result<Json<SessionRefreshResponse>, ApiError> {
     let failure_key = refresh_failure_key(&request.device_id);
-    if state.refresh_failure_count(&failure_key).await >= MAX_REFRESH_FAILURES_PER_DEVICE {
-        return Err(ApiError::Unauthorized);
-    }
+    let refresh_result = {
+        let mut pairing = state.pairing.lock().await;
+        pairing.create_session(&request.device_id, &request.device_secret)
+    };
 
-    let mut pairing = state.pairing.lock().await;
-    let registration = match pairing.create_session(&request.device_id, &request.device_secret) {
-        Ok(registration) => registration,
+    let registration = match refresh_result {
+        Ok(registration) => {
+            state.clear_refresh_failures(&failure_key).await;
+            registration
+        }
         Err(_) => {
             state.record_refresh_failure(failure_key).await;
             return Err(ApiError::Unauthorized);
         }
     };
-    drop(pairing);
-
-    state.clear_refresh_failures(&failure_key).await;
 
     Ok(Json(SessionRefreshResponse {
         device_id: registration.device_id,
@@ -456,15 +457,6 @@ fn refresh_failure_key(device_id: &str) -> String {
 }
 
 impl AppState {
-    async fn refresh_failure_count(&self, failure_key: &str) -> usize {
-        self.refresh_failures
-            .lock()
-            .await
-            .get(failure_key)
-            .copied()
-            .unwrap_or_default()
-    }
-
     async fn record_refresh_failure(&self, failure_key: String) {
         let mut refresh_failures = self.refresh_failures.lock().await;
         let count = refresh_failures.entry(failure_key).or_default();
@@ -794,10 +786,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_refresh_throttles_repeated_wrong_secret_attempts() {
+    async fn session_refresh_allows_valid_secret_after_repeated_wrong_secret_attempts() {
         let (_dir, state) = test_state();
         pair_device(&state).await;
-        let app = build_router(state);
+        let app = build_router(state.clone());
 
         for attempt in 1..=MAX_REFRESH_FAILURES_PER_DEVICE {
             let response = app
@@ -823,7 +815,17 @@ mod tests {
             assert!(body.get("sessionToken").is_none());
         }
 
-        let throttled_valid_secret_response = app
+        assert_eq!(
+            state
+                .refresh_failures
+                .lock()
+                .await
+                .get(&refresh_failure_key("phone-1"))
+                .copied(),
+            Some(MAX_REFRESH_FAILURES_PER_DEVICE)
+        );
+
+        let valid_secret_response = app
             .oneshot(json_request(
                 Method::POST,
                 "/api/session/refresh",
@@ -835,13 +837,18 @@ mod tests {
             .await
             .expect("request succeeds");
 
+        assert_eq!(valid_secret_response.status(), StatusCode::OK);
+        let body = response_json(valid_secret_response).await;
+        assert_eq!(body["deviceId"], json!("phone-1"));
+        assert!(body["sessionToken"].as_str().is_some());
         assert_eq!(
-            throttled_valid_secret_response.status(),
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            response_json(throttled_valid_secret_response).await,
-            json!({ "error": "unauthorized" })
+            state
+                .refresh_failures
+                .lock()
+                .await
+                .get(&refresh_failure_key("phone-1"))
+                .copied(),
+            None
         );
     }
 
