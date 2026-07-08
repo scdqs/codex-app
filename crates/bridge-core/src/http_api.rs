@@ -36,10 +36,12 @@ pub struct AppState {
     pairing: Arc<Mutex<PairingManager>>,
     event_hub: EventHub,
     event_history: Arc<Mutex<HashMap<String, VecDeque<SessionEvent>>>>,
+    refresh_failures: Arc<Mutex<HashMap<String, usize>>>,
     control_token: Arc<str>,
 }
 
 const EVENT_HISTORY_LIMIT_PER_THREAD: usize = 256;
+const MAX_REFRESH_FAILURES_PER_DEVICE: usize = 5;
 const BRIDGE_CONTROL_TOKEN_HEADER: &str = "x-bridge-control-token";
 
 #[derive(Debug, Clone)]
@@ -137,12 +139,29 @@ impl AppState {
             pairing: Arc::new(Mutex::new(pairing)),
             event_hub,
             event_history: Arc::new(Mutex::new(HashMap::new())),
+            refresh_failures: Arc::new(Mutex::new(HashMap::new())),
             control_token: control_token.into(),
         }
     }
 
     pub fn event_hub(&self) -> EventHub {
         self.event_hub.clone()
+    }
+
+    pub async fn publish_session_event(&self, event: SessionEvent) -> usize {
+        self.record_session_event(event.clone()).await;
+        self.event_hub.publish(ServerEnvelope::SessionEvent(event))
+    }
+
+    async fn record_session_event(&self, event: SessionEvent) {
+        let mut event_history = self.event_history.lock().await;
+        let thread_events = event_history
+            .entry(event.thread_id.clone())
+            .or_insert_with(VecDeque::new);
+        if thread_events.len() == EVENT_HISTORY_LIMIT_PER_THREAD {
+            thread_events.pop_front();
+        }
+        thread_events.push_back(event);
     }
 }
 
@@ -205,8 +224,22 @@ async fn refresh_session(
     State(state): State<AppState>,
     Json(request): Json<SessionRefreshRequest>,
 ) -> Result<Json<SessionRefreshResponse>, ApiError> {
+    let failure_key = refresh_failure_key(&request.device_id);
+    if state.refresh_failure_count(&failure_key).await >= MAX_REFRESH_FAILURES_PER_DEVICE {
+        return Err(ApiError::Unauthorized);
+    }
+
     let mut pairing = state.pairing.lock().await;
-    let registration = pairing.create_session(&request.device_id, &request.device_secret)?;
+    let registration = match pairing.create_session(&request.device_id, &request.device_secret) {
+        Ok(registration) => registration,
+        Err(_) => {
+            state.record_refresh_failure(failure_key).await;
+            return Err(ApiError::Unauthorized);
+        }
+    };
+    drop(pairing);
+
+    state.clear_refresh_failures(&failure_key).await;
 
     Ok(Json(SessionRefreshResponse {
         device_id: registration.device_id,
@@ -296,8 +329,7 @@ async fn send_message(
         }),
         created_at: current_time_ms(),
     };
-    record_session_event(&state, event.clone()).await;
-    state.event_hub.publish(ServerEnvelope::SessionEvent(event));
+    state.publish_session_event(event).await;
 
     (
         StatusCode::ACCEPTED,
@@ -419,15 +451,29 @@ fn control_token_from_headers(headers: &HeaderMap) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-async fn record_session_event(state: &AppState, event: SessionEvent) {
-    let mut event_history = state.event_history.lock().await;
-    let thread_events = event_history
-        .entry(event.thread_id.clone())
-        .or_insert_with(VecDeque::new);
-    if thread_events.len() == EVENT_HISTORY_LIMIT_PER_THREAD {
-        thread_events.pop_front();
+fn refresh_failure_key(device_id: &str) -> String {
+    device_id.trim().to_ascii_lowercase()
+}
+
+impl AppState {
+    async fn refresh_failure_count(&self, failure_key: &str) -> usize {
+        self.refresh_failures
+            .lock()
+            .await
+            .get(failure_key)
+            .copied()
+            .unwrap_or_default()
     }
-    thread_events.push_back(event);
+
+    async fn record_refresh_failure(&self, failure_key: String) {
+        let mut refresh_failures = self.refresh_failures.lock().await;
+        let count = refresh_failures.entry(failure_key).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    async fn clear_refresh_failures(&self, failure_key: &str) {
+        self.refresh_failures.lock().await.remove(failure_key);
+    }
 }
 
 fn current_time_ms() -> u64 {
@@ -702,7 +748,101 @@ mod tests {
             .await
             .expect("request succeeds");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response_json(response).await,
+            json!({ "error": "unauthorized" })
+        );
+    }
+
+    #[tokio::test]
+    async fn session_refresh_unknown_device_and_wrong_secret_have_same_response() {
+        let (_dir, state) = test_state();
+        pair_device(&state).await;
+        let app = build_router(state);
+
+        let wrong_secret_response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/session/refresh",
+                json!({
+                    "deviceId": "phone-1",
+                    "deviceSecret": "wrong-secret",
+                }),
+            ))
+            .await
+            .expect("request succeeds");
+        let unknown_device_response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/api/session/refresh",
+                json!({
+                    "deviceId": "missing-phone",
+                    "deviceSecret": "wrong-secret",
+                }),
+            ))
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(wrong_secret_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(unknown_device_response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response_json(wrong_secret_response).await,
+            response_json(unknown_device_response).await
+        );
+    }
+
+    #[tokio::test]
+    async fn session_refresh_throttles_repeated_wrong_secret_attempts() {
+        let (_dir, state) = test_state();
+        pair_device(&state).await;
+        let app = build_router(state);
+
+        for attempt in 1..=MAX_REFRESH_FAILURES_PER_DEVICE {
+            let response = app
+                .clone()
+                .oneshot(json_request(
+                    Method::POST,
+                    "/api/session/refresh",
+                    json!({
+                        "deviceId": "PHONE-1 ",
+                        "deviceSecret": "wrong-secret",
+                    }),
+                ))
+                .await
+                .expect("request succeeds");
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "attempt {attempt}"
+            );
+            let body = response_json(response).await;
+            assert_eq!(body, json!({ "error": "unauthorized" }));
+            assert!(body.get("sessionToken").is_none());
+        }
+
+        let throttled_valid_secret_response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/api/session/refresh",
+                json!({
+                    "deviceId": "phone-1",
+                    "deviceSecret": "phone-secret",
+                }),
+            ))
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(
+            throttled_valid_secret_response.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            response_json(throttled_valid_secret_response).await,
+            json!({ "error": "unauthorized" })
+        );
     }
 
     #[tokio::test]
@@ -908,5 +1048,45 @@ mod tests {
         assert_eq!(body[0]["threadId"], json!("thread-1"));
         assert_eq!(body[0]["type"], json!("message"));
         assert_eq!(body[0]["payload"]["text"], json!("hello"));
+    }
+
+    #[tokio::test]
+    async fn app_state_publish_session_event_records_history_and_broadcasts() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let mut subscriber = state.event_hub().subscribe().await;
+        let event = SessionEvent {
+            id: "event-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            event_type: SessionEventType::Message,
+            payload: json!({ "role": "assistant", "text": "published" }),
+            created_at: 1_725_000_000_100,
+        };
+
+        let receivers = state.publish_session_event(event.clone()).await;
+
+        assert_eq!(receivers, 1);
+        assert_eq!(
+            subscriber.recv().await.expect("subscriber receives event"),
+            ServerEnvelope::SessionEvent(event)
+        );
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body[0]["id"], json!("event-1"));
+        assert_eq!(body[0]["payload"]["text"], json!("published"));
     }
 }
