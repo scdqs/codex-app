@@ -1,4 +1,3 @@
-// @ts-ignore - Vitest runs this test in Node, but this package does not include Node ambient types.
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";

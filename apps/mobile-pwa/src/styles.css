@@ -201,7 +201,7 @@ h3 {
   grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
   overflow: hidden;
-  padding: 12px 12px calc(var(--composer-height) + var(--safe-bottom) + 14px);
+  padding: 12px;
 }
 
 .approval-queue,
