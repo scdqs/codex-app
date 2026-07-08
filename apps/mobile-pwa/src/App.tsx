@@ -128,6 +128,8 @@ interface ConnectionViewState {
 }
 
 const pairingAttempts = new Map<string, Promise<DeviceSession>>();
+const SESSION_LIST_REFRESH_MS = 5_000;
+const SESSION_EVENTS_REFRESH_MS = 2_000;
 
 function App() {
   const hasInitialPairingPayload = useMemo(() => readPairingPayloadFromUrl(window.location.href) !== null, []);
@@ -168,22 +170,26 @@ function App() {
     async function loadConnection() {
       const pairingPayload = readPairingPayloadFromUrl(window.location.href);
       const savedSession = loadSession();
-      const shouldCompletePairing = pairingPayload !== null && !savedSession;
-      const bridgeUrl = shouldCompletePairing
-        ? pairingPayload.bridgeUrl ?? window.location.origin
-        : savedSession?.bridgeUrl ?? window.location.origin;
 
       try {
-        if (shouldCompletePairing) {
+        if (pairingPayload) {
+          const pairingBridgeUrl = pairingPayload.bridgeUrl ?? window.location.origin;
           setConnection({ label: "Pairing" });
-          const pairedSession = await completePairingOnce(bridgeUrl, pairingPayload, savedSession);
-          clearPairingParamsFromUrl();
-          const health = await getHealth(bridgeUrl, pairedSession.sessionToken);
-          if (!cancelled) {
-            setConnection(mapHealthToConnection(health));
-            setDeviceSession(pairedSession);
+          try {
+            const pairedSession = await completePairingOnce(pairingBridgeUrl, pairingPayload, savedSession);
+            clearPairingParamsFromUrl();
+            const health = await getHealth(pairingBridgeUrl, pairedSession.sessionToken);
+            if (!cancelled) {
+              setConnection(mapHealthToConnection(health));
+              setDeviceSession(pairedSession);
+            }
+            return;
+          } catch (error) {
+            if (!savedSession || !isPairingTokenError(error)) {
+              throw error;
+            }
+            clearPairingParamsFromUrl();
           }
-          return;
         }
 
         if (!savedSession) {
@@ -192,9 +198,7 @@ function App() {
           return;
         }
 
-        if (pairingPayload) {
-          clearPairingParamsFromUrl();
-        }
+        const bridgeUrl = savedSession.bridgeUrl ?? window.location.origin;
 
         if (isExpired(savedSession.sessionExpiresAt)) {
           setConnection({ label: "Pairing", detail: "Refreshing session" });
@@ -272,9 +276,13 @@ function App() {
     }
 
     void loadSessionList();
+    const intervalId = window.setInterval(() => {
+      void loadSessionList();
+    }, SESSION_LIST_REFRESH_MS);
 
     return () => {
       cancelled = true;
+      window.clearInterval(intervalId);
     };
   }, [connection.label, deviceSession]);
 
@@ -293,7 +301,7 @@ function App() {
         if (!cancelled) {
           setEventsByThread((current) => ({
             ...current,
-            [threadId]: mergeSessionEvents([...(current[threadId] ?? []), ...items]),
+            [threadId]: mergePolledSessionEvents(current[threadId] ?? [], items),
           }));
         }
       } catch (error) {
@@ -307,9 +315,13 @@ function App() {
     }
 
     void loadEvents();
+    const intervalId = window.setInterval(() => {
+      void loadEvents();
+    }, SESSION_EVENTS_REFRESH_MS);
 
     return () => {
       cancelled = true;
+      window.clearInterval(intervalId);
     };
   }, [deviceSession, liveSessions, selectedSession]);
 
@@ -342,19 +354,19 @@ function App() {
     const text = draft.trim();
     const threadId = selectedSession.threadId;
     setSending(true);
-    setEventsByThread((current) => ({
-      ...current,
-      [threadId]: [
-        ...(current[threadId] ?? []),
-        {
-          id: `local-${Date.now()}`,
-          threadId,
-          type: "message",
-          payload: { role: "user", text, pending: true },
-          createdAt: Date.now(),
-        },
-      ],
-    }));
+    setEventsByThread((current) => {
+      const localEvent: SessionEvent = {
+        id: `local-${Date.now()}`,
+        threadId,
+        type: "message",
+        payload: { role: "user", text, pending: true },
+        createdAt: Date.now(),
+      };
+      return {
+        ...current,
+        [threadId]: sortSessionEvents(appendOrMergeSessionEvent(current[threadId] ?? [], localEvent)),
+      };
+    });
     setDraft("");
     try {
       await sendTextMessage(activeSession.bridgeUrl, activeSession.sessionToken, threadId, text);
@@ -762,6 +774,33 @@ export function appendOrMergeSessionEvent(events: SessionEvent[], event: Session
   ];
 }
 
+export function mergePolledSessionEvents(current: SessionEvent[], polled: SessionEvent[]): SessionEvent[] {
+  const polledIds = new Set(polled.map((event) => event.id));
+  const polledUserTexts = new Set(
+    polled
+      .map(normalizedUserMessageText)
+      .filter((text): text is string => Boolean(text)),
+  );
+  const carried = current.filter((event) => {
+    if (polledIds.has(event.id)) {
+      return false;
+    }
+    if (isPendingPayload(event.payload)) {
+      const text = normalizedUserMessageText(event);
+      if (text && polledUserTexts.has(text)) {
+        return false;
+      }
+    }
+    return true;
+  });
+
+  return sortSessionEvents(mergeSessionEvents([...polled, ...carried]));
+}
+
+function sortSessionEvents(events: SessionEvent[]): SessionEvent[] {
+  return [...events].sort((left, right) => right.createdAt - left.createdAt);
+}
+
 function deltaText(payload: SessionEvent["payload"]): string {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return "";
@@ -799,14 +838,14 @@ function isUserMessage(event: SessionEvent): boolean {
 }
 
 function isMatchingPendingUserMessage(existing: SessionEvent, next: SessionEvent): boolean {
-  const nextText = userMessageText(next);
+  const nextText = normalizedUserMessageText(next);
   if (existing.threadId !== next.threadId || nextText === null) {
     return false;
   }
   if (!isPendingPayload(existing.payload) || isPendingPayload(next.payload)) {
     return false;
   }
-  return existing.payload.text === nextText;
+  return existing.payload.text.trim() === nextText;
 }
 
 function userMessageText(event: SessionEvent): string | null {
@@ -818,6 +857,10 @@ function userMessageText(event: SessionEvent): string | null {
     return null;
   }
   return typeof payload.text === "string" ? payload.text : null;
+}
+
+function normalizedUserMessageText(event: SessionEvent): string | null {
+  return userMessageText(event)?.trim() ?? null;
 }
 
 function isPendingPayload(payload: SessionEvent["payload"]): payload is { role: "user"; text: string; pending: true } {
@@ -959,6 +1002,10 @@ function secondaryStatusText(label: ConnectionLabel): string {
 
 function isAuthError(error: unknown): boolean {
   return error instanceof ApiError && (error.status === 401 || error.status === 403);
+}
+
+function isPairingTokenError(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 400;
 }
 
 function isSessionDataEnabled(label: ConnectionLabel): boolean {
@@ -1143,9 +1190,8 @@ function handleServerEnvelope(
     case "session_event":
       setEventsByThread((current) => ({
         ...current,
-        [envelope.payload.threadId]: appendOrMergeSessionEvent(
-          current[envelope.payload.threadId] ?? [],
-          envelope.payload,
+        [envelope.payload.threadId]: sortSessionEvents(
+          appendOrMergeSessionEvent(current[envelope.payload.threadId] ?? [], envelope.payload),
         ),
       }));
       break;

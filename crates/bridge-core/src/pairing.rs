@@ -335,6 +335,33 @@ mod tests {
     }
 
     #[test]
+    fn new_pairing_token_can_rebind_existing_device() {
+        let (_dir, storage) = temp_storage();
+        let now = Arc::new(AtomicU64::new(1_725_000_000_000));
+        let mut manager = manager_at(Arc::clone(&now), storage);
+        let first_token = manager.create_token().expect("first token creates");
+        manager
+            .register_device(&first_token, "phone-1", "Damon's phone", "old-secret")
+            .expect("device registers");
+        let second_token = manager.create_token().expect("second token creates");
+
+        let registration = manager
+            .register_device(&second_token, "phone-1", "Damon's phone", "new-secret")
+            .expect("device rebinds");
+
+        assert_eq!(registration.device_id, "phone-1");
+        assert_eq!(
+            manager.create_session_token("phone-1", "old-secret"),
+            Err(PairingError::InvalidToken)
+        );
+        assert!(
+            manager
+                .create_session_token("phone-1", "new-secret")
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn expired_session_token_is_rejected() {
         let (_dir, storage) = temp_storage();
         let now = Arc::new(AtomicU64::new(1_725_000_000_000));

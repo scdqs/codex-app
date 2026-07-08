@@ -28,6 +28,7 @@ use crate::{
     codex_rpc::{CodexAdapter, CodexRpcError},
     diagnostics::DiagnosticsReport,
     event_hub::EventHub,
+    normalizer::Normalizer,
     pairing::{DEFAULT_PAIRING_TOKEN_TTL_MS, PairingError, PairingManager},
     protocol::{
         ApprovalDecision, DecisionKind, ServerEnvelope, SessionEvent, SessionEventType,
@@ -324,14 +325,35 @@ async fn revoke_device(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSnapshot>> {
-    Json(state.event_hub.all_snapshots().await)
+async fn list_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<SessionSnapshot>>, ApiError> {
+    if let Some(adapter) = state.codex_adapter.as_ref() {
+        let threads = adapter.list_threads().await?;
+        for thread in threads {
+            state
+                .event_hub
+                .set_snapshot(Normalizer::snapshot_from_thread(&thread))
+                .await;
+        }
+    }
+
+    Ok(Json(state.event_hub.all_snapshots().await))
 }
 
 async fn list_session_events(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
-) -> Json<Vec<SessionEvent>> {
+) -> Result<Json<Vec<SessionEvent>>, ApiError> {
+    if let Some(adapter) = state.codex_adapter.as_ref() {
+        let turns = adapter.list_turns(&thread_id).await?;
+        let events = Normalizer::events_from_turns(&thread_id, &turns);
+        for event in &events {
+            state.record_session_event(event.clone()).await;
+        }
+        return Ok(Json(events));
+    }
+
     let events = state
         .event_history
         .lock()
@@ -340,14 +362,18 @@ async fn list_session_events(
         .map(|events| events.iter().cloned().collect())
         .unwrap_or_default();
 
-    Json(events)
+    Ok(Json(events))
 }
 
 async fn send_message(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
     Json(request): Json<SendMessageRequest>,
-) -> (StatusCode, Json<AcceptedResponse>) {
+) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
+    if let Some(adapter) = state.codex_adapter.as_ref() {
+        adapter.send_user_message(&thread_id, &request.text).await?;
+    }
+
     let event = SessionEvent {
         id: Uuid::new_v4().to_string(),
         thread_id,
@@ -360,10 +386,10 @@ async fn send_message(
     };
     state.publish_session_event(event).await;
 
-    (
+    Ok((
         StatusCode::ACCEPTED,
         Json(AcceptedResponse { accepted: true }),
-    )
+    ))
 }
 
 async fn decide_approval(
@@ -577,6 +603,7 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::{
+        collections::HashMap as StdHashMap,
         path::PathBuf,
         sync::{Arc, Mutex as StdMutex},
     };
@@ -1107,6 +1134,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paired_device_can_list_live_codex_threads() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::with_threads(vec![CodexThread {
+            id: "thread-live".to_string(),
+            title: Some("Live Codex thread".to_string()),
+            cwd: Some("/repo".to_string()),
+            model_provider: Some("openai".to_string()),
+            preview: Some("Latest live message".to_string()),
+            created_at: None,
+            updated_at: Some(1_725_000_000_200),
+            raw: json!({ "id": "thread-live", "status": "running" }),
+        }]));
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            json!([
+                {
+                    "threadId": "thread-live",
+                    "title": "Live Codex thread",
+                    "cwd": "/repo",
+                    "modelProvider": "openai",
+                    "preview": "Latest live message",
+                    "updatedAt": 1725000000200u64,
+                    "status": "running",
+                    "pendingApprovalIds": [],
+                }
+            ])
+        );
+    }
+
+    #[tokio::test]
     async fn paired_device_can_read_message_events_published_through_api() {
         let (_dir, state) = test_state();
         let session_token = pair_device(&state).await;
@@ -1144,6 +1217,34 @@ mod tests {
         assert_eq!(body[0]["threadId"], json!("thread-1"));
         assert_eq!(body[0]["type"], json!("message"));
         assert_eq!(body[0]["payload"]["text"], json!("hello"));
+    }
+
+    #[tokio::test]
+    async fn paired_device_send_message_routes_to_codex_adapter() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::default());
+        let messages = adapter.messages();
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/thread-1/messages")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "text": "hello Codex" }).to_string()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            messages.lock().expect("messages lock").as_slice(),
+            &[("thread-1".to_string(), "hello Codex".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -1189,18 +1290,32 @@ mod tests {
     #[derive(Default)]
     struct RecordingAdapter {
         decisions: Arc<StdMutex<Vec<ApprovalDecision>>>,
+        messages: Arc<StdMutex<Vec<(String, String)>>>,
+        threads: Arc<StdMutex<Vec<CodexThread>>>,
+        turns: Arc<StdMutex<StdHashMap<String, Vec<CodexTurn>>>>,
     }
 
     impl RecordingAdapter {
+        fn with_threads(threads: Vec<CodexThread>) -> Self {
+            Self {
+                threads: Arc::new(StdMutex::new(threads)),
+                ..Self::default()
+            }
+        }
+
         fn decisions(&self) -> Arc<StdMutex<Vec<ApprovalDecision>>> {
             self.decisions.clone()
+        }
+
+        fn messages(&self) -> Arc<StdMutex<Vec<(String, String)>>> {
+            self.messages.clone()
         }
     }
 
     #[async_trait]
     impl CodexAdapter for RecordingAdapter {
         async fn list_threads(&self) -> Result<Vec<CodexThread>, CodexRpcError> {
-            Ok(Vec::new())
+            Ok(self.threads.lock().expect("threads lock").clone())
         }
 
         async fn resume_thread(
@@ -1210,15 +1325,25 @@ mod tests {
             Ok(None)
         }
 
-        async fn list_turns(&self, _thread_id: &str) -> Result<Vec<CodexTurn>, CodexRpcError> {
-            Ok(Vec::new())
+        async fn list_turns(&self, thread_id: &str) -> Result<Vec<CodexTurn>, CodexRpcError> {
+            Ok(self
+                .turns
+                .lock()
+                .expect("turns lock")
+                .get(thread_id)
+                .cloned()
+                .unwrap_or_default())
         }
 
         async fn send_user_message(
             &self,
-            _thread_id: &str,
-            _text: &str,
+            thread_id: &str,
+            text: &str,
         ) -> Result<(), CodexRpcError> {
+            self.messages
+                .lock()
+                .expect("messages lock")
+                .push((thread_id.to_string(), text.to_string()));
             Ok(())
         }
 

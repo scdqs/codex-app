@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import App, { appendOrMergeSessionEvent } from "./App";
+import App, { appendOrMergeSessionEvent, mergePolledSessionEvents } from "./App";
 import type { SessionEvent, SessionSnapshot } from "./protocol";
 import { clearSession, loadSession, saveSession } from "./storage";
 
@@ -14,6 +14,7 @@ describe("App", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     clearSession();
     window.history.replaceState(null, "", "/");
@@ -140,6 +141,47 @@ describe("App", () => {
     expect(loadSession()?.sessionToken).toBe("session-1");
   });
 
+  it("uses_new_pairing_link_when_saved_session_is_revoked", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/?pairingToken=pair-2&bridgeUrl=http%3A%2F%2Fbridge.local&keep=1",
+    );
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "revoked-token",
+      sessionExpiresAt: Date.now() + 60_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    const replaceState = vi.spyOn(window.history, "replaceState");
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            deviceId: "device-1",
+            sessionToken: "new-session",
+            sessionExpiresAt: Date.now() + 60_000,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(jsonResponse({ status: "ok", connectionState: "writable" }));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Writable");
+    });
+    expect(replaceState).toHaveBeenCalledWith(null, "", "/?keep=1");
+    expect(loadSession()?.sessionToken).toBe("new-session");
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "http://bridge.local/api/pairing/complete",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
   it("uses_saved_session_when_url_pairing_token_is_stale", async () => {
     window.history.replaceState(
       null,
@@ -155,8 +197,11 @@ describe("App", () => {
       bridgeUrl: "http://bridge.local",
     });
     const replaceState = vi.spyOn(window.history, "replaceState");
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
+      if (url === "http://stale.local/api/pairing/complete" && init?.method === "POST") {
+        return jsonResponse({ error: "invalid pairing token" }, 400);
+      }
       if (url === "http://bridge.local/api/health") {
         return jsonResponse({ status: "ok", connectionState: "connected" });
       }
@@ -178,11 +223,11 @@ describe("App", () => {
     expect(
       vi
         .mocked(globalThis.fetch)
-        .mock.calls.some(([input]) => String(input) === "http://stale.local/api/pairing/complete"),
-    ).toBe(false);
+        .mock.calls.some(([input, init]) => String(input) === "http://stale.local/api/pairing/complete" && init?.method === "POST"),
+    ).toBe(true);
   });
 
-  it("refreshes_expired_saved_session_instead_of_reusing_stale_pairing_token", async () => {
+  it("refreshes_expired_saved_session_after_stale_pairing_token_fails", async () => {
     window.history.replaceState(
       null,
       "",
@@ -198,6 +243,7 @@ describe("App", () => {
     });
     const replaceState = vi.spyOn(window.history, "replaceState");
     vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse({ error: "invalid pairing token" }, 400))
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
@@ -222,16 +268,15 @@ describe("App", () => {
     });
     expect(replaceState).toHaveBeenCalledWith(null, "", "/?keep=1");
     expect(loadSession()?.sessionToken).toBe("new-token");
-    expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(4);
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      "http://stale.local/api/pairing/complete",
+      expect.objectContaining({ method: "POST" }),
+    );
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "http://bridge.local/api/session/refresh",
       expect.objectContaining({ method: "POST" }),
     );
-    expect(
-      vi
-        .mocked(globalThis.fetch)
-        .mock.calls.some(([input]) => String(input) === "http://bridge.local/api/pairing/complete"),
-    ).toBe(false);
   });
 
   it("shares_in_flight_pairing_request_under_strict_mode", async () => {
@@ -480,6 +525,49 @@ describe("App", () => {
     expect(input).toHaveValue("");
   });
 
+  it("polls_selected_thread_events_after_initial_load", async () => {
+    saveActiveSession();
+    let eventFetches = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-poll", title: "Polling target", preview: "Waiting" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-poll/events") {
+        eventFetches += 1;
+        return jsonResponse([
+          sessionEvent({
+            id: eventFetches === 1 ? "event-initial" : "event-polled",
+            threadId: "thread-poll",
+            payload: {
+              role: "assistant",
+              text: eventFetches === 1 ? "Initial load" : "Polled reply",
+            },
+          }),
+        ]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("Initial load")).toBeInTheDocument();
+
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 2_100));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Polled reply")).toBeInTheDocument();
+    });
+    expect(eventFetches).toBeGreaterThanOrEqual(2);
+  });
+
   it("renders_empty_state_and_disables_composer_when_sessions_are_empty", async () => {
     saveActiveSession();
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
@@ -643,6 +731,47 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getAllByText("same text")).toHaveLength(1);
     });
+  });
+
+  it("keeps_polled_events_newest_first_and_reconciles_pending_echo_with_newline", () => {
+    const current = [
+      sessionEvent({
+        id: "old-assistant",
+        threadId: "thread-a",
+        payload: { role: "assistant", text: "Old answer" },
+        createdAt: 1_783_515_380_000,
+      }),
+      sessionEvent({
+        id: "local-pending",
+        threadId: "thread-a",
+        payload: { role: "user", text: "continue", pending: true },
+        createdAt: 1_783_515_390_000,
+      }),
+    ];
+    const polled = [
+      sessionEvent({
+        id: "turn-new:item-1",
+        threadId: "thread-a",
+        payload: { role: "user", text: "continue\n" },
+        createdAt: 1_783_515_391_000,
+      }),
+      sessionEvent({
+        id: "turn-new:item-2",
+        threadId: "thread-a",
+        payload: { role: "assistant", text: "New answer" },
+        createdAt: 1_783_515_391_000,
+      }),
+      current[0],
+    ];
+
+    const merged = mergePolledSessionEvents(current, polled);
+
+    expect(merged.map((event) => event.id)).toEqual([
+      "turn-new:item-1",
+      "turn-new:item-2",
+      "old-assistant",
+    ]);
+    expect(merged.map((event) => event.payload).filter((payload) => payload && typeof payload === "object" && "text" in payload && payload.text === "continue")).toHaveLength(0);
   });
 
   it("ignores_malformed_ws_event_and_handles_valid_approval_request", async () => {

@@ -61,7 +61,7 @@ sidecar 的诊断顺序：
 1. 查询 CDP targets。
 2. 选择 Codex page target。
 3. 注入 `window.__codexMobileBridge.rpc`。
-4. 通过 app-server RPC 检查 `thread/list`、`thread/turns/list`、`turn/start`。
+4. 通过 app-server RPC 检查 `thread/list`，如已有 thread 再检查 `thread/turns/list`。
 5. 根据结果返回 `writable`、`read_only` 或明确降级原因。
 
 ## 常见降级状态
@@ -71,8 +71,8 @@ sidecar 的诊断顺序：
 - `target_not_found`：CDP 可达，但没有识别到 Codex page target。
 - `inject_failed`：找到 Codex target，但页面内未发现可用 app-server client。
 - `rpc_unavailable`：注入成功但基础 app-server RPC 不可用。
-- `read_only`：可读取会话，但 `turn/start` 探测失败，手机端应禁用文本回写。
-- `writable`：会话读取和文本回写探测通过。
+- `read_only`：可读取会话，但文本回写能力不可用，手机端应禁用文本回写。
+- `writable`：Desktop bridge RPC 可用，手机端允许向已选 thread 发送文本。
 
 ## 局域网安全边界
 

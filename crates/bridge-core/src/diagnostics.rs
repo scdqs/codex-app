@@ -105,22 +105,13 @@ where
             );
         }
     };
-    let Some(first_thread) = threads.first() else {
-        return DiagnosticsReport::degraded(
-            BridgeConnectionState::ReadOnly,
-            "thread/list passed, but there are no threads available for turn/start probing",
-        );
-    };
-
-    if let Err(error) = client.list_turns(&first_thread.id).await {
-        return DiagnosticsReport::degraded(
-            BridgeConnectionState::RpcUnavailable,
-            error.to_string(),
-        );
-    }
-
-    if let Err(error) = client.probe_turn_start(&first_thread.id).await {
-        return DiagnosticsReport::degraded(BridgeConnectionState::ReadOnly, error.to_string());
+    if let Some(first_thread) = threads.first() {
+        if let Err(error) = client.list_turns(&first_thread.id).await {
+            return DiagnosticsReport::degraded(
+                BridgeConnectionState::RpcUnavailable,
+                error.to_string(),
+            );
+        }
     }
 
     DiagnosticsReport::ok(BridgeConnectionState::Writable)
@@ -141,7 +132,6 @@ mod tests {
         let transport = ScriptedTransport::new(vec![
             Ok(json!({ "data": [{ "id": "thread-1" }] })),
             Ok(json!({ "data": [] })),
-            Ok(json!({ "accepted": true })),
         ]);
         let client = AppServerJsonRpcClient::new(transport);
 
@@ -152,23 +142,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diagnostics_reports_read_only_when_turn_start_is_unavailable() {
+    async fn diagnostics_reports_writable_when_thread_list_passes_with_no_threads() {
+        let transport = ScriptedTransport::new(vec![Ok(json!({ "data": [] }))]);
+        let client = AppServerJsonRpcClient::new(transport);
+
+        let report = diagnose_app_server(&client).await;
+
+        assert_eq!(report.status, DiagnosticsStatus::Ok);
+        assert_eq!(report.connection_state, BridgeConnectionState::Writable);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_reports_rpc_unavailable_when_turns_list_fails() {
         let transport = ScriptedTransport::new(vec![
             Ok(json!({ "data": [{ "id": "thread-1" }] })),
-            Ok(json!({ "data": [] })),
-            Err("turn/start unavailable"),
+            Err("thread/turns/list unavailable"),
         ]);
         let client = AppServerJsonRpcClient::new(transport);
 
         let report = diagnose_app_server(&client).await;
 
         assert_eq!(report.status, DiagnosticsStatus::Degraded);
-        assert_eq!(report.connection_state, BridgeConnectionState::ReadOnly);
+        assert_eq!(
+            report.connection_state,
+            BridgeConnectionState::RpcUnavailable
+        );
         assert!(
             report
                 .detail
                 .expect("detail is present")
-                .contains("turn/start unavailable")
+                .contains("thread/turns/list unavailable")
         );
     }
 

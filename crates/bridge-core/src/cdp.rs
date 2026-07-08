@@ -229,10 +229,42 @@ impl BridgeConnectionState {
 }
 
 const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
-(() => {
+(async () => {
   if (globalThis.__codexMobileBridge && typeof globalThis.__codexMobileBridge.rpc === "function") {
     return true;
   }
+
+  const installDirectClientBridge = (client) => {
+    if (!client || typeof client.sendRequest !== "function") {
+      return false;
+    }
+    globalThis.__codexMobileBridge = {
+      mode: "direct-client",
+      rpc: async (request) => client.sendRequest(request.method, request.params || {}),
+    };
+    return true;
+  };
+
+  const installHostBridge = (sendRequest) => {
+    if (typeof sendRequest !== "function") {
+      return false;
+    }
+    globalThis.__codexMobileBridge = {
+      mode: "host-module",
+      rpc: async (request) => {
+        if (!request || typeof request.method !== "string") {
+          throw new Error("Invalid Codex mobile bridge request");
+        }
+        return await sendRequest("send-cli-request-for-host", {
+          hostId: "local",
+          method: request.method,
+          params: request.params || {},
+          timeoutMs: request.method === "turn/start" ? 60000 : 30000,
+        });
+      },
+    };
+    return true;
+  };
 
   const candidates = [
     globalThis.__codexAppServerClient,
@@ -241,14 +273,27 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
     globalThis.appServerClient,
   ];
   const client = candidates.find((candidate) => candidate && typeof candidate.sendRequest === "function");
-  if (!client) {
+  if (installDirectClientBridge(client)) {
+    return true;
+  }
+
+  const moduleUrls = Array.from(document.querySelectorAll('link[rel="modulepreload"], script[type="module"], script[src]'))
+    .map((element) => element.href || element.src)
+    .filter(Boolean);
+  const hostModuleUrl =
+    moduleUrls.find((url) => url.includes("new-thread-panel-page")) ||
+    moduleUrls.find((url) => url.includes("app-server-manager-signals"));
+  if (!hostModuleUrl) {
     return false;
   }
 
-  globalThis.__codexMobileBridge = {
-    rpc: async (request) => client.sendRequest(request.method, request.params || {}),
-  };
-  return true;
+  try {
+    const hostModule = await import(hostModuleUrl);
+    return installHostBridge(hostModule.pv);
+  } catch (error) {
+    globalThis.__codexMobileBridgeLastError = error?.message || String(error);
+    return false;
+  }
 })()
 "#;
 
@@ -277,7 +322,24 @@ fn codex_target_score(target: &CdpTarget) -> Option<u8> {
     let mut score = 0_u8;
     let mut matched_codex = false;
 
-    if title.contains("codex") {
+    if title.contains("codex mobile") {
+        return None;
+    }
+    if url == "app://-/index.html" {
+        score = score.saturating_add(80);
+        matched_codex = true;
+    } else if url.starts_with("app://-") {
+        score = score.saturating_add(60);
+        matched_codex = true;
+    }
+    if url.contains("codex.app") {
+        score = score.saturating_add(50);
+        matched_codex = true;
+    }
+    if title == "codex" {
+        score = score.saturating_add(30);
+        matched_codex = true;
+    } else if title.contains("codex") {
         score = score.saturating_add(20);
         matched_codex = true;
     }
@@ -374,6 +436,43 @@ mod tests {
         let selected = select_codex_target(&targets).expect("codex target is selected");
 
         assert_eq!(selected.id, "page-2");
+    }
+
+    #[test]
+    fn prefers_codex_desktop_app_over_mobile_bridge_page() {
+        let targets = vec![
+            target(
+                "page-1",
+                "page",
+                "Codex Mobile",
+                "http://192.168.1.166:57324/",
+            ),
+            target("page-2", "page", "Codex", "app://-/index.html"),
+        ];
+
+        let selected = select_codex_target(&targets).expect("codex target is selected");
+
+        assert_eq!(selected.id, "page-2");
+    }
+
+    #[test]
+    fn ignores_codex_mobile_bridge_page_when_desktop_app_is_absent() {
+        let targets = vec![target(
+            "page-1",
+            "page",
+            "Codex Mobile",
+            "http://192.168.1.166:57324/",
+        )];
+
+        let error = select_codex_target(&targets).expect_err("mobile bridge is ignored");
+
+        assert!(matches!(error, CdpError::NoCodexTarget));
+    }
+
+    #[test]
+    fn bridge_script_uses_current_codex_host_module_bridge() {
+        assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("new-thread-panel-page"));
+        assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("send-cli-request-for-host"));
     }
 
     #[test]

@@ -3,11 +3,13 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::PathBuf,
     process::Command,
+    sync::Arc,
 };
 
 use anyhow::Context;
 use bridge_core::{
-    cdp::CdpClient,
+    cdp::{CdpClient, select_codex_target},
+    codex_rpc::{AppServerJsonRpcClient, CdpAppServerTransport, CodexAdapter},
     diagnostics::diagnose_cdp_app_server,
     event_hub::EventHub,
     http_api::{AppState, serve_with_static_dir},
@@ -70,10 +72,23 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "Local control token for starting device pairing: {control_token}. Keep this token on this machine; it is not exposed by the HTTP API."
     );
-    let state =
+    let codex_adapter = cdp_app_server_adapter(&cdp_client).await;
+    let mut state =
         AppState::new(pairing, EventHub::new(), control_token).with_diagnostics(diagnostics);
+    if let Some(adapter) = codex_adapter {
+        state = state.with_codex_adapter(adapter);
+    }
 
     serve_with_static_dir(bind_addr, state, pwa_dir).await
+}
+
+async fn cdp_app_server_adapter(cdp_client: &CdpClient) -> Option<Arc<dyn CodexAdapter>> {
+    let targets = cdp_client.list_targets().await.ok()?;
+    let target = select_codex_target(&targets).ok()?;
+    cdp_client.inject_app_server_bridge(&target).await.ok()?;
+    Some(Arc::new(AppServerJsonRpcClient::new(
+        CdpAppServerTransport::new(cdp_client.clone(), target),
+    )))
 }
 
 fn bridge_url_for_bind_addr(bind_addr: SocketAddr) -> String {

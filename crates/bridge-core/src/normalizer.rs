@@ -129,6 +129,12 @@ fn event_from_item(
         .or(turn.updated_at)
         .unwrap_or_default();
     let id = string_field(item, &["id", "itemId", "item_id"])
+        .map(|item_id| {
+            turn.id
+                .as_ref()
+                .map(|turn_id| format!("{turn_id}:{item_id}"))
+                .unwrap_or(item_id)
+        })
         .or_else(|| turn.id.clone().map(|id| format!("{id}:{item_index}")))
         .unwrap_or_else(|| format!("{thread_id}:turn-{turn_index}:item-{item_index}"));
 
@@ -431,6 +437,39 @@ mod tests {
         assert_eq!(event.payload["text"], json!("hello"));
         assert_eq!(event.payload["raw"]["delta"], json!("hello"));
         assert_eq!(event.created_at, 1_725_000_000_000);
+    }
+
+    #[test]
+    fn prefixes_turn_id_to_turn_item_event_ids() {
+        let turns = vec![
+            CodexTurn {
+                id: Some("turn-new".to_string()),
+                thread_id: Some("thread-1".to_string()),
+                created_at: Some(1_725_000_000_000),
+                updated_at: None,
+                raw: json!({
+                    "items": [
+                        { "id": "item-1", "type": "userMessage", "content": "new prompt" }
+                    ]
+                }),
+            },
+            CodexTurn {
+                id: Some("turn-old".to_string()),
+                thread_id: Some("thread-1".to_string()),
+                created_at: Some(1_724_999_000_000),
+                updated_at: None,
+                raw: json!({
+                    "items": [
+                        { "id": "item-1", "type": "userMessage", "content": "old prompt" }
+                    ]
+                }),
+            },
+        ];
+
+        let events = Normalizer::events_from_turns("thread-1", &turns);
+
+        assert_eq!(events[0].id, "turn-new:item-1");
+        assert_eq!(events[1].id, "turn-old:item-1");
     }
 
     #[test]

@@ -67,6 +67,11 @@ impl Storage {
                 revoked_at
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(device_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                secret_hash = excluded.secret_hash,
+                last_seen_at = excluded.last_seen_at,
+                revoked_at = excluded.revoked_at
             "#,
             params![
                 device.device_id,
