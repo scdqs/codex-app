@@ -66,6 +66,25 @@ describe("App", () => {
     expect(screen.getByLabelText("Connection status")).toHaveTextContent("Session revoked or expired");
   });
 
+  it("hides_sample_data_when_pairing_link_is_invalid", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/?pairingToken=used-token&bridgeUrl=http%3A%2F%2Fbridge.local",
+    );
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse({ error: "invalid pairing token" }, 400));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Connection error");
+    });
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("Pairing link expired");
+    expect(screen.queryByText("Run npm install")).not.toBeInTheDocument();
+    expect(screen.queryByText("Mobile bridge MVP")).not.toBeInTheDocument();
+    expect(screen.getByText("No live sessions yet. Use the newest pairing URL from the bridge terminal.")).toBeInTheDocument();
+  });
+
   it("clears_pairing_token_after_successful_pairing", async () => {
     window.history.replaceState(
       null,
@@ -115,12 +134,16 @@ describe("App", () => {
       bridgeUrl: "http://bridge.local",
     });
     const replaceState = vi.spyOn(window.history, "replaceState");
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      new Response(JSON.stringify({ status: "ok", connectionState: "connected" }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "connected" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
 
     render(<App />);
 
@@ -128,10 +151,14 @@ describe("App", () => {
       expect(screen.getByLabelText("Connection status")).toHaveTextContent("Connected");
     });
     expect(replaceState).toHaveBeenCalledWith(null, "", "/?keep=1");
-    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     expect(globalThis.fetch).toHaveBeenCalledWith("http://bridge.local/api/health", {
       headers: { Authorization: "Bearer session-1" },
     });
+    expect(
+      vi
+        .mocked(globalThis.fetch)
+        .mock.calls.some(([input]) => String(input) === "http://stale.local/api/pairing/complete"),
+    ).toBe(false);
   });
 
   it("refreshes_expired_saved_session_instead_of_reusing_stale_pairing_token", async () => {
@@ -256,7 +283,10 @@ describe("App", () => {
       expect(screen.getByLabelText("Connection status")).toHaveTextContent("Writable");
     });
     expect(loadSession()?.sessionToken).toBe("new-token");
-    expect(globalThis.fetch).toHaveBeenCalledTimes(4);
+    const refreshCalls = vi
+      .mocked(globalThis.fetch)
+      .mock.calls.filter(([input, init]) => String(input) === "http://bridge.local/api/session/refresh" && init?.method === "POST");
+    expect(refreshCalls).toHaveLength(1);
   });
 
   it("rejects_malformed_pairing_response_without_saving_session", async () => {

@@ -130,6 +130,7 @@ interface ConnectionViewState {
 const pairingAttempts = new Map<string, Promise<DeviceSession>>();
 
 function App() {
+  const hasInitialPairingPayload = useMemo(() => readPairingPayloadFromUrl(window.location.href) !== null, []);
   const [selectedThreadId, setSelectedThreadId] = useState(sampleSessions[0].threadId);
   const [draft, setDraft] = useState("");
   const [connection, setConnection] = useState<ConnectionViewState>({ label: "Unpaired" });
@@ -139,8 +140,9 @@ function App() {
   const [liveApprovals, setLiveApprovals] = useState<ApprovalRequest[]>([]);
   const [sending, setSending] = useState(false);
   const [decidingApprovalIds, setDecidingApprovalIds] = useState<Record<string, DecisionKind>>({});
-  const sessions = liveSessions ?? sampleSessions;
-  const approvals = liveSessions === null ? sampleApprovals : liveApprovals;
+  const showSampleData = connection.label === "Unpaired" && !hasInitialPairingPayload && !deviceSession;
+  const sessions = liveSessions ?? (showSampleData ? sampleSessions : []);
+  const approvals = showSampleData ? sampleApprovals : liveApprovals;
   const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? null;
   const selectedApprovals = selectedSession
     ? approvals.filter((approval) => approval.threadId === selectedSession.threadId)
@@ -148,7 +150,7 @@ function App() {
   const selectedEvents =
     selectedSession
       ? eventsByThread[selectedSession.threadId] ??
-        (liveSessions ? [] : sampleEvents.filter((event) => event.threadId === selectedSession.threadId))
+        (showSampleData ? sampleEvents.filter((event) => event.threadId === selectedSession.threadId) : [])
       : [];
   const pendingCount = approvals.length;
   const canSend = (connection.label === "Connected" || connection.label === "Writable") && Boolean(deviceSession) && Boolean(selectedSession);
@@ -157,8 +159,20 @@ function App() {
     if (pendingCount > 0) {
       return `${pendingCount} pending`;
     }
+    if (connection.label === "Connection error") {
+      return "Needs new link";
+    }
+    if (connection.label === "Pairing") {
+      return "Pairing";
+    }
+    if (connection.label === "Unpaired") {
+      return "Open pairing link";
+    }
+    if (connection.label === "Read-only") {
+      return "Read-only";
+    }
     return "Writable";
-  }, [pendingCount]);
+  }, [connection.label, pendingCount]);
 
   useEffect(() => {
     let cancelled = false;
@@ -547,6 +561,11 @@ function SessionList({
         <span>{sessionItems.length}</span>
       </div>
       <div className="session-list" role="list">
+        {sessionItems.length === 0 ? (
+          <div className="empty-state" role="status">
+            No live sessions yet. Use the newest pairing URL from the bridge terminal.
+          </div>
+        ) : null}
         {sessionItems.map((session) => {
           const selected = session.threadId === selectedThreadId;
           return (
@@ -920,6 +939,9 @@ function mapHealthToConnection(health: HealthResponse): ConnectionViewState {
 function connectionErrorText(error: unknown): string {
   if (isAuthError(error)) {
     return "Session revoked or expired";
+  }
+  if (error instanceof ApiError && error.status === 400) {
+    return "Pairing link expired or already used. Restart the bridge and open the newest pairing URL.";
   }
   if (error instanceof Error) {
     return error.message;
