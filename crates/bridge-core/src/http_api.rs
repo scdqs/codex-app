@@ -19,11 +19,12 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::{
     codex_rpc::{CodexAdapter, CodexRpcError},
+    diagnostics::DiagnosticsReport,
     event_hub::EventHub,
     pairing::{DEFAULT_PAIRING_TOKEN_TTL_MS, PairingError, PairingManager},
     protocol::{
@@ -40,6 +41,7 @@ pub struct AppState {
     refresh_failures: Arc<Mutex<HashMap<String, usize>>>,
     control_token: Arc<str>,
     codex_adapter: Option<Arc<dyn CodexAdapter>>,
+    diagnostics: Arc<RwLock<DiagnosticsReport>>,
 }
 
 const EVENT_HISTORY_LIMIT_PER_THREAD: usize = 256;
@@ -55,8 +57,8 @@ struct AuthenticatedDevice {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealthResponse {
-    status: &'static str,
-    connection_state: &'static str,
+    status: String,
+    connection_state: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -145,12 +147,20 @@ impl AppState {
             refresh_failures: Arc::new(Mutex::new(HashMap::new())),
             control_token: control_token.into(),
             codex_adapter: None,
+            diagnostics: Arc::new(RwLock::new(DiagnosticsReport::default())),
         }
     }
 
     pub fn with_codex_adapter(mut self, adapter: Arc<dyn CodexAdapter>) -> Self {
         self.codex_adapter = Some(adapter);
         self
+    }
+
+    pub fn with_diagnostics(self, diagnostics: DiagnosticsReport) -> Self {
+        Self {
+            diagnostics: Arc::new(RwLock::new(diagnostics)),
+            ..self
+        }
     }
 
     pub fn event_hub(&self) -> EventHub {
@@ -207,10 +217,11 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let diagnostics = state.diagnostics.read().await;
     Json(HealthResponse {
-        status: "ok",
-        connection_state: "mocked",
+        status: diagnostics.status.as_str().to_string(),
+        connection_state: diagnostics.connection_state.as_str().to_string(),
     })
 }
 
@@ -633,8 +644,8 @@ mod tests {
         assert_eq!(
             response_json(response).await,
             json!({
-                "status": "ok",
-                "connectionState": "mocked",
+                "status": "degraded",
+                "connectionState": "codex_not_running",
             })
         );
     }

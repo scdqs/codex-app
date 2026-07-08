@@ -1,6 +1,7 @@
 pub mod approval;
 pub mod cdp;
 pub mod codex_rpc;
+pub mod diagnostics;
 pub mod event_hub;
 pub mod http_api;
 pub mod normalizer;

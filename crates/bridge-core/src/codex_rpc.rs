@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::protocol::ApprovalDecision;
+use crate::{
+    cdp::{CdpClient, CdpTarget},
+    protocol::ApprovalDecision,
+};
 
 #[async_trait]
 pub trait CodexAdapter: Send + Sync {
@@ -31,6 +34,12 @@ pub struct AppServerJsonRpcClient<T> {
     transport: T,
     next_request_id: AtomicU64,
     next_client_message_id: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CdpAppServerTransport {
+    cdp: CdpClient,
+    target: CdpTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -112,6 +121,48 @@ where
                 params,
             })
             .await
+    }
+
+    pub async fn probe_turn_start(&self, thread_id: &str) -> Result<(), CodexRpcError> {
+        self.call(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "clientUserMessageId": "codex-mobile-healthcheck",
+                "input": [],
+                "dryRun": true,
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+impl CdpAppServerTransport {
+    pub fn new(cdp: CdpClient, target: CdpTarget) -> Self {
+        Self { cdp, target }
+    }
+}
+
+#[async_trait]
+impl JsonRpcTransport for CdpAppServerTransport {
+    async fn send_request(&self, request: JsonRpcRequest) -> Result<Value, CodexRpcError> {
+        let request_json = serde_json::to_string(&request)
+            .map_err(|error| CodexRpcError::Transport(error.to_string()))?;
+        let expression = format!(
+            r#"(async () => {{
+  const bridge = globalThis.__codexMobileBridge;
+  if (!bridge || typeof bridge.rpc !== "function") {{
+    throw new Error("Codex mobile bridge is not injected");
+  }}
+  return await bridge.rpc({request_json});
+}})()"#
+        );
+
+        self.cdp
+            .evaluate_on_target(&self.target, &expression)
+            .await
+            .map_err(|error| CodexRpcError::Transport(error.to_string()))
     }
 }
 

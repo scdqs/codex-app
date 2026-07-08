@@ -3,6 +3,7 @@ use std::{env, net::SocketAddr, path::PathBuf};
 use anyhow::Context;
 use bridge_core::{
     cdp::CdpClient,
+    diagnostics::diagnose_cdp_app_server,
     event_hub::EventHub,
     http_api::{AppState, serve},
     pairing::PairingManager,
@@ -32,28 +33,23 @@ async fn main() -> anyhow::Result<()> {
     let storage = Storage::open(db_path).context("open bridge storage")?;
     let control_token = Uuid::new_v4().to_string();
     println!("Codex mobile bridge listening on {bind_addr}");
-    let cdp_health = CdpClient::new(debug_port)
-        .context("create cdp client")?
-        .bridge_health()
-        .await;
+    let cdp_client = CdpClient::new(debug_port).context("create cdp client")?;
+    let diagnostics = diagnose_cdp_app_server(&cdp_client).await;
     println!(
         "Codex CDP debug port {debug_port}: {} ({}){}",
-        cdp_health.status.as_str(),
-        cdp_health.connection_state.as_str(),
-        cdp_health
-            .target_title
+        diagnostics.status.as_str(),
+        diagnostics.connection_state.as_str(),
+        diagnostics
+            .detail
             .as_deref()
-            .map(|title| format!(" target={title}"))
-            .or_else(|| cdp_health
-                .reason
-                .as_deref()
-                .map(|reason| format!(" reason={reason}")))
+            .map(|detail| format!(" detail={detail}"))
             .unwrap_or_default()
     );
     println!(
         "Local control token for starting device pairing: {control_token}. Keep this token on this machine; it is not exposed by the HTTP API."
     );
-    let state = AppState::new(PairingManager::new(storage), EventHub::new(), control_token);
+    let state = AppState::new(PairingManager::new(storage), EventHub::new(), control_token)
+        .with_diagnostics(diagnostics);
 
     serve(bind_addr, state).await
 }

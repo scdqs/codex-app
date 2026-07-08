@@ -52,8 +52,13 @@ pub enum BridgeHealthStatus {
 #[serde(rename_all = "snake_case")]
 pub enum BridgeConnectionState {
     Connected,
+    CodexNotRunning,
     CdpUnavailable,
     TargetNotFound,
+    InjectFailed,
+    RpcUnavailable,
+    ReadOnly,
+    Writable,
 }
 
 #[derive(Debug, Error)]
@@ -76,6 +81,8 @@ pub enum CdpError {
     RuntimeException(String),
     #[error("malformed cdp response: {0}")]
     MalformedResponse(&'static str),
+    #[error("codex app-server bridge injection failed")]
+    InjectFailed,
 }
 
 impl CdpClient {
@@ -152,6 +159,17 @@ impl CdpClient {
             ),
         }
     }
+
+    pub async fn inject_app_server_bridge(&self, target: &CdpTarget) -> Result<(), CdpError> {
+        let injected = self
+            .evaluate_on_target(target, CODEX_APP_SERVER_BRIDGE_SCRIPT)
+            .await?;
+        if injected.as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(CdpError::InjectFailed)
+        }
+    }
 }
 
 pub fn select_codex_target(targets: &[CdpTarget]) -> Result<CdpTarget, CdpError> {
@@ -199,11 +217,40 @@ impl BridgeConnectionState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Connected => "connected",
+            Self::CodexNotRunning => "codex_not_running",
             Self::CdpUnavailable => "cdp_unavailable",
             Self::TargetNotFound => "target_not_found",
+            Self::InjectFailed => "inject_failed",
+            Self::RpcUnavailable => "rpc_unavailable",
+            Self::ReadOnly => "read_only",
+            Self::Writable => "writable",
         }
     }
 }
+
+const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
+(() => {
+  if (globalThis.__codexMobileBridge && typeof globalThis.__codexMobileBridge.rpc === "function") {
+    return true;
+  }
+
+  const candidates = [
+    globalThis.__codexAppServerClient,
+    globalThis.__codex?.appServerClient,
+    globalThis.codex?.appServerClient,
+    globalThis.appServerClient,
+  ];
+  const client = candidates.find((candidate) => candidate && typeof candidate.sendRequest === "function");
+  if (!client) {
+    return false;
+  }
+
+  globalThis.__codexMobileBridge = {
+    rpc: async (request) => client.sendRequest(request.method, request.params || {}),
+  };
+  return true;
+})()
+"#;
 
 fn bridge_health_from_targets(targets: &[CdpTarget]) -> BridgeHealth {
     match select_codex_target(targets) {
