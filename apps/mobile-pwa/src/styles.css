@@ -364,6 +364,7 @@ h3 {
 
 .session-list {
   flex: 1;
+  align-content: start;
 }
 
 .event-stream {

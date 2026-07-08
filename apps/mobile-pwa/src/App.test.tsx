@@ -60,6 +60,8 @@ describe("App", () => {
     expect(css).toContain("overflow-y: auto");
     expect(css).toContain(".session-list-panel,");
     expect(css).toContain("flex-direction: column");
+    expect(css).toMatch(/\.session-list\s*\{[^}]*align-content:\s*start;/);
+    expect(css).toMatch(/\.event-stream\s*\{[^}]*align-content:\s*start;/);
   });
 
   it("shows_revoked_or_expired_connection_error", async () => {
