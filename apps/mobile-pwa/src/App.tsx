@@ -643,7 +643,7 @@ function SessionDetail({
       shouldStickToBottomRef.current = true;
     }
     previousThreadIdRef.current = threadId;
-  }, [eventTailKey, threadId]);
+  }, [eventTailKey, sessionEvents.length, threadId]);
 
   function handleEventStreamScroll() {
     const stream = eventStreamRef.current;
@@ -778,8 +778,14 @@ export function mergeSessionEvents(events: SessionEvent[]): SessionEvent[] {
 }
 
 export function appendOrMergeSessionEvent(events: SessionEvent[], event: SessionEvent): SessionEvent[] {
-  if (events.some((existing) => existing.id === event.id)) {
-    return events;
+  const existingIndex = events.findIndex((existing) => existing.id === event.id);
+  if (existingIndex !== -1) {
+    if (isSameSessionEvent(events[existingIndex], event)) {
+      return events;
+    }
+    const nextEvents = [...events];
+    nextEvents[existingIndex] = event;
+    return nextEvents;
   }
 
   if (isUserMessage(event)) {
@@ -825,6 +831,50 @@ export function appendOrMergeSessionEvent(events: SessionEvent[], event: Session
       payload: { role: "assistant", text: delta },
     },
   ];
+}
+
+function isSameSessionEvent(left: SessionEvent, right: SessionEvent): boolean {
+  return (
+    left.id === right.id &&
+    left.threadId === right.threadId &&
+    left.type === right.type &&
+    left.createdAt === right.createdAt &&
+    isSameJsonValue(left.payload, right.payload)
+  );
+}
+
+function isSameJsonValue(left: SessionEvent["payload"], right: SessionEvent["payload"]): boolean {
+  if (Object.is(left, right)) {
+    return true;
+  }
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+      return false;
+    }
+    return left.every((item, index) => isSameJsonValue(item, right[index]));
+  }
+  if (
+    left === null ||
+    right === null ||
+    typeof left !== "object" ||
+    typeof right !== "object"
+  ) {
+    return false;
+  }
+
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) {
+    return false;
+  }
+
+  const leftRecord = left as Record<string, SessionEvent["payload"]>;
+  const rightRecord = right as Record<string, SessionEvent["payload"]>;
+  return leftKeys.every(
+    (key) =>
+      Object.prototype.hasOwnProperty.call(rightRecord, key) &&
+      isSameJsonValue(leftRecord[key], rightRecord[key]),
+  );
 }
 
 export function mergePolledSessionEvents(current: SessionEvent[], polled: SessionEvent[]): SessionEvent[] {

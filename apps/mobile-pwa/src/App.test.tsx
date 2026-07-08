@@ -478,6 +478,25 @@ describe("App", () => {
     expect(merged[0].payload).toEqual({ role: "assistant", text: "Hello!" });
   });
 
+  it("updates_same-id_assistant_message_with_new_text", () => {
+    const initial = sessionEvent({
+      id: "assistant-stream",
+      threadId: "thread-a",
+      payload: { role: "assistant", text: "Hel" },
+    });
+    const merged = appendOrMergeSessionEvent(
+      [initial],
+      sessionEvent({
+        id: "assistant-stream",
+        threadId: "thread-a",
+        payload: { role: "assistant", text: "Hello" },
+      }),
+    );
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].payload).toEqual({ role: "assistant", text: "Hello" });
+  });
+
   it("starts_new_delta_tail_after_intervening_user_message", () => {
     const merged = appendOrMergeSessionEvent(
       [
@@ -758,6 +777,71 @@ describe("App", () => {
 
     expect(await screen.findByText("Second")).toBeInTheDocument();
     expect(scrollTo).toHaveBeenLastCalledWith({ top: 900, behavior: "auto" });
+  });
+
+  it("keeps_bottom_when_polled_backfill_grows_event_list_without_changing_tail", async () => {
+    saveActiveSession();
+    const scrollTo = vi.fn();
+    HTMLElement.prototype.scrollTo = scrollTo;
+    let eventFetches = 0;
+    let resolveBackfill: (response: Response) => void = () => {};
+    const backfillResponse = new Promise<Response>((resolve) => {
+      resolveBackfill = resolve;
+    });
+    const tailEvent = sessionEvent({
+      id: "event-tail",
+      threadId: "thread-live",
+      payload: { role: "assistant", text: "Tail" },
+      createdAt: 1_783_515_390_000,
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-live", title: "Live thread", preview: "Real session" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-live/events") {
+        eventFetches += 1;
+        if (eventFetches === 1) {
+          return jsonResponse([tailEvent]);
+        }
+        return backfillResponse;
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("Tail")).toBeInTheDocument();
+    const stream = screen.getByLabelText("Session event stream");
+    setScrollMetrics(stream, { scrollTop: 720, clientHeight: 200, scrollHeight: 900 });
+    fireEvent.scroll(stream);
+    scrollTo.mockClear();
+
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 2_100));
+    });
+    setScrollMetrics(stream, { scrollTop: 720, clientHeight: 200, scrollHeight: 1_200 });
+    await act(async () => {
+      resolveBackfill(
+        jsonResponse([
+          sessionEvent({
+            id: "event-backfill",
+            threadId: "thread-live",
+            payload: { role: "assistant", text: "Backfilled" },
+            createdAt: 1_783_515_380_000,
+          }),
+          tailEvent,
+        ]),
+      );
+    });
+
+    expect(await screen.findByText("Backfilled")).toBeInTheDocument();
+    expect(scrollTo).toHaveBeenLastCalledWith({ top: 1_200, behavior: "auto" });
   });
 
   it("does_not_steal_scroll_when_user_is_reading_history", async () => {
