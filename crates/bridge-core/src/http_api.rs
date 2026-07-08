@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
+    codex_rpc::{CodexAdapter, CodexRpcError},
     event_hub::EventHub,
     pairing::{DEFAULT_PAIRING_TOKEN_TTL_MS, PairingError, PairingManager},
     protocol::{
@@ -38,6 +39,7 @@ pub struct AppState {
     event_history: Arc<Mutex<HashMap<String, VecDeque<SessionEvent>>>>,
     refresh_failures: Arc<Mutex<HashMap<String, usize>>>,
     control_token: Arc<str>,
+    codex_adapter: Option<Arc<dyn CodexAdapter>>,
 }
 
 const EVENT_HISTORY_LIMIT_PER_THREAD: usize = 256;
@@ -142,7 +144,13 @@ impl AppState {
             event_history: Arc::new(Mutex::new(HashMap::new())),
             refresh_failures: Arc::new(Mutex::new(HashMap::new())),
             control_token: control_token.into(),
+            codex_adapter: None,
         }
+    }
+
+    pub fn with_codex_adapter(mut self, adapter: Arc<dyn CodexAdapter>) -> Self {
+        self.codex_adapter = Some(adapter);
+        self
     }
 
     pub fn event_hub(&self) -> EventHub {
@@ -352,6 +360,12 @@ async fn decide_approval(
         decided_at: current_time_ms(),
     };
 
+    if let Some(adapter) = state.codex_adapter.as_ref() {
+        adapter
+            .respond_approval(&decision.approval_id, &decision)
+            .await?;
+    }
+
     state
         .event_hub
         .publish(ServerEnvelope::ApprovalResolved(decision));
@@ -479,11 +493,18 @@ fn current_time_ms() -> u64 {
 enum ApiError {
     Unauthorized,
     Pairing(PairingError),
+    Adapter(CodexRpcError),
 }
 
 impl From<PairingError> for ApiError {
     fn from(error: PairingError) -> Self {
         Self::Pairing(error)
+    }
+}
+
+impl From<CodexRpcError> for ApiError {
+    fn from(error: CodexRpcError) -> Self {
+        Self::Adapter(error)
     }
 }
 
@@ -503,6 +524,7 @@ impl IntoResponse for ApiError {
             Self::Pairing(PairingError::DeviceNotFound) => {
                 (StatusCode::NOT_FOUND, "device not found".to_string())
             }
+            Self::Adapter(error) => (StatusCode::BAD_GATEWAY, error.to_string()),
         };
 
         (status, Json(ErrorResponse { error: message })).into_response()
@@ -518,18 +540,23 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request, StatusCode, header},
     };
     use serde_json::{Value, json};
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex as StdMutex},
+    };
     use tempfile::{TempDir, tempdir};
     use tower::ServiceExt;
 
     use crate::{
+        codex_rpc::{CodexAdapter, CodexRpcError, CodexThread, CodexTurn},
         pairing::PairingManager,
-        protocol::{SessionSnapshot, SessionStatus},
+        protocol::{ApprovalDecision, SessionSnapshot, SessionStatus},
         storage::Storage,
     };
 
@@ -943,6 +970,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_decision_routes_to_adapter() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::default());
+        let decisions = adapter.decisions();
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/approvals/approval-1/decision")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "decision": "approve", "comment": "ship it" }).to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let decisions = decisions.lock().expect("decisions lock");
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].approval_id, "approval-1");
+        assert_eq!(decisions[0].device_id, "phone-1");
+        assert_eq!(decisions[0].decision, DecisionKind::Approve);
+        assert_eq!(decisions[0].comment.as_deref(), Some("ship it"));
+    }
+
+    #[tokio::test]
     async fn websocket_route_rejects_missing_and_invalid_tokens_before_upgrade() {
         let (_dir, state) = test_state();
         let app = build_router(state);
@@ -1095,5 +1154,58 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body[0]["id"], json!("event-1"));
         assert_eq!(body[0]["payload"]["text"], json!("published"));
+    }
+
+    #[derive(Default)]
+    struct RecordingAdapter {
+        decisions: Arc<StdMutex<Vec<ApprovalDecision>>>,
+    }
+
+    impl RecordingAdapter {
+        fn decisions(&self) -> Arc<StdMutex<Vec<ApprovalDecision>>> {
+            self.decisions.clone()
+        }
+    }
+
+    #[async_trait]
+    impl CodexAdapter for RecordingAdapter {
+        async fn list_threads(&self) -> Result<Vec<CodexThread>, CodexRpcError> {
+            Ok(Vec::new())
+        }
+
+        async fn resume_thread(
+            &self,
+            _thread_id: &str,
+        ) -> Result<Option<CodexThread>, CodexRpcError> {
+            Ok(None)
+        }
+
+        async fn list_turns(&self, _thread_id: &str) -> Result<Vec<CodexTurn>, CodexRpcError> {
+            Ok(Vec::new())
+        }
+
+        async fn send_user_message(
+            &self,
+            _thread_id: &str,
+            _text: &str,
+        ) -> Result<(), CodexRpcError> {
+            Ok(())
+        }
+
+        async fn subscribe_events(&self, _thread_id: Option<&str>) -> Result<(), CodexRpcError> {
+            Ok(())
+        }
+
+        async fn respond_approval(
+            &self,
+            _approval_id: &str,
+            decision: &ApprovalDecision,
+        ) -> Result<(), CodexRpcError> {
+            self.decisions
+                .lock()
+                .expect("decisions lock")
+                .push(decision.clone());
+            Ok(())
+        }
     }
 }

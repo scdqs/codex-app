@@ -1,5 +1,5 @@
 import type { DeviceSession } from "./storage";
-import type { SessionEvent, SessionSnapshot } from "./protocol";
+import type { DecisionKind, SessionEvent, SessionSnapshot } from "./protocol";
 
 export interface PairingPayload {
   pairingToken: string;
@@ -117,6 +117,26 @@ export async function sendTextMessage(
 
   if (!response.ok) {
     throw new ApiError(response.status, `Send message request failed with ${response.status}`);
+  }
+}
+
+export async function decideApproval(
+  bridgeUrl: string,
+  sessionToken: string,
+  approvalId: string,
+  decision: DecisionKind,
+): Promise<void> {
+  const response = await fetch(apiUrl(bridgeUrl, `/api/approvals/${encodeURIComponent(approvalId)}/decision`), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ decision }),
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status, `Approval decision request failed with ${response.status}`);
   }
 }
 

@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod cdp;
 pub mod codex_rpc;
 pub mod event_hub;

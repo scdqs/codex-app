@@ -636,6 +636,75 @@ describe("App", () => {
     expect(screen.queryByText("bad-event")).not.toBeInTheDocument();
     expect(await screen.findByText("Approve valid command")).toBeInTheDocument();
   });
+
+  it("renders_approval_card_and_approve_reject_buttons", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-live",
+            title: "Live thread",
+            preview: "Real session",
+            status: "waiting_for_approval",
+            pendingApprovalIds: ["approval-real"],
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-live/events") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/approvals/approval-real/decision" && init?.method === "POST") {
+        return jsonResponse({ accepted: true }, 202);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Live thread" });
+    act(() => {
+      MockWebSocket.instances[0].emit({
+        type: "approval_request",
+        payload: {
+          id: "approval-real",
+          threadId: "thread-live",
+          kind: "command",
+          title: "Run real check",
+          detail: "npm test",
+          riskHint: "Runs local tests",
+          createdAt: 1_783_515_390_000,
+        },
+      });
+    });
+
+    expect(await screen.findByText("Run real check")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reject Run real check" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Approve Run real check" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://bridge.local/api/approvals/approval-real/decision",
+        expect.objectContaining({
+          method: "POST",
+          headers: expect.objectContaining({
+            Authorization: "Bearer session-1",
+            "Content-Type": "application/json",
+          }),
+          body: JSON.stringify({ decision: "approve" }),
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("Run real check")).not.toBeInTheDocument();
+    });
+    expect(await screen.findByText("approval resolved")).toBeInTheDocument();
+  });
 });
 
 function saveActiveSession() {

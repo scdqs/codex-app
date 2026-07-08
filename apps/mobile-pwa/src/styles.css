@@ -321,6 +321,11 @@ h3 {
   background: var(--surface-strong);
 }
 
+.icon-button:disabled {
+  cursor: wait;
+  opacity: 0.48;
+}
+
 .icon-button.danger {
   border-color: rgb(211 93 85 / 30%);
   color: #f0aaa5;

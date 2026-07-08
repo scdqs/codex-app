@@ -12,11 +12,20 @@ import {
   TerminalSquare,
   X,
 } from "lucide-react";
-import type { ApprovalDecision, ApprovalKind, ApprovalRequest, ServerEnvelope, SessionEvent, SessionSnapshot } from "./protocol";
+import type {
+  ApprovalDecision,
+  ApprovalKind,
+  ApprovalRequest,
+  DecisionKind,
+  ServerEnvelope,
+  SessionEvent,
+  SessionSnapshot,
+} from "./protocol";
 import {
   ApiError,
   completePairing,
   connectWebSocket,
+  decideApproval,
   getHealth,
   listSessionEvents,
   listSessions,
@@ -129,6 +138,7 @@ function App() {
   const [eventsByThread, setEventsByThread] = useState<Record<string, SessionEvent[]>>({});
   const [liveApprovals, setLiveApprovals] = useState<ApprovalRequest[]>([]);
   const [sending, setSending] = useState(false);
+  const [decidingApprovalIds, setDecidingApprovalIds] = useState<Record<string, DecisionKind>>({});
   const sessions = liveSessions ?? sampleSessions;
   const approvals = liveSessions === null ? sampleApprovals : liveApprovals;
   const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? null;
@@ -353,12 +363,58 @@ function App() {
     }
   }
 
+  async function handleApprovalDecision(approval: ApprovalRequest, decision: DecisionKind) {
+    const activeSession = deviceSession;
+    if (!activeSession || decidingApprovalIds[approval.id]) {
+      return;
+    }
+
+    setDecidingApprovalIds((current) => ({ ...current, [approval.id]: decision }));
+    try {
+      await decideApproval(activeSession.bridgeUrl, activeSession.sessionToken, approval.id, decision);
+      const decidedAt = Date.now();
+      const resolved: ApprovalDecision = {
+        approvalId: approval.id,
+        decision,
+        deviceId: activeSession.deviceId,
+        decidedAt,
+      };
+      setLiveApprovals((current) => removeResolvedApproval(current, resolved));
+      setEventsByThread((current) => ({
+        ...current,
+        [approval.threadId]: appendOrMergeSessionEvent(current[approval.threadId] ?? [], {
+          id: `approval-${approval.id}-${decision}-${decidedAt}`,
+          threadId: approval.threadId,
+          type: "approval_resolved",
+          payload: {
+            approvalId: approval.id,
+            decision,
+            title: approval.title,
+          },
+          createdAt: decidedAt,
+        }),
+      }));
+    } catch (error) {
+      setConnection({ label: "Connection error", detail: connectionErrorText(error) });
+    } finally {
+      setDecidingApprovalIds((current) => {
+        const next = { ...current };
+        delete next[approval.id];
+        return next;
+      });
+    }
+  }
+
   return (
     <main className="app-shell" aria-label="Codex mobile workbench">
       <ConnectionBar connection={connection} statusText={statusText} />
 
       <section className="workbench" aria-label="Workbench">
-        <ApprovalQueue approvals={approvals} />
+        <ApprovalQueue
+          approvals={approvals}
+          decidingApprovalIds={decidingApprovalIds}
+          onDecision={handleApprovalDecision}
+        />
 
         <section className="session-grid" aria-label="Sessions and detail">
           <SessionList
@@ -410,7 +466,15 @@ function ConnectionBar({
   );
 }
 
-function ApprovalQueue({ approvals }: { approvals: ApprovalRequest[] }) {
+function ApprovalQueue({
+  approvals,
+  decidingApprovalIds,
+  onDecision,
+}: {
+  approvals: ApprovalRequest[];
+  decidingApprovalIds: Record<string, DecisionKind>;
+  onDecision: (approval: ApprovalRequest, decision: DecisionKind) => void;
+}) {
   return (
     <section className="approval-queue" aria-labelledby="approval-heading">
       <div className="section-heading">
@@ -418,34 +482,50 @@ function ApprovalQueue({ approvals }: { approvals: ApprovalRequest[] }) {
         <span>{approvals.length}</span>
       </div>
       <div className="approval-strip">
-        {approvals.map((approval) => (
-          <article className="approval-card" key={approval.id}>
-            <div className="approval-icon" aria-hidden="true">
-              <ApprovalIcon kind={approval.kind} />
-            </div>
-            <div className="approval-body">
-              <div className="approval-title-row">
-                <h3>{approval.title}</h3>
-                <span>{approval.kind.replace("_", " ")}</span>
+        {approvals.map((approval) => {
+          const pendingDecision = decidingApprovalIds[approval.id];
+          const disabled = Boolean(pendingDecision);
+          return (
+            <article className="approval-card" key={approval.id} aria-busy={disabled}>
+              <div className="approval-icon" aria-hidden="true">
+                <ApprovalIcon kind={approval.kind} />
               </div>
-              <p className="approval-detail">{approval.detail}</p>
-              {approval.riskHint ? (
-                <p className="risk-line">
-                  <ShieldAlert size={13} aria-hidden="true" />
-                  {approval.riskHint}
-                </p>
-              ) : null}
-            </div>
-            <div className="approval-actions" aria-label={`${approval.title} decision`}>
-              <button className="icon-button danger" type="button" aria-label={`Reject ${approval.title}`}>
-                <X size={16} />
-              </button>
-              <button className="icon-button success" type="button" aria-label={`Approve ${approval.title}`}>
-                <Check size={16} />
-              </button>
-            </div>
-          </article>
-        ))}
+              <div className="approval-body">
+                <div className="approval-title-row">
+                  <h3>{approval.title}</h3>
+                  <span>{approval.kind.replace("_", " ")}</span>
+                </div>
+                <p className="approval-detail">{approval.detail}</p>
+                {approval.riskHint ? (
+                  <p className="risk-line">
+                    <ShieldAlert size={13} aria-hidden="true" />
+                    {approval.riskHint}
+                  </p>
+                ) : null}
+              </div>
+              <div className="approval-actions" aria-label={`${approval.title} decision`}>
+                <button
+                  className="icon-button danger"
+                  disabled={disabled}
+                  onClick={() => onDecision(approval, "reject")}
+                  type="button"
+                  aria-label={`Reject ${approval.title}`}
+                >
+                  <X size={16} />
+                </button>
+                <button
+                  className="icon-button success"
+                  disabled={disabled}
+                  onClick={() => onDecision(approval, "approve")}
+                  type="button"
+                  aria-label={`Approve ${approval.title}`}
+                >
+                  <Check size={16} />
+                </button>
+              </div>
+            </article>
+          );
+        })}
       </div>
     </section>
   );
