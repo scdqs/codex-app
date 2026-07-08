@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiValidationError, completePairing, connectWebSocket, readPairingPayloadFromUrl } from "./api";
+import {
+  ApiValidationError,
+  completePairing,
+  connectWebSocket,
+  fetchAssetBlob,
+  readPairingPayloadFromUrl,
+} from "./api";
 import { clearSession, loadSession, saveSession } from "./storage";
 
 describe("pairing API helpers", () => {
@@ -139,4 +145,68 @@ describe("pairing API helpers", () => {
 
     expect(urls).toEqual(["wss://bridge.local/ws?token=session-1"]);
   });
+
+  it.each(["https://attacker.example/x", "//attacker.example/x"])(
+    "fetchAssetBlob_rejects_off_origin_asset_source_without_fetch",
+    async (src) => {
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({}));
+
+      await expect(fetchAssetBlob("http://bridge.local", "session-1", src)).rejects.toMatchObject({
+        status: 400,
+        message: "Invalid asset source",
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fetchAssetBlob_rejects_non_asset_paths_without_fetch", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse({}));
+
+    await expect(
+      fetchAssetBlob("http://bridge.local", "session-1", "/api/sessions/thread/events"),
+    ).rejects.toMatchObject({
+      status: 400,
+      message: "Invalid asset source",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fetchAssetBlob_rejects_non_image_content_type", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response("not an image", {
+        status: 200,
+        headers: { "Content-Type": "text/plain" },
+      }),
+    );
+
+    await expect(
+      fetchAssetBlob("http://bridge.local", "session-1", "/api/assets/local-image/asset-1"),
+    ).rejects.toMatchObject({
+      status: 200,
+      message: "Asset response is not an image",
+    });
+  });
+
+  it("fetchAssetBlob_accepts_asset_paths_and_sends_authorization", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(new Blob(["png"], { type: "image/png" }), {
+        status: 200,
+        headers: { "Content-Type": "image/png" },
+      }),
+    );
+
+    const blob = await fetchAssetBlob("http://bridge.local", "session-1", "/api/assets/local-image/asset-1");
+
+    expect(blob.type).toBe("image/png");
+    expect(fetchMock).toHaveBeenCalledWith("http://bridge.local/api/assets/local-image/asset-1", {
+      headers: { Authorization: "Bearer session-1" },
+    });
+  });
 });
+
+function jsonResponse(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}

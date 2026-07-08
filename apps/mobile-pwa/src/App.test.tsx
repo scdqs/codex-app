@@ -1,13 +1,15 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App, { appendOrMergeSessionEvent, mergePolledSessionEvents } from "./App";
 import type { SessionEvent, SessionSnapshot } from "./protocol";
 import { clearSession, loadSession, saveSession } from "./storage";
 
 const originalScrollTo = (HTMLElement.prototype as Partial<HTMLElement>).scrollTo;
+const originalCreateObjectURL = (URL as Partial<typeof URL>).createObjectURL;
+const originalRevokeObjectURL = (URL as Partial<typeof URL>).revokeObjectURL;
 
 describe("App", () => {
   beforeEach(() => {
@@ -16,12 +18,14 @@ describe("App", () => {
   });
 
   afterEach(() => {
+    cleanup();
     vi.restoreAllMocks();
     vi.useRealTimers();
     vi.unstubAllGlobals();
     clearSession();
     window.history.replaceState(null, "", "/");
     restoreScrollTo();
+    restoreObjectUrls();
   });
 
   it("renders the mobile workbench regions and selected session detail", () => {
@@ -1255,6 +1259,25 @@ function restoreScrollTo() {
     return;
   }
   delete (HTMLElement.prototype as Partial<HTMLElement>).scrollTo;
+}
+
+function restoreObjectUrls() {
+  restoreUrlProperty("createObjectURL", originalCreateObjectURL);
+  restoreUrlProperty("revokeObjectURL", originalRevokeObjectURL);
+}
+
+function restoreUrlProperty(
+  name: "createObjectURL" | "revokeObjectURL",
+  value: typeof URL.createObjectURL | typeof URL.revokeObjectURL | undefined,
+) {
+  if (value) {
+    Object.defineProperty(URL, name, {
+      configurable: true,
+      value,
+    });
+    return;
+  }
+  delete (URL as unknown as Record<string, unknown>)[name];
 }
 
 class MockWebSocket {

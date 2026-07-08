@@ -105,6 +105,10 @@ export async function fetchAssetBlob(
   sessionToken: string,
   src: string,
 ): Promise<Blob> {
+  if (!isAllowedAssetSource(src)) {
+    throw new ApiError(400, "Invalid asset source");
+  }
+
   const response = await fetch(apiUrl(bridgeUrl, src), {
     headers: { Authorization: `Bearer ${sessionToken}` },
   });
@@ -119,6 +123,14 @@ export async function fetchAssetBlob(
   }
 
   return response.blob();
+}
+
+function isAllowedAssetSource(src: string): boolean {
+  return (
+    src.startsWith("/api/assets/") &&
+    !src.startsWith("//") &&
+    !/[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(src)
+  );
 }
 
 export async function sendTextMessage(

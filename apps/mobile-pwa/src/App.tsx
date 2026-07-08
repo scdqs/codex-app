@@ -740,7 +740,7 @@ function EventRow({
               <AttachmentImage
                 assetSession={assetSession}
                 attachment={attachment}
-                key={`${attachment.src}:${attachment.name}:${index}`}
+                key={`${attachment.src}:${index}`}
               />
             ))}
           </div>
@@ -759,6 +759,8 @@ function AttachmentImage({
 }) {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const bridgeUrl = assetSession?.bridgeUrl ?? "";
+  const sessionToken = assetSession?.sessionToken ?? "";
 
   useEffect(() => {
     let cancelled = false;
@@ -767,13 +769,10 @@ function AttachmentImage({
     setObjectUrl(null);
     setFailed(false);
 
-    const activeSession = assetSession;
-    if (!activeSession) {
+    if (!bridgeUrl || !sessionToken) {
       setFailed(true);
       return;
     }
-    const bridgeUrl = activeSession.bridgeUrl;
-    const sessionToken = activeSession.sessionToken;
 
     async function loadAttachment() {
       try {
@@ -798,14 +797,14 @@ function AttachmentImage({
         URL.revokeObjectURL(createdObjectUrl);
       }
     };
-  }, [assetSession, attachment.src]);
+  }, [bridgeUrl, sessionToken, attachment.src]);
 
   if (failed) {
-    return <span className="attachment-error">Image unavailable: {attachment.name}</span>;
+    return <span className="attachment-error" role="status">Image unavailable: {attachment.name}</span>;
   }
 
   if (!objectUrl) {
-    return <span className="attachment-loading">Loading image: {attachment.name}</span>;
+    return <span className="attachment-loading" role="status">Loading image: {attachment.name}</span>;
   }
 
   return <img className="attachment-image" src={objectUrl} alt={attachment.name} />;
