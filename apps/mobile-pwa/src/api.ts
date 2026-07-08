@@ -127,17 +127,32 @@ export async function fetchAssetBlob(
 }
 
 function allowedAssetUrl(bridgeUrl: string, src: string): string | null {
-  if (src.startsWith("//") || /[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(src)) {
+  if (!isCanonicalAssetPath(src)) {
     return null;
   }
 
   const bridge = new URL(bridgeUrl);
   const url = new URL(src, bridge);
-  if (url.origin !== bridge.origin || !url.pathname.startsWith("/api/assets/")) {
+  if (url.origin !== bridge.origin || url.pathname !== src) {
     return null;
   }
 
   return url.toString();
+}
+
+function isCanonicalAssetPath(src: string): boolean {
+  if (!src.startsWith("/api/assets/")) {
+    return false;
+  }
+  if (src.startsWith("//") || /[a-zA-Z][a-zA-Z\d+.-]*:/.test(src)) {
+    return false;
+  }
+  if (src.includes("\\") || src.includes("?") || src.includes("#") || src.includes("%")) {
+    return false;
+  }
+
+  const segments = src.split("/");
+  return segments.every((segment) => segment !== "." && segment !== "..");
 }
 
 export async function sendTextMessage(
