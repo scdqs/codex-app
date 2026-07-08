@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Codex Mobile">
+  <rect width="512" height="512" fill="#101418"/>
+  <circle cx="256" cy="256" r="188" fill="#171d22" stroke="#3b4650" stroke-width="18"/>
+  <rect x="172" y="138" width="168" height="236" rx="30" fill="#1f272d" stroke="#2a333b" stroke-width="14"/>
+  <circle cx="256" cy="218" r="42" fill="#42b89b"/>
+  <path d="M210 302h92M210 342h60" fill="none" stroke="#edf2f5" stroke-width="22" stroke-linecap="round"/>
+</svg>

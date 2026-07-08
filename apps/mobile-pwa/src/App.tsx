@@ -185,10 +185,10 @@ function ApprovalQueue({ approvals }: { approvals: ApprovalRequest[] }) {
               ) : null}
             </div>
             <div className="approval-actions" aria-label={`${approval.title} decision`}>
-              <button className="icon-button danger" type="button" aria-label="Reject approval">
+              <button className="icon-button danger" type="button" aria-label={`Reject ${approval.title}`}>
                 <X size={16} />
               </button>
-              <button className="icon-button success" type="button" aria-label="Approve request">
+              <button className="icon-button success" type="button" aria-label={`Approve ${approval.title}`}>
                 <Check size={16} />
               </button>
             </div>
