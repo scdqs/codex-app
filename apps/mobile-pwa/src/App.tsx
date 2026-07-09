@@ -2,6 +2,7 @@ import {
   FormEvent,
   useEffect,
   useLayoutEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -17,6 +18,7 @@ import {
   Clock3,
   Command,
   FilePenLine,
+  Menu,
   Send,
   ShieldAlert,
   TerminalSquare,
@@ -147,6 +149,7 @@ function App() {
   const hasInitialPairingPayload = useMemo(() => readPairingPayloadFromUrl(window.location.href) !== null, []);
   const [selectedThreadId, setSelectedThreadId] = useState(sampleSessions[0].threadId);
   const [draft, setDraft] = useState("");
+  const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false);
   const [connection, setConnection] = useState<ConnectionViewState>({ label: "Unpaired" });
   const [deviceSession, setDeviceSession] = useState<DeviceSession | null>(null);
   const [liveSessions, setLiveSessions] = useState<SessionSnapshot[] | null>(null);
@@ -431,9 +434,19 @@ function App() {
     }
   }
 
+  function handleSelectSession(threadId: string) {
+    setSelectedThreadId(threadId);
+    setIsSessionDrawerOpen(false);
+  }
+
   return (
     <main className="app-shell" aria-label="Codex mobile workbench">
-      <ConnectionBar connection={connection} statusText={statusText} />
+      <ConnectionBar
+        connection={connection}
+        statusText={statusText}
+        showSessionMenuButton
+        onOpenSessions={() => setIsSessionDrawerOpen(true)}
+      />
 
       <section className="workbench" aria-label="Workbench">
         <ApprovalQueue
@@ -443,11 +456,13 @@ function App() {
         />
 
         <section className="session-grid" aria-label="Sessions and detail">
-          <SessionList
-            sessions={sessions}
-            selectedThreadId={selectedSession?.threadId ?? ""}
-            onSelect={setSelectedThreadId}
-          />
+          <div className="desktop-session-panel">
+            <SessionList
+              sessions={sessions}
+              selectedThreadId={selectedSession?.threadId ?? ""}
+              onSelect={setSelectedThreadId}
+            />
+          </div>
           <SessionDetail
             assetSession={deviceSession}
             approvals={selectedApprovals}
@@ -456,6 +471,14 @@ function App() {
           />
         </section>
       </section>
+
+      <SessionDrawer
+        isOpen={isSessionDrawerOpen}
+        sessions={sessions}
+        selectedThreadId={selectedSession?.threadId ?? ""}
+        onClose={() => setIsSessionDrawerOpen(false)}
+        onSelect={handleSelectSession}
+      />
 
       <Composer
         draft={draft}
@@ -470,13 +493,22 @@ function App() {
 
 function ConnectionBar({
   connection,
+  onOpenSessions,
+  showSessionMenuButton = false,
   statusText,
 }: {
   connection: ConnectionViewState;
+  onOpenSessions?: () => void;
+  showSessionMenuButton?: boolean;
   statusText: string;
 }) {
   return (
     <header className="connection-bar" aria-label="Connection status">
+      {showSessionMenuButton ? (
+        <button className="session-menu-button" onClick={onOpenSessions} type="button" aria-label="Open sessions">
+          <Menu size={18} aria-hidden="true" />
+        </button>
+      ) : null}
       <div className="connection-primary">
         <span className={`status-dot ${connectionClass(connection.label)}`} aria-hidden="true" />
         <div>
@@ -558,6 +590,63 @@ function ApprovalQueue({
   );
 }
 
+function SessionDrawer({
+  isOpen,
+  onClose,
+  onSelect,
+  selectedThreadId,
+  sessions,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  onSelect: (threadId: string) => void;
+  selectedThreadId: string;
+  sessions: SessionSnapshot[];
+}) {
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    closeButtonRef.current?.focus();
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isOpen, onClose]);
+
+  if (!isOpen) {
+    return null;
+  }
+
+  return (
+    <div className="session-drawer-layer">
+      <button className="session-drawer-backdrop" onClick={onClose} type="button" aria-label="Close sessions drawer" />
+      <aside className="session-drawer" role="dialog" aria-modal="true" aria-label="Sessions">
+        <div className="drawer-heading">
+          <h2>Sessions</h2>
+          <div className="drawer-heading-actions">
+            <span>{sessions.length}</span>
+            <button ref={closeButtonRef} className="icon-button" onClick={onClose} type="button" aria-label="Close sessions">
+              <X size={16} aria-hidden="true" />
+            </button>
+          </div>
+        </div>
+        <SessionList sessions={sessions} selectedThreadId={selectedThreadId} onSelect={onSelect} />
+      </aside>
+    </div>
+  );
+}
+
 function SessionList({
   onSelect,
   selectedThreadId,
@@ -567,10 +656,12 @@ function SessionList({
   selectedThreadId: string;
   sessions: SessionSnapshot[];
 }) {
+  const headingId = useId();
+
   return (
-    <section className="session-list-panel" aria-labelledby="session-list-heading">
+    <section className="session-list-panel" aria-labelledby={headingId}>
       <div className="section-heading">
-        <h2 id="session-list-heading">Sessions</h2>
+        <h2 id={headingId}>Sessions</h2>
         <span>{sessionItems.length}</span>
       </div>
       <div className="session-list" role="list">

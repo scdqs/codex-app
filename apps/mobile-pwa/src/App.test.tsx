@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App, { appendOrMergeSessionEvent, mergePolledSessionEvents } from "./App";
 import type { SessionEvent, SessionSnapshot } from "./protocol";
@@ -32,8 +32,10 @@ describe("App", () => {
     render(<App />);
 
     expect(screen.getByLabelText("Connection status")).toHaveTextContent("Unpaired");
+    expect(screen.getByRole("button", { name: "Open sessions" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Pending approvals" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Sessions" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Sessions" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Mobile bridge MVP" })).toBeInTheDocument();
     expect(screen.getByPlaceholderText("Message Mobile bridge MVP")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Reject Run npm install" })).toBeInTheDocument();
@@ -48,6 +50,57 @@ describe("App", () => {
     expect(screen.getByRole("heading", { name: "Bridge sidecar API" })).toBeInTheDocument();
     expect(screen.getByPlaceholderText("Message Bridge sidecar API")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Bridge sidecar API/ })).toHaveAttribute("aria-current", "true");
+  });
+
+  it("opens_and_closes_the_mobile_session_drawer", async () => {
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "Open sessions" }));
+
+    expect(screen.getByRole("dialog", { name: "Sessions" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close sessions" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Close sessions" }));
+
+    expect(screen.queryByRole("dialog", { name: "Sessions" })).not.toBeInTheDocument();
+  });
+
+  it("closes_the_mobile_session_drawer_from_the_backdrop", async () => {
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "Open sessions" }));
+    await user.click(screen.getByLabelText("Close sessions drawer"));
+
+    expect(screen.queryByRole("dialog", { name: "Sessions" })).not.toBeInTheDocument();
+  });
+
+  it("selects_a_session_from_the_mobile_drawer_and_closes_it", async () => {
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "Open sessions" }));
+    const drawer = screen.getByRole("dialog", { name: "Sessions" });
+    await user.click(within(drawer).getByRole("button", { name: /Bridge sidecar API/ }));
+
+    expect(screen.queryByRole("dialog", { name: "Sessions" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Bridge sidecar API" })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Message Bridge sidecar API")).toBeInTheDocument();
+  });
+
+  it("closes_the_mobile_session_drawer_with_escape", async () => {
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    await user.click(screen.getByRole("button", { name: "Open sessions" }));
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog", { name: "Sessions" })).not.toBeInTheDocument();
   });
 
   it("uses_independent_scroll_containers_for_sessions_and_events", () => {
@@ -67,8 +120,30 @@ describe("App", () => {
     expect(css).toContain("overflow-y: auto");
     expect(css).toContain(".session-list-panel,");
     expect(css).toContain("flex-direction: column");
+    expect(css).toContain(".desktop-session-panel");
+    expect(css).toContain(".session-drawer-layer");
+    expect(css).toContain("grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.45fr)");
+    expect(css).toContain("grid-template-rows: minmax(0, 1fr)");
+    expect(css).not.toContain("grid-template-rows: minmax(150px, 0.42fr) minmax(0, 1fr)");
     expect(css).toMatch(/\.session-list\s*\{[^}]*align-content:\s*start;/);
     expect(css).toMatch(/\.event-stream\s*\{[^}]*align-content:\s*start;/);
+  });
+
+  it("defines_mobile_session_drawer_layout_without_a_stacked_session_panel", () => {
+    const stylesUrl = new URL("./styles.css", import.meta.url);
+    const stylesPath =
+      stylesUrl.protocol === "file:"
+        ? stylesUrl
+        : stylesUrl.pathname.startsWith("/@fs/")
+          ? stylesUrl.pathname.slice("/@fs".length)
+          : `.${stylesUrl.pathname}`;
+    const css = readFileSync(stylesPath, "utf8");
+
+    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.connection-bar\s*\{[\s\S]*grid-template-columns:\s*38px minmax\(0, 1fr\) minmax\(0, auto\);/);
+    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.session-menu-button\s*\{[\s\S]*display:\s*grid;/);
+    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.desktop-session-panel\s*\{[\s\S]*display:\s*none;/);
+    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.session-drawer\s*\{[\s\S]*width:\s*min\(84vw, 340px\);/);
+    expect(css).not.toContain("grid-template-rows: minmax(150px, 0.42fr) minmax(0, 1fr)");
   });
 
   it("shows_revoked_or_expired_connection_error", async () => {
