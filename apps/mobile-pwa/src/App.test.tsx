@@ -826,7 +826,7 @@ describe("App", () => {
     expect(await screen.findByText("Run real check")).toBeInTheDocument();
   });
 
-  it("preserves_newer_ws_event_when_http_events_resolve_later", async () => {
+  it("replaces_non_pending_ws_events_when_http_snapshot_resolves_later", async () => {
     saveActiveSession();
     let resolveEvents: (response: Response) => void = () => {};
     const eventsResponse = new Promise<Response>((resolve) => {
@@ -876,7 +876,7 @@ describe("App", () => {
     });
 
     expect(await screen.findByText("Loaded over HTTP")).toBeInTheDocument();
-    expect(screen.getByText("Arrived over socket")).toBeInTheDocument();
+    expect(screen.queryByText("Arrived over socket")).not.toBeInTheDocument();
   });
 
   it("keeps_event_stream_at_bottom_when_new_events_arrive_near_bottom", async () => {
@@ -1125,6 +1125,80 @@ describe("App", () => {
       "turn-new:item-2",
     ]);
     expect(merged.map((event) => event.payload).filter((payload) => payload && typeof payload === "object" && "text" in payload && payload.text === "continue")).toHaveLength(0);
+  });
+
+  it("treats_polled_events_as_authoritative_and_drops_stale_carried_ws_events", () => {
+    const current = [
+      sessionEvent({
+        id: "turn-new:item-6",
+        threadId: "thread-a",
+        payload: { role: "assistant", text: "Canonical answer" },
+        createdAt: 1_783_515_391_000,
+      }),
+      sessionEvent({
+        id: "ws-progress-1",
+        threadId: "thread-a",
+        payload: { role: "assistant", text: "Local progress update" },
+        createdAt: 1_783_515_392_000,
+      }),
+    ];
+    const polled = [
+      sessionEvent({
+        id: "turn-new:item-1",
+        threadId: "thread-a",
+        payload: { role: "user", text: "question" },
+        createdAt: 1_783_515_391_000,
+      }),
+      current[0],
+    ];
+
+    const merged = mergePolledSessionEvents(current, polled);
+
+    expect(merged.map((event) => event.id)).toEqual(["turn-new:item-1", "turn-new:item-6"]);
+  });
+
+  it("keeps_unmatched_pending_user_message_after_polling", () => {
+    const current = [
+      sessionEvent({
+        id: "local-pending",
+        threadId: "thread-a",
+        payload: { role: "user", text: "still sending", pending: true },
+        createdAt: 1_783_515_392_000,
+      }),
+    ];
+    const polled = [
+      sessionEvent({
+        id: "turn-old:item-2",
+        threadId: "thread-a",
+        payload: { role: "assistant", text: "Previous answer" },
+        createdAt: 1_783_515_380_000,
+      }),
+    ];
+
+    const merged = mergePolledSessionEvents(current, polled);
+
+    expect(merged.map((event) => event.id)).toEqual(["turn-old:item-2", "local-pending"]);
+  });
+
+  it("orders_same_turn_events_by_item_number_when_timestamps_match", () => {
+    const polled = [
+      sessionEvent({
+        id: "turn-new:item-6",
+        threadId: "thread-a",
+        payload: { role: "assistant", text: "Answer" },
+        createdAt: 1_783_515_391_000,
+      }),
+      sessionEvent({
+        id: "turn-new:item-1",
+        threadId: "thread-a",
+        payload: { role: "user", text: "Question" },
+        createdAt: 1_783_515_391_000,
+      }),
+    ];
+
+    const merged = mergePolledSessionEvents([], polled);
+
+    expect(merged.map((event) => event.id)).toEqual(["turn-new:item-1", "turn-new:item-6"]);
   });
 
   it("ignores_malformed_ws_event_and_handles_valid_approval_request", async () => {

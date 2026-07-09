@@ -1211,21 +1211,18 @@ function isSameJsonValue(left: SessionEvent["payload"], right: SessionEvent["pay
 }
 
 export function mergePolledSessionEvents(current: SessionEvent[], polled: SessionEvent[]): SessionEvent[] {
-  const polledIds = new Set(polled.map((event) => event.id));
   const polledUserTexts = new Set(
     polled
       .map(normalizedUserMessageText)
       .filter((text): text is string => Boolean(text)),
   );
   const carried = current.filter((event) => {
-    if (polledIds.has(event.id)) {
+    if (!isPendingPayload(event.payload)) {
       return false;
     }
-    if (isPendingPayload(event.payload)) {
-      const text = normalizedUserMessageText(event);
-      if (text && polledUserTexts.has(text)) {
-        return false;
-      }
+    const text = normalizedUserMessageText(event);
+    if (text && polledUserTexts.has(text)) {
+      return false;
     }
     return true;
   });
@@ -1234,7 +1231,34 @@ export function mergePolledSessionEvents(current: SessionEvent[], polled: Sessio
 }
 
 function sortSessionEvents(events: SessionEvent[]): SessionEvent[] {
-  return [...events].sort((left, right) => left.createdAt - right.createdAt);
+  return [...events].sort(compareSessionEvents);
+}
+
+function compareSessionEvents(left: SessionEvent, right: SessionEvent): number {
+  const byCreatedAt = left.createdAt - right.createdAt;
+  if (byCreatedAt !== 0) {
+    return byCreatedAt;
+  }
+
+  const leftItem = eventItemOrder(left.id);
+  const rightItem = eventItemOrder(right.id);
+  if (leftItem && rightItem && leftItem.scope === rightItem.scope && leftItem.index !== rightItem.index) {
+    return leftItem.index - rightItem.index;
+  }
+
+  return 0;
+}
+
+function eventItemOrder(id: string): { scope: string; index: number } | null {
+  const match = /^(.*):item-(\d+)(?::.*)?$/.exec(id);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    scope: match[1],
+    index: Number(match[2]),
+  };
 }
 
 function deltaText(payload: SessionEvent["payload"]): string {
