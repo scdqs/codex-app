@@ -635,6 +635,7 @@ describe("App", () => {
   });
 
   it("distinguishes_user_and_codex_message_rows", async () => {
+    vi.setSystemTime(new Date("2026-07-09T13:00:00+08:00"));
     saveActiveSession();
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = String(input);
@@ -651,11 +652,13 @@ describe("App", () => {
           sessionEvent({
             id: "event-user",
             threadId: "thread-roles",
+            createdAt: new Date("2026-07-09T12:34:00+08:00").getTime(),
             payload: { role: "user", text: "Can you check this?" },
           }),
           sessionEvent({
             id: "event-assistant",
             threadId: "thread-roles",
+            createdAt: new Date("2026-07-09T12:35:00+08:00").getTime(),
             payload: { role: "assistant", text: "I checked it." },
           }),
         ]);
@@ -671,8 +674,12 @@ describe("App", () => {
     const rows = Array.from(document.querySelectorAll(".event-row"));
     expect(rows[0]).toHaveClass("user");
     expect(rows[0]).toHaveTextContent("You");
+    expect(rows[0].querySelector("time")).toHaveTextContent("12:34");
+    expect(rows[0].querySelector("time")).toHaveAttribute("dateTime", "2026-07-09T04:34:00.000Z");
     expect(rows[1]).toHaveClass("assistant");
     expect(rows[1]).toHaveTextContent("Codex");
+    expect(rows[1].querySelector("time")).toHaveTextContent("12:35");
+    expect(rows[1].querySelector("time")).toHaveAttribute("dateTime", "2026-07-09T04:35:00.000Z");
   });
 
   it("renders_image_attachments_with_authenticated_asset_fetch", async () => {

@@ -594,17 +594,43 @@ h3 {
   width: min(94%, 760px);
 }
 
-.event-kind {
+.event-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 5px;
+}
+
+.event-row.user .event-meta {
+  justify-content: flex-end;
+}
+
+.event-kind,
+.event-meta time {
   color: var(--text-soft);
   font-size: 0.75rem;
   font-weight: 750;
   line-height: 1.2;
+}
+
+.event-kind {
   text-transform: uppercase;
+}
+
+.event-meta time {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 680;
+  white-space: nowrap;
 }
 
 .event-row.user .event-kind {
   color: #bcebdd;
   text-align: right;
+}
+
+.event-row.user .event-meta time {
+  color: #9bdccf;
 }
 
 .event-row.assistant .event-kind {

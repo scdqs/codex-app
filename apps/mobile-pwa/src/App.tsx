@@ -855,7 +855,10 @@ function EventRow({
         {eventIcon(event, actor)}
       </span>
       <div className="event-content">
-        <p className="event-kind">{eventKindLabel(event, actor)}</p>
+        <div className="event-meta">
+          <p className="event-kind">{eventKindLabel(event, actor)}</p>
+          <time dateTime={new Date(event.createdAt).toISOString()}>{formatEventTime(event.createdAt)}</time>
+        </div>
         <MessageBody text={payloadText(event.payload)} />
         {attachments.length > 0 ? (
           <div className="attachment-list" aria-label="Image attachments">
@@ -905,6 +908,23 @@ function eventKindLabel(event: SessionEvent, actor: EventActor) {
     return "Codex";
   }
   return event.type.replace("_", " ");
+}
+
+function formatEventTime(timestamp: number) {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: sameDay ? undefined : "numeric",
+    day: sameDay ? undefined : "numeric",
+    hour: "2-digit",
+    hourCycle: "h23",
+    minute: "2-digit",
+  }).format(date);
 }
 
 function AttachmentImage({
