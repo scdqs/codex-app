@@ -161,6 +161,7 @@ function App() {
   const [sending, setSending] = useState(false);
   const [decidingApprovalIds, setDecidingApprovalIds] = useState<Record<string, DecisionKind>>({});
   const sessionMenuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const sessionRefreshPromiseRef = useRef<Promise<DeviceSession> | null>(null);
   const showSampleData = connection.label === "Unpaired" && !hasInitialPairingPayload && !deviceSession;
   const sessions = liveSessions ?? (showSampleData ? sampleSessions : []);
   const approvals = showSampleData ? sampleApprovals : liveApprovals;
@@ -182,6 +183,36 @@ function App() {
     }
     return secondaryStatusText(connection.label);
   }, [connection.label, pendingCount]);
+
+  async function refreshActiveSession(activeSession: DeviceSession): Promise<DeviceSession> {
+    if (!sessionRefreshPromiseRef.current) {
+      setConnection({ label: "Pairing", detail: "Refreshing session" });
+      sessionRefreshPromiseRef.current = (async () => {
+        const refreshed = await refreshSession(activeSession.bridgeUrl, activeSession);
+        const nextSession: DeviceSession = {
+          ...activeSession,
+          deviceId: refreshed.deviceId,
+          sessionToken: refreshed.sessionToken,
+          sessionExpiresAt: refreshed.sessionExpiresAt,
+          bridgeUrl: activeSession.bridgeUrl,
+        };
+        saveSession(nextSession);
+        const health = await getHealth(activeSession.bridgeUrl, nextSession.sessionToken);
+        setDeviceSession((current) => {
+          if (!current || current.deviceId !== activeSession.deviceId) {
+            return current;
+          }
+          return nextSession;
+        });
+        setConnection(mapHealthToConnection(health));
+        return nextSession;
+      })().finally(() => {
+        sessionRefreshPromiseRef.current = null;
+      });
+    }
+
+    return sessionRefreshPromiseRef.current;
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -272,7 +303,7 @@ function App() {
 
     async function loadSessionList() {
       try {
-        const items = await listSessions(activeSession.bridgeUrl, activeSession.sessionToken);
+        const items = await listSessionsWithRefresh(activeSession);
         if (cancelled) {
           return;
         }
@@ -291,6 +322,18 @@ function App() {
             detail: connectionErrorText(error),
           });
         }
+      }
+    }
+
+    async function listSessionsWithRefresh(session: DeviceSession): Promise<SessionSnapshot[]> {
+      try {
+        return await listSessions(session.bridgeUrl, session.sessionToken);
+      } catch (error) {
+        if (!isAuthError(error)) {
+          throw error;
+        }
+        const refreshedSession = await refreshActiveSession(session);
+        return listSessions(refreshedSession.bridgeUrl, refreshedSession.sessionToken);
       }
     }
 
@@ -316,7 +359,7 @@ function App() {
 
     async function loadEvents() {
       try {
-        const items = await listSessionEvents(activeSession.bridgeUrl, activeSession.sessionToken, threadId);
+        const items = await listSessionEventsWithRefresh(activeSession, threadId);
         if (!cancelled) {
           setEventsByThread((current) => ({
             ...current,
@@ -330,6 +373,18 @@ function App() {
             detail: connectionErrorText(error),
           });
         }
+      }
+    }
+
+    async function listSessionEventsWithRefresh(session: DeviceSession, activeThreadId: string): Promise<SessionEvent[]> {
+      try {
+        return await listSessionEvents(session.bridgeUrl, session.sessionToken, activeThreadId);
+      } catch (error) {
+        if (!isAuthError(error)) {
+          throw error;
+        }
+        const refreshedSession = await refreshActiveSession(session);
+        return listSessionEvents(refreshedSession.bridgeUrl, refreshedSession.sessionToken, activeThreadId);
       }
     }
 

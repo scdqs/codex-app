@@ -508,6 +508,113 @@ describe("App", () => {
     expect(refreshCalls).toHaveLength(1);
   });
 
+  it("refreshes_session_when_session_list_rejects_token_after_bridge_restart", async () => {
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "old-token",
+      sessionExpiresAt: Date.now() + 60_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const authorization = new Headers(init?.headers).get("Authorization");
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions" && authorization === "Bearer old-token") {
+        return new Response(JSON.stringify({ message: "expired" }), { status: 401 });
+      }
+      if (url === "http://bridge.local/api/session/refresh" && init?.method === "POST") {
+        return jsonResponse({
+          deviceId: "device-1",
+          sessionToken: "new-token",
+          sessionExpiresAt: Date.now() + 120_000,
+        });
+      }
+      if (url === "http://bridge.local/api/sessions" && authorization === "Bearer new-token") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-recovered",
+            title: "Recovered thread",
+            preview: "Session refreshed after restart",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-recovered/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Recovered thread" });
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("Writable");
+    expect(loadSession()?.sessionToken).toBe("new-token");
+    expect(
+      fetchSpy.mock.calls.some(
+        ([input, init]) =>
+          String(input) === "http://bridge.local/api/sessions" &&
+          new Headers(init?.headers).get("Authorization") === "Bearer new-token",
+      ),
+    ).toBe(true);
+  });
+
+  it("refreshes_session_when_event_poll_rejects_token_after_bridge_restart", async () => {
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "old-token",
+      sessionExpiresAt: Date.now() + 60_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const authorization = new Headers(init?.headers).get("Authorization");
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-recovered",
+            title: "Recovered thread",
+            preview: "Session refreshed after event auth failure",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-recovered/events" && authorization === "Bearer old-token") {
+        return new Response(JSON.stringify({ message: "expired" }), { status: 401 });
+      }
+      if (url === "http://bridge.local/api/session/refresh" && init?.method === "POST") {
+        return jsonResponse({
+          deviceId: "device-1",
+          sessionToken: "new-token",
+          sessionExpiresAt: Date.now() + 120_000,
+        });
+      }
+      if (url === "http://bridge.local/api/sessions/thread-recovered/events" && authorization === "Bearer new-token") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-recovered",
+            threadId: "thread-recovered",
+            payload: { role: "assistant", text: "Recovered event stream" },
+          }),
+        ]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await screen.findByText("Recovered event stream");
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("Writable");
+    expect(loadSession()?.sessionToken).toBe("new-token");
+  });
+
   it("rejects_malformed_pairing_response_without_saving_session", async () => {
     window.history.replaceState(null, "", "/?pairingToken=pair-1&bridgeUrl=http%3A%2F%2Fbridge.local");
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
