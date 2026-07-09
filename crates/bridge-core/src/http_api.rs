@@ -190,6 +190,7 @@ impl AppState {
     }
 
     async fn register_local_assets_for_event(&self, mut event: SessionEvent) -> SessionEvent {
+        let local_image_replacements = local_image_attachment_replacements(&event.payload);
         scrub_raw_local_image_paths(&mut event.payload);
 
         let Some(attachments) = event
@@ -215,6 +216,7 @@ impl AppState {
             }
         }
 
+        scrub_local_image_path_strings(&mut event.payload, &local_image_replacements);
         event
     }
 }
@@ -443,6 +445,34 @@ fn local_image_attachment_path(attachment: &serde_json::Value) -> Option<PathBuf
         .map(PathBuf::from)
 }
 
+fn local_image_attachment_replacements(payload: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(attachments) = payload
+        .get("attachments")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    attachments
+        .iter()
+        .filter_map(|attachment| {
+            let object = attachment.as_object()?;
+            let path = object.get("path").and_then(serde_json::Value::as_str)?;
+            let name = object
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| {
+                    FsPath::new(path)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "image".to_string());
+            Some((path.to_string(), name))
+        })
+        .collect()
+}
+
 fn scrub_raw_local_image_paths(payload: &mut serde_json::Value) {
     if let Some(raw) = payload.get_mut("raw") {
         scrub_local_image_paths(raw);
@@ -468,6 +498,36 @@ fn scrub_local_image_paths(value: &mut serde_json::Value) {
 
             for child in object.values_mut() {
                 scrub_local_image_paths(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scrub_local_image_path_strings(
+    value: &mut serde_json::Value,
+    replacements: &[(String, String)],
+) {
+    if replacements.is_empty() {
+        return;
+    }
+
+    match value {
+        serde_json::Value::String(text) => {
+            for (path, name) in replacements {
+                if text.contains(path) {
+                    *text = text.replace(path, name);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scrub_local_image_path_strings(item, replacements);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for child in object.values_mut() {
+                scrub_local_image_path_strings(child, replacements);
             }
         }
         _ => {}
@@ -1319,6 +1379,7 @@ mod tests {
         tokio::fs::write(&image_path, b"png-bytes")
             .await
             .expect("image bytes write");
+        let image_text = format!("look at this: {}", image_path.to_string_lossy());
         let adapter = Arc::new(RecordingAdapter::with_turns(
             "thread-image",
             vec![CodexTurn {
@@ -1332,7 +1393,7 @@ mod tests {
                             "id": "item-1",
                             "type": "userMessage",
                             "content": [
-                                { "type": "input_text", "text": "look at this" },
+                                { "type": "input_text", "text": image_text },
                                 {
                                     "type": "localImage",
                                     "path": image_path.to_string_lossy(),
@@ -1365,6 +1426,10 @@ mod tests {
             serde_json::to_string(&body).expect("response body serializes to json");
         assert!(!serialized_body.contains(image_path.to_string_lossy().as_ref()));
         let attachment = &body[0]["payload"]["attachments"][0];
+        assert_eq!(
+            body[0]["payload"]["text"],
+            json!("look at this: codex-clipboard.png")
+        );
         assert_eq!(attachment["type"], json!("image"));
         assert_eq!(attachment["name"], json!("codex-clipboard.png"));
         assert!(attachment.get("path").is_none());

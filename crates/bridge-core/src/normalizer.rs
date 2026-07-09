@@ -125,12 +125,14 @@ fn event_from_item(
 ) -> SessionEvent {
     let role = role_from_item(item);
     let event_type = event_type_for_role(&role);
-    let text = text_from_value(item).unwrap_or_default();
+    let attachments = image_attachments_from_value(item);
+    let text = text_from_value(item)
+        .map(|text| scrub_attachment_paths_from_text(&text, &attachments))
+        .unwrap_or_default();
     let created_at = timestamp_field(item, &["createdAt", "created_at", "timestamp"])
         .or(turn.created_at)
         .or(turn.updated_at)
         .unwrap_or_default();
-    let attachments = image_attachments_from_value(item);
     let id = string_field(item, &["id", "itemId", "item_id"])
         .map(|item_id| {
             turn.id
@@ -411,6 +413,25 @@ fn file_name_from_path(path: &str) -> String {
         .unwrap_or_else(|| "image".to_string())
 }
 
+fn scrub_attachment_paths_from_text(text: &str, attachments: &[Value]) -> String {
+    let mut scrubbed = text.to_string();
+    for attachment in attachments {
+        let Some(path) = attachment.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if path.is_empty() || !scrubbed.contains(path) {
+            continue;
+        }
+        let name = attachment
+            .get("name")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| file_name_from_path(path));
+        scrubbed = scrubbed.replace(path, &name);
+    }
+    scrubbed
+}
+
 fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
@@ -569,6 +590,42 @@ mod tests {
                     "name": "codex-clipboard.png"
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn scrubs_local_image_paths_from_display_text() {
+        let turns = vec![CodexTurn {
+            id: Some("turn-image".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            created_at: Some(1_725_000_000_000),
+            updated_at: None,
+            raw: json!({
+                "items": [
+                    {
+                        "id": "item-1",
+                        "type": "userMessage",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "attached image: /var/folders/codex-clipboard.png"
+                            },
+                            {
+                                "type": "localImage",
+                                "path": "/var/folders/codex-clipboard.png",
+                                "detail": null
+                            }
+                        ]
+                    }
+                ]
+            }),
+        }];
+
+        let events = Normalizer::events_from_turns("thread-1", &turns);
+
+        assert_eq!(
+            events[0].payload["text"],
+            json!("attached image: codex-clipboard.png")
         );
     }
 
