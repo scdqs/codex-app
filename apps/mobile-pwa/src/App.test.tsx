@@ -260,6 +260,27 @@ describe("App", () => {
     expect(screen.getByText("No live sessions yet. Use the newest pairing URL from the bridge terminal.")).toBeInTheDocument();
   });
 
+  it("does_not_duplicate_writable_connection_status", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([]);
+      }
+      return jsonResponse([]);
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Writable");
+    });
+    expect(within(screen.getByLabelText("Connection status")).getAllByText("Writable")).toHaveLength(1);
+  });
+
   it("clears_pairing_token_after_successful_pairing", async () => {
     window.history.replaceState(
       null,

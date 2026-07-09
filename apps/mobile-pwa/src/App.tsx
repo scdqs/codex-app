@@ -575,6 +575,8 @@ function ConnectionBar({
   showSessionMenuButton?: boolean;
   statusText: string;
 }) {
+  const secondaryStatusText = statusText === connection.label ? null : statusText;
+
   return (
     <header className="connection-bar" aria-label="Connection status">
       {showSessionMenuButton ? (
@@ -598,7 +600,7 @@ function ConnectionBar({
       </div>
       <div className="connection-meta">
         <span className={`meta-chip ${connectionClass(connection.label)}`}>{connection.label}</span>
-        <span className="meta-chip muted">{statusText}</span>
+        {secondaryStatusText ? <span className="meta-chip muted">{secondaryStatusText}</span> : null}
       </div>
     </header>
   );
