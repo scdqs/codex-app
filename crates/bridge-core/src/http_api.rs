@@ -190,6 +190,8 @@ impl AppState {
     }
 
     async fn register_local_assets_for_event(&self, mut event: SessionEvent) -> SessionEvent {
+        scrub_raw_local_image_paths(&mut event.payload);
+
         let Some(attachments) = event
             .payload
             .get_mut("attachments")
@@ -439,6 +441,37 @@ fn local_image_attachment_path(attachment: &serde_json::Value) -> Option<PathBuf
         .get("path")
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
+}
+
+fn scrub_raw_local_image_paths(payload: &mut serde_json::Value) {
+    if let Some(raw) = payload.get_mut("raw") {
+        scrub_local_image_paths(raw);
+    }
+}
+
+fn scrub_local_image_paths(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scrub_local_image_paths(item);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            let is_local_image = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.eq_ignore_ascii_case("localimage"))
+                .unwrap_or(false);
+            if is_local_image {
+                object.remove("path");
+            }
+
+            for child in object.values_mut() {
+                scrub_local_image_paths(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn image_content_type(path: &FsPath) -> Option<&'static str> {
@@ -1328,6 +1361,9 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
+        let serialized_body =
+            serde_json::to_string(&body).expect("response body serializes to json");
+        assert!(!serialized_body.contains(image_path.to_string_lossy().as_ref()));
         let attachment = &body[0]["payload"]["attachments"][0];
         assert_eq!(attachment["type"], json!("image"));
         assert_eq!(attachment["name"], json!("codex-clipboard.png"));
@@ -1394,6 +1430,85 @@ mod tests {
             .expect("request succeeds");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_denied_local_image_asset_returns_forbidden() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let asset_path = dir.path().join("unreadable.png");
+        tokio::fs::write(&asset_path, b"png-bytes")
+            .await
+            .expect("asset bytes write");
+        let mut permissions = tokio::fs::metadata(&asset_path)
+            .await
+            .expect("asset metadata reads")
+            .permissions();
+        permissions.set_mode(0o000);
+        tokio::fs::set_permissions(&asset_path, permissions)
+            .await
+            .expect("asset permissions update");
+        let adapter = Arc::new(RecordingAdapter::with_turns(
+            "thread-image",
+            vec![CodexTurn {
+                id: Some("turn-image".to_string()),
+                thread_id: Some("thread-image".to_string()),
+                created_at: Some(1_725_000_000_000),
+                updated_at: None,
+                raw: json!({
+                    "items": [
+                        {
+                            "id": "item-1",
+                            "type": "userMessage",
+                            "content": [
+                                {
+                                    "type": "localImage",
+                                    "path": asset_path.to_string_lossy(),
+                                    "detail": null
+                                }
+                            ]
+                        }
+                    ]
+                }),
+            }],
+        ));
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-image/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let src = body[0]["payload"]["attachments"][0]["src"]
+            .as_str()
+            .expect("asset src is present");
+
+        let asset_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(src)
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(asset_response.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
