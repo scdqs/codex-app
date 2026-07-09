@@ -92,6 +92,52 @@ describe("App", () => {
     expect(screen.getByPlaceholderText("Message Bridge sidecar API")).toBeInTheDocument();
   });
 
+  it("keeps_focus_on_drawer_session_row_during_live_session_updates", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-live", title: "Live thread", preview: "Real session" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-live/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Live thread" });
+    await user.click(screen.getByRole("button", { name: "Open sessions" }));
+    const drawer = screen.getByRole("dialog", { name: "Sessions" });
+    const row = within(drawer).getByRole("button", { name: /Live thread/ });
+    row.focus();
+
+    expect(document.activeElement).toBe(row);
+
+    act(() => {
+      MockWebSocket.instances[0].emit({
+        type: "session_snapshot",
+        payload: sessionSnapshot({
+          threadId: "thread-live",
+          title: "Live thread",
+          preview: "Updated while drawer stays open",
+          updatedAt: 1_783_515_390_000,
+        }),
+      });
+    });
+
+    expect(screen.getByRole("dialog", { name: "Sessions" })).toBeInTheDocument();
+    expect(document.activeElement).toBe(row);
+    expect(screen.getByRole("button", { name: "Close sessions" })).not.toHaveFocus();
+  });
+
   it("closes_the_mobile_session_drawer_with_escape", async () => {
     const user = userEvent.setup();
 
