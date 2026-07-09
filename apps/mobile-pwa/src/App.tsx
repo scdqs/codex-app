@@ -27,16 +27,22 @@ import {
   UserRound,
   X,
 } from "lucide-react";
-import type {
-  ApprovalDecision,
-  ApprovalKind,
-  ApprovalRequest,
-  DecisionKind,
-  ImageAttachment,
-  ServerEnvelope,
-  SessionEvent,
-  SessionSnapshot,
-} from "./protocol";
+import {
+  isSessionDataEnabled,
+  mapHealthToConnection,
+  parseServerEnvelope,
+  secondaryStatusText,
+  type ConnectionLabel,
+  type ConnectionViewState,
+  type ApprovalDecision,
+  type ApprovalKind,
+  type ApprovalRequest,
+  type DecisionKind,
+  type ImageAttachment,
+  type ServerEnvelope,
+  type SessionEvent,
+  type SessionSnapshot,
+} from "@codex/bridge-protocol";
 import {
   ApiError,
   completePairing,
@@ -128,21 +134,6 @@ const sampleEvents: SessionEvent[] = [
     createdAt: 1_783_515_360_000,
   },
 ];
-
-type ConnectionLabel =
-  | "Unpaired"
-  | "Pairing"
-  | "Connected"
-  | "Codex not running"
-  | "Inject failed"
-  | "Read-only"
-  | "Writable"
-  | "Connection error";
-
-interface ConnectionViewState {
-  label: ConnectionLabel;
-  detail?: string;
-}
 
 const pairingAttempts = new Map<string, Promise<DeviceSession>>();
 const SESSION_LIST_REFRESH_MS = 5_000;
@@ -1640,26 +1631,6 @@ async function getHealthWithRefresh(
   return { health: await getHealth(bridgeUrl, nextSession.sessionToken), session: nextSession };
 }
 
-function mapHealthToConnection(health: HealthResponse): ConnectionViewState {
-  const state = health.connectionState.toLowerCase().replaceAll("-", "_");
-  if (state === "codex_not_running" || state === "not_running") {
-    return { label: "Codex not running" };
-  }
-  if (state === "inject_failed" || state === "injection_failed") {
-    return { label: "Inject failed" };
-  }
-  if (state === "read_only" || state === "readonly") {
-    return { label: "Read-only" };
-  }
-  if (state === "writable" || state === "ready") {
-    return { label: "Writable" };
-  }
-  if (state === "connected" || health.status.toLowerCase() === "ok") {
-    return { label: "Connected" };
-  }
-  return { label: "Connection error", detail: health.connectionState };
-}
-
 function connectionErrorText(error: unknown): string {
   if (isAuthError(error)) {
     return "Session revoked or expired";
@@ -1673,26 +1644,6 @@ function connectionErrorText(error: unknown): string {
   return "Unable to reach bridge";
 }
 
-function secondaryStatusText(label: ConnectionLabel): string {
-  switch (label) {
-    case "Connected":
-    case "Writable":
-      return "Writable";
-    case "Read-only":
-      return "Read-only";
-    case "Inject failed":
-      return "Desktop bridge unavailable";
-    case "Codex not running":
-      return "Start Codex Desktop";
-    case "Connection error":
-      return "Needs new link";
-    case "Pairing":
-      return "Pairing";
-    case "Unpaired":
-      return "Open pairing link";
-  }
-}
-
 function isAuthError(error: unknown): boolean {
   return error instanceof ApiError && (error.status === 401 || error.status === 403);
 }
@@ -1701,173 +1652,8 @@ function isPairingTokenError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 400;
 }
 
-function isSessionDataEnabled(label: ConnectionLabel): boolean {
-  return label === "Connected" || label === "Writable" || label === "Read-only";
-}
-
 function sortSessions(items: SessionSnapshot[]): SessionSnapshot[] {
   return [...items].sort((left, right) => right.updatedAt - left.updatedAt);
-}
-
-function parseServerEnvelope(data: unknown): ServerEnvelope | null {
-  if (typeof data !== "string") {
-    return null;
-  }
-  try {
-    const value = JSON.parse(data) as unknown;
-    return isServerEnvelope(value) ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function isServerEnvelope(value: unknown): value is ServerEnvelope {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-
-  const envelope = value as Record<string, unknown>;
-  switch (envelope.type) {
-    case "session_snapshot":
-      return isSessionSnapshot(envelope.payload);
-    case "session_event":
-      return isSessionEvent(envelope.payload);
-    case "approval_request":
-      return isApprovalRequest(envelope.payload);
-    case "approval_resolved":
-      return isApprovalDecision(envelope.payload);
-    case "error":
-      return isErrorPayload(envelope.payload);
-    default:
-      return false;
-  }
-}
-
-function isSessionSnapshot(value: unknown): value is SessionSnapshot {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-
-  const session = value as Record<string, unknown>;
-  return (
-    typeof session.threadId === "string" &&
-    typeof session.title === "string" &&
-    (session.cwd === undefined || typeof session.cwd === "string") &&
-    (session.modelProvider === undefined || typeof session.modelProvider === "string") &&
-    (session.preview === undefined || typeof session.preview === "string") &&
-    typeof session.updatedAt === "number" &&
-    Number.isFinite(session.updatedAt) &&
-    isSessionStatus(session.status) &&
-    Array.isArray(session.pendingApprovalIds) &&
-    session.pendingApprovalIds.every((id) => typeof id === "string")
-  );
-}
-
-function isSessionEvent(value: unknown): value is SessionEvent {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-
-  const event = value as Record<string, unknown>;
-  return (
-    typeof event.id === "string" &&
-    typeof event.threadId === "string" &&
-    isSessionEventType(event.type) &&
-    isJsonValue(event.payload) &&
-    typeof event.createdAt === "number" &&
-    Number.isFinite(event.createdAt)
-  );
-}
-
-function isApprovalRequest(value: unknown): value is ApprovalRequest {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-
-  const approval = value as Record<string, unknown>;
-  return (
-    typeof approval.id === "string" &&
-    typeof approval.threadId === "string" &&
-    isApprovalKind(approval.kind) &&
-    typeof approval.title === "string" &&
-    typeof approval.detail === "string" &&
-    (approval.riskHint === undefined || typeof approval.riskHint === "string") &&
-    (approval.raw === undefined || isJsonValue(approval.raw)) &&
-    typeof approval.createdAt === "number" &&
-    Number.isFinite(approval.createdAt) &&
-    (approval.expiresAt === undefined ||
-      (typeof approval.expiresAt === "number" && Number.isFinite(approval.expiresAt)))
-  );
-}
-
-function isApprovalDecision(value: unknown): value is ApprovalDecision {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-
-  const decision = value as Record<string, unknown>;
-  return (
-    typeof decision.approvalId === "string" &&
-    (decision.decision === "approve" || decision.decision === "reject") &&
-    (decision.comment === undefined || typeof decision.comment === "string") &&
-    typeof decision.deviceId === "string" &&
-    typeof decision.decidedAt === "number" &&
-    Number.isFinite(decision.decidedAt)
-  );
-}
-
-function isErrorPayload(value: unknown): value is { message: string } {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    typeof (value as Record<string, unknown>).message === "string"
-  );
-}
-
-function isSessionStatus(value: unknown): value is SessionSnapshot["status"] {
-  return (
-    value === "idle" ||
-    value === "running" ||
-    value === "waiting_for_input" ||
-    value === "waiting_for_approval" ||
-    value === "error"
-  );
-}
-
-function isSessionEventType(value: unknown): value is SessionEvent["type"] {
-  return (
-    value === "message" ||
-    value === "message_delta" ||
-    value === "tool_call" ||
-    value === "tool_result" ||
-    value === "approval_requested" ||
-    value === "approval_resolved" ||
-    value === "status_changed" ||
-    value === "error"
-  );
-}
-
-function isApprovalKind(value: unknown): value is ApprovalKind {
-  return value === "command" || value === "file_edit" || value === "network" || value === "mcp" || value === "unknown";
-}
-
-function isJsonValue(value: unknown): value is SessionEvent["payload"] {
-  if (
-    value === null ||
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return true;
-  }
-  if (Array.isArray(value)) {
-    return value.every(isJsonValue);
-  }
-  if (typeof value === "object") {
-    return Object.values(value).every(isJsonValue);
-  }
-  return false;
 }
 
 function handleServerEnvelope(

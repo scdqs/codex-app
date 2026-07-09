@@ -4,7 +4,7 @@ import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App, { appendOrMergeSessionEvent, mergePolledSessionEvents } from "./App";
-import type { SessionEvent, SessionSnapshot } from "./protocol";
+import type { SessionEvent, SessionSnapshot } from "@codex/bridge-protocol";
 import { clearSession, loadSession, saveSession } from "./storage";
 
 const originalScrollTo = (HTMLElement.prototype as Partial<HTMLElement>).scrollTo;

@@ -1,5 +1,13 @@
 import type { DeviceSession } from "./storage";
-import type { DecisionKind, SessionEvent, SessionSnapshot } from "./protocol";
+import {
+  isJsonValue,
+  isSessionEventType,
+  isSessionStatus,
+  type BridgeHealth,
+  type DecisionKind,
+  type SessionEvent,
+  type SessionSnapshot,
+} from "@codex/bridge-protocol";
 
 export interface PairingPayload {
   pairingToken: string;
@@ -20,10 +28,7 @@ export interface SessionResponse {
   sessionExpiresAt: number;
 }
 
-export interface HealthResponse {
-  status: string;
-  connectionState: string;
-}
+export type HealthResponse = BridgeHealth;
 
 export function readPairingPayloadFromUrl(url: string): PairingPayload | null {
   const parsed = new URL(url, window.location.href);
@@ -332,45 +337,4 @@ function parseSessionEvent(value: unknown): SessionEvent {
     payload: event.payload,
     createdAt: event.createdAt,
   };
-}
-
-function isSessionStatus(value: unknown): value is SessionSnapshot["status"] {
-  return (
-    value === "idle" ||
-    value === "running" ||
-    value === "waiting_for_input" ||
-    value === "waiting_for_approval" ||
-    value === "error"
-  );
-}
-
-function isSessionEventType(value: unknown): value is SessionEvent["type"] {
-  return (
-    value === "message" ||
-    value === "message_delta" ||
-    value === "tool_call" ||
-    value === "tool_result" ||
-    value === "approval_requested" ||
-    value === "approval_resolved" ||
-    value === "status_changed" ||
-    value === "error"
-  );
-}
-
-function isJsonValue(value: unknown): value is SessionEvent["payload"] {
-  if (
-    value === null ||
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return true;
-  }
-  if (Array.isArray(value)) {
-    return value.every(isJsonValue);
-  }
-  if (typeof value === "object") {
-    return Object.values(value).every(isJsonValue);
-  }
-  return false;
 }
