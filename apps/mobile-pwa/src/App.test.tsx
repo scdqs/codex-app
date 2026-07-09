@@ -451,6 +451,64 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: /Review sidecar API/ })).toHaveAttribute("aria-current", "true");
   });
 
+  it("renders_message_markdown_with_codex_like_structure", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-markdown", title: "Markdown thread", preview: "Formatted" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-markdown/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-markdown",
+            threadId: "thread-markdown",
+            payload: {
+              role: "assistant",
+              text: [
+                "现在状态：",
+                "",
+                "- sidecar 已重启，`57324` 正在运行",
+                "- `/api/health` 是 `ok / writable`",
+                "",
+                "手机用这条新链接：",
+                "",
+                "[打开 Codex Mobile](http://192.168.1.166:57324/)",
+                "",
+                "```bash",
+                "npm run build",
+                "```",
+              ].join("\n"),
+            },
+          }),
+        ]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(document.querySelectorAll(".message-body li")).toHaveLength(2);
+    });
+    const listItems = Array.from(document.querySelectorAll(".message-body li")).map((item) => item.textContent);
+    expect(listItems).toEqual([
+      "sidecar 已重启，57324 正在运行",
+      "/api/health 是 ok / writable",
+    ]);
+    expect(screen.getByRole("link", { name: "打开 Codex Mobile" })).toHaveAttribute(
+      "href",
+      "http://192.168.1.166:57324/",
+    );
+    expect(screen.getByText("npm run build")).toBeInTheDocument();
+    expect(document.querySelectorAll(".message-body code")).toHaveLength(4);
+  });
+
   it("renders_image_attachments_with_authenticated_asset_fetch", async () => {
     stubObjectUrls();
     saveActiveSession();

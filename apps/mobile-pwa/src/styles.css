@@ -536,8 +536,9 @@ h3 {
 .event-row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: 9px;
-  padding: 9px 4px;
+  align-items: start;
+  gap: 10px;
+  padding: 12px 8px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -545,23 +546,112 @@ h3 {
   border-bottom: 0;
 }
 
-.event-row p {
+.event-kind {
   color: var(--text-soft);
   font-size: 0.75rem;
   font-weight: 750;
+  line-height: 1.2;
   text-transform: uppercase;
-}
-
-.event-row span {
-  display: block;
-  margin-top: 2px;
-  color: var(--text-muted);
-  font-size: 0.78rem;
-  overflow-wrap: anywhere;
 }
 
 .event-content {
   min-width: 0;
+}
+
+.message-body {
+  display: grid;
+  gap: 8px;
+  margin-top: 5px;
+  color: var(--text-soft);
+  font-size: 0.84rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.message-body p,
+.message-body blockquote,
+.message-body pre,
+.message-body ul,
+.message-body ol,
+.message-body h1,
+.message-body h2,
+.message-body h3 {
+  margin: 0;
+}
+
+.message-body h1,
+.message-body h2,
+.message-body h3 {
+  color: var(--text);
+  font-weight: 740;
+  line-height: 1.25;
+}
+
+.message-body h1 {
+  font-size: 0.98rem;
+}
+
+.message-body h2 {
+  font-size: 0.9rem;
+}
+
+.message-body h3 {
+  font-size: 0.86rem;
+}
+
+.message-body ul,
+.message-body ol {
+  display: grid;
+  gap: 5px;
+  padding-left: 18px;
+}
+
+.message-body li {
+  padding-left: 2px;
+}
+
+.message-body code {
+  border: 1px solid rgb(59 70 80 / 70%);
+  border-radius: 5px;
+  padding: 1px 5px;
+  background: var(--surface-strong);
+  color: #d8e2e8;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.86em;
+}
+
+.message-body pre {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 9px 10px;
+  background: var(--surface-subtle);
+}
+
+.message-body pre code {
+  display: block;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text-soft);
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.message-body a {
+  color: #78d5c0;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.message-body a:hover {
+  text-decoration: underline;
+}
+
+.message-body blockquote {
+  border-left: 2px solid var(--border-strong);
+  padding-left: 10px;
+  color: var(--text-muted);
 }
 
 .attachment-list {

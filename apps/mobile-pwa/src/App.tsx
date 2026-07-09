@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   type Dispatch,
+  type ReactNode,
   type SetStateAction,
 } from "react";
 import {
@@ -732,8 +733,8 @@ function EventRow({
         {event.type === "tool_call" ? <TerminalSquare size={14} /> : <Clock3 size={14} />}
       </span>
       <div className="event-content">
-        <p>{event.type.replace("_", " ")}</p>
-        <span>{payloadText(event.payload)}</span>
+        <p className="event-kind">{event.type.replace("_", " ")}</p>
+        <MessageBody text={payloadText(event.payload)} />
         {attachments.length > 0 ? (
           <div className="attachment-list" aria-label="Image attachments">
             {attachments.map((attachment, index) => (
@@ -853,6 +854,216 @@ function ApprovalIcon({ kind }: { kind: ApprovalKind }) {
 
 function StatusBadge({ status }: { status: SessionSnapshot["status"] }) {
   return <span className={`status-badge ${status}`}>{status.replaceAll("_", " ")}</span>;
+}
+
+type MarkdownBlock =
+  | { type: "paragraph"; text: string }
+  | { type: "heading"; level: 1 | 2 | 3; text: string }
+  | { type: "list"; ordered: boolean; items: string[] }
+  | { type: "code"; language?: string; text: string }
+  | { type: "quote"; text: string };
+
+function MessageBody({ text }: { text: string }) {
+  const blocks = parseMessageMarkdown(text);
+
+  return (
+    <div className="message-body">
+      {blocks.map((block, index) => renderMarkdownBlock(block, index))}
+    </div>
+  );
+}
+
+function renderMarkdownBlock(block: MarkdownBlock, index: number) {
+  if (block.type === "heading") {
+    const HeadingTag = `h${block.level}` as "h1" | "h2" | "h3";
+    return <HeadingTag key={index}>{renderInlineMarkdown(block.text)}</HeadingTag>;
+  }
+
+  if (block.type === "list") {
+    const ListTag = block.ordered ? "ol" : "ul";
+    return (
+      <ListTag key={index}>
+        {block.items.map((item, itemIndex) => (
+          <li key={itemIndex}>{renderInlineMarkdown(item)}</li>
+        ))}
+      </ListTag>
+    );
+  }
+
+  if (block.type === "code") {
+    return (
+      <pre key={index} data-language={block.language || undefined}>
+        <code>{block.text}</code>
+      </pre>
+    );
+  }
+
+  if (block.type === "quote") {
+    return <blockquote key={index}>{renderInlineMarkdown(block.text)}</blockquote>;
+  }
+
+  return <p key={index}>{renderInlineMarkdown(block.text)}</p>;
+}
+
+function parseMessageMarkdown(text: string): MarkdownBlock[] {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const blocks: MarkdownBlock[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      index += 1;
+      continue;
+    }
+
+    const fenceMatch = trimmed.match(/^```(\S*)\s*$/);
+    if (fenceMatch) {
+      const codeLines: string[] = [];
+      index += 1;
+      while (index < lines.length && !lines[index].trim().startsWith("```")) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) {
+        index += 1;
+      }
+      blocks.push({ type: "code", language: fenceMatch[1] || undefined, text: codeLines.join("\n") });
+      continue;
+    }
+
+    const headingMatch = trimmed.match(/^(#{1,3})\s+(.+)$/);
+    if (headingMatch) {
+      blocks.push({
+        type: "heading",
+        level: headingMatch[1].length as 1 | 2 | 3,
+        text: headingMatch[2],
+      });
+      index += 1;
+      continue;
+    }
+
+    const unorderedMatch = trimmed.match(/^[-*•]\s+(.+)$/);
+    if (unorderedMatch) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const itemMatch = lines[index].trim().match(/^[-*•]\s+(.+)$/);
+        if (!itemMatch) {
+          break;
+        }
+        items.push(itemMatch[1]);
+        index += 1;
+      }
+      blocks.push({ type: "list", ordered: false, items });
+      continue;
+    }
+
+    const orderedMatch = trimmed.match(/^\d+[.)]\s+(.+)$/);
+    if (orderedMatch) {
+      const items: string[] = [];
+      while (index < lines.length) {
+        const itemMatch = lines[index].trim().match(/^\d+[.)]\s+(.+)$/);
+        if (!itemMatch) {
+          break;
+        }
+        items.push(itemMatch[1]);
+        index += 1;
+      }
+      blocks.push({ type: "list", ordered: true, items });
+      continue;
+    }
+
+    const quoteMatch = trimmed.match(/^>\s?(.*)$/);
+    if (quoteMatch) {
+      const quoteLines: string[] = [];
+      while (index < lines.length) {
+        const itemMatch = lines[index].trim().match(/^>\s?(.*)$/);
+        if (!itemMatch) {
+          break;
+        }
+        quoteLines.push(itemMatch[1]);
+        index += 1;
+      }
+      blocks.push({ type: "quote", text: quoteLines.join("\n") });
+      continue;
+    }
+
+    const paragraphLines = [trimmed];
+    index += 1;
+    while (index < lines.length) {
+      const next = lines[index].trim();
+      if (!next || isMarkdownBlockStart(next)) {
+        break;
+      }
+      paragraphLines.push(next);
+      index += 1;
+    }
+    blocks.push({ type: "paragraph", text: paragraphLines.join("\n") });
+  }
+
+  return blocks.length > 0 ? blocks : [{ type: "paragraph", text }];
+}
+
+function isMarkdownBlockStart(text: string) {
+  return (
+    text.startsWith("```") ||
+    /^#{1,3}\s+/.test(text) ||
+    /^[-*•]\s+/.test(text) ||
+    /^\d+[.)]\s+/.test(text) ||
+    /^>\s?/.test(text)
+  );
+}
+
+function renderInlineMarkdown(text: string) {
+  const nodes: ReactNode[] = [];
+  const pattern = /(`[^`]+`|\[([^\]]+)\]\(([^)\s]+)\))/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    pushTextWithBreaks(nodes, text.slice(lastIndex, match.index));
+    const token = match[0];
+    if (token.startsWith("`")) {
+      nodes.push(<code key={nodes.length}>{token.slice(1, -1)}</code>);
+    } else {
+      const label = match[2];
+      const href = safeMarkdownHref(match[3]);
+      if (href) {
+        nodes.push(
+          <a href={href} key={nodes.length} rel="noreferrer" target="_blank">
+            {label}
+          </a>,
+        );
+      } else {
+        nodes.push(token);
+      }
+    }
+    lastIndex = match.index + token.length;
+  }
+
+  pushTextWithBreaks(nodes, text.slice(lastIndex));
+  return nodes;
+}
+
+function pushTextWithBreaks(nodes: ReactNode[], value: string) {
+  const parts = value.split("\n");
+  parts.forEach((part, index) => {
+    if (part) {
+      nodes.push(part);
+    }
+    if (index < parts.length - 1) {
+      nodes.push(<br key={`br-${nodes.length}`} />);
+    }
+  });
+}
+
+function safeMarkdownHref(href: string) {
+  if (/^(https?:\/\/|mailto:)/i.test(href)) {
+    return href;
+  }
+  return null;
 }
 
 function payloadText(payload: SessionEvent["payload"]) {
