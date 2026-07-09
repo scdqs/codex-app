@@ -57,7 +57,8 @@ describe("App", () => {
 
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "Open sessions" }));
+    const openButton = screen.getByRole("button", { name: "Open sessions" });
+    await user.click(openButton);
 
     expect(screen.getByRole("dialog", { name: "Sessions" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Close sessions" })).toBeInTheDocument();
@@ -65,6 +66,7 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "Close sessions" }));
 
     expect(screen.queryByRole("dialog", { name: "Sessions" })).not.toBeInTheDocument();
+    expect(openButton).toHaveFocus();
   });
 
   it("closes_the_mobile_session_drawer_from_the_backdrop", async () => {
@@ -143,10 +145,12 @@ describe("App", () => {
 
     render(<App />);
 
-    await user.click(screen.getByRole("button", { name: "Open sessions" }));
+    const openButton = screen.getByRole("button", { name: "Open sessions" });
+    await user.click(openButton);
     await user.keyboard("{Escape}");
 
     expect(screen.queryByRole("dialog", { name: "Sessions" })).not.toBeInTheDocument();
+    expect(openButton).toHaveFocus();
   });
 
   it("uses_independent_scroll_containers_for_sessions_and_events", () => {

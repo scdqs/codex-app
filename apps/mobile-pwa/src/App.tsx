@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   type Dispatch,
+  type Ref,
   type ReactNode,
   type SetStateAction,
 } from "react";
@@ -157,6 +158,7 @@ function App() {
   const [liveApprovals, setLiveApprovals] = useState<ApprovalRequest[]>([]);
   const [sending, setSending] = useState(false);
   const [decidingApprovalIds, setDecidingApprovalIds] = useState<Record<string, DecisionKind>>({});
+  const sessionMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const showSampleData = connection.label === "Unpaired" && !hasInitialPairingPayload && !deviceSession;
   const sessions = liveSessions ?? (showSampleData ? sampleSessions : []);
   const approvals = showSampleData ? sampleApprovals : liveApprovals;
@@ -434,9 +436,18 @@ function App() {
     }
   }
 
+  function handleOpenSessionDrawer() {
+    setIsSessionDrawerOpen(true);
+  }
+
+  function handleCloseSessionDrawer() {
+    setIsSessionDrawerOpen(false);
+    sessionMenuButtonRef.current?.focus();
+  }
+
   function handleSelectSession(threadId: string) {
     setSelectedThreadId(threadId);
-    setIsSessionDrawerOpen(false);
+    handleCloseSessionDrawer();
   }
 
   return (
@@ -445,7 +456,8 @@ function App() {
         connection={connection}
         statusText={statusText}
         showSessionMenuButton
-        onOpenSessions={() => setIsSessionDrawerOpen(true)}
+        sessionMenuButtonRef={sessionMenuButtonRef}
+        onOpenSessions={handleOpenSessionDrawer}
       />
 
       <section className="workbench" aria-label="Workbench">
@@ -476,7 +488,7 @@ function App() {
         isOpen={isSessionDrawerOpen}
         sessions={sessions}
         selectedThreadId={selectedSession?.threadId ?? ""}
-        onClose={() => setIsSessionDrawerOpen(false)}
+        onClose={handleCloseSessionDrawer}
         onSelect={handleSelectSession}
       />
 
@@ -494,18 +506,26 @@ function App() {
 function ConnectionBar({
   connection,
   onOpenSessions,
+  sessionMenuButtonRef,
   showSessionMenuButton = false,
   statusText,
 }: {
   connection: ConnectionViewState;
   onOpenSessions?: () => void;
+  sessionMenuButtonRef?: Ref<HTMLButtonElement>;
   showSessionMenuButton?: boolean;
   statusText: string;
 }) {
   return (
     <header className="connection-bar" aria-label="Connection status">
       {showSessionMenuButton ? (
-        <button className="session-menu-button" onClick={onOpenSessions} type="button" aria-label="Open sessions">
+        <button
+          className="session-menu-button"
+          onClick={onOpenSessions}
+          ref={sessionMenuButtonRef}
+          type="button"
+          aria-label="Open sessions"
+        >
           <Menu size={18} aria-hidden="true" />
         </button>
       ) : null}
