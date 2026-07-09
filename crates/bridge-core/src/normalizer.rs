@@ -24,6 +24,7 @@ impl Normalizer {
             updated_at: thread
                 .updated_at
                 .or(thread.created_at)
+                .map(normalize_timestamp_ms)
                 .or_else(|| {
                     timestamp_field(
                         &thread.raw,
@@ -130,8 +131,8 @@ fn event_from_item(
         .map(|text| scrub_attachment_paths_from_text(&text, &attachments))
         .unwrap_or_default();
     let created_at = timestamp_field(item, &["createdAt", "created_at", "timestamp"])
-        .or(turn.created_at)
-        .or(turn.updated_at)
+        .or_else(|| turn.created_at.map(normalize_timestamp_ms))
+        .or_else(|| turn.updated_at.map(normalize_timestamp_ms))
         .unwrap_or_default();
     let id = string_field(item, &["id", "itemId", "item_id"])
         .map(|item_id| {
@@ -550,6 +551,43 @@ mod tests {
 
         assert_eq!(events[0].id, "turn-new:item-1");
         assert_eq!(events[1].id, "turn-old:item-1");
+    }
+
+    #[test]
+    fn normalizes_second_precision_turn_timestamps_to_milliseconds() {
+        let turns = vec![CodexTurn {
+            id: Some("turn-seconds".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            created_at: Some(1_783_574_153),
+            updated_at: None,
+            raw: json!({
+                "items": [
+                    { "id": "item-1", "type": "assistantMessage", "content": "hello from seconds" }
+                ]
+            }),
+        }];
+
+        let events = Normalizer::events_from_turns("thread-1", &turns);
+
+        assert_eq!(events[0].created_at, 1_783_574_153_000);
+    }
+
+    #[test]
+    fn normalizes_second_precision_thread_timestamps_to_milliseconds() {
+        let thread = CodexThread {
+            id: "thread-seconds".to_string(),
+            title: Some("Thread seconds".to_string()),
+            cwd: None,
+            model_provider: None,
+            preview: None,
+            created_at: Some(1_783_574_153),
+            updated_at: None,
+            raw: json!({}),
+        };
+
+        let snapshot = Normalizer::snapshot_from_thread(&thread);
+
+        assert_eq!(snapshot.updated_at, 1_783_574_153_000);
     }
 
     #[test]
