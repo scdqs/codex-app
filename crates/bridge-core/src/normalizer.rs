@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde_json::{Value, json};
 
 use crate::{
@@ -128,6 +130,7 @@ fn event_from_item(
         .or(turn.created_at)
         .or(turn.updated_at)
         .unwrap_or_default();
+    let attachments = image_attachments_from_value(item);
     let id = string_field(item, &["id", "itemId", "item_id"])
         .map(|item_id| {
             turn.id
@@ -137,16 +140,22 @@ fn event_from_item(
         })
         .or_else(|| turn.id.clone().map(|id| format!("{id}:{item_index}")))
         .unwrap_or_else(|| format!("{thread_id}:turn-{turn_index}:item-{item_index}"));
+    let mut payload = json!({
+        "role": role,
+        "text": text,
+        "raw": item,
+    });
+    if !attachments.is_empty() {
+        if let Some(payload) = payload.as_object_mut() {
+            payload.insert("attachments".to_string(), Value::Array(attachments));
+        }
+    }
 
     SessionEvent {
         id,
         thread_id: thread_id.to_string(),
         event_type,
-        payload: json!({
-            "role": role,
-            "text": text,
-            "raw": item,
-        }),
+        payload,
         created_at,
     }
 }
@@ -352,6 +361,56 @@ fn text_from_value_with_depth(value: &Value, depth: usize) -> Option<String> {
     }
 }
 
+fn image_attachments_from_value(value: &Value) -> Vec<Value> {
+    let mut attachments = Vec::new();
+    collect_image_attachments(value, 0, &mut attachments);
+    attachments
+}
+
+fn collect_image_attachments(value: &Value, depth: usize, attachments: &mut Vec<Value>) {
+    if depth > 6 {
+        return;
+    }
+
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_image_attachments(item, depth + 1, attachments);
+            }
+        }
+        Value::Object(object) => {
+            let is_local_image = object
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|value| value.eq_ignore_ascii_case("localimage"))
+                .unwrap_or(false);
+            if is_local_image {
+                if let Some(path) = object.get("path").and_then(Value::as_str) {
+                    attachments.push(json!({
+                        "type": "image",
+                        "path": path,
+                        "name": file_name_from_path(path),
+                    }));
+                }
+                return;
+            }
+
+            for child in object.values() {
+                collect_image_attachments(child, depth + 1, attachments);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn file_name_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "image".to_string())
+}
+
 fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
@@ -470,6 +529,47 @@ mod tests {
 
         assert_eq!(events[0].id, "turn-new:item-1");
         assert_eq!(events[1].id, "turn-old:item-1");
+    }
+
+    #[test]
+    fn normalizes_local_image_parts_to_internal_attachments() {
+        let turns = vec![CodexTurn {
+            id: Some("turn-image".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            created_at: Some(1_725_000_000_000),
+            updated_at: None,
+            raw: json!({
+                "items": [
+                    {
+                        "id": "item-1",
+                        "type": "userMessage",
+                        "content": [
+                            { "type": "input_text", "text": "look at this" },
+                            {
+                                "type": "localImage",
+                                "path": "/var/folders/codex-clipboard.png",
+                                "detail": null
+                            }
+                        ]
+                    }
+                ]
+            }),
+        }];
+
+        let events = Normalizer::events_from_turns("thread-1", &turns);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["text"], json!("look at this"));
+        assert_eq!(
+            events[0].payload["attachments"],
+            json!([
+                {
+                    "type": "image",
+                    "path": "/var/folders/codex-clipboard.png",
+                    "name": "codex-clipboard.png"
+                }
+            ])
+        );
     }
 
     #[test]
