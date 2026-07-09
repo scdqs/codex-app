@@ -933,6 +933,7 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.queryByText("Run npm install")).not.toBeInTheDocument();
     });
+    expect(screen.queryByRole("heading", { name: "Pending approvals" })).not.toBeInTheDocument();
 
     act(() => {
       MockWebSocket.instances[0].emit({
@@ -948,6 +949,7 @@ describe("App", () => {
       });
     });
 
+    expect(await screen.findByRole("heading", { name: "Pending approvals" })).toBeInTheDocument();
     expect(await screen.findByText("Run real check")).toBeInTheDocument();
   });
 

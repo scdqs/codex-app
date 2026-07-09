@@ -461,11 +461,13 @@ function App() {
       />
 
       <section className="workbench" aria-label="Workbench">
-        <ApprovalQueue
-          approvals={approvals}
-          decidingApprovalIds={decidingApprovalIds}
-          onDecision={handleApprovalDecision}
-        />
+        {approvals.length > 0 ? (
+          <ApprovalQueue
+            approvals={approvals}
+            decidingApprovalIds={decidingApprovalIds}
+            onDecision={handleApprovalDecision}
+          />
+        ) : null}
 
         <section className="session-grid" aria-label="Sessions and detail">
           <div className="desktop-session-panel">
