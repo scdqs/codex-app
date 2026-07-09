@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::Arc,
 };
 
@@ -12,7 +12,7 @@ use axum::{
         Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -28,6 +28,7 @@ use crate::{
     codex_rpc::{CodexAdapter, CodexRpcError},
     diagnostics::DiagnosticsReport,
     event_hub::EventHub,
+    local_assets::LocalAssetRegistry,
     normalizer::Normalizer,
     pairing::{DEFAULT_PAIRING_TOKEN_TTL_MS, PairingError, PairingManager},
     protocol::{
@@ -42,6 +43,7 @@ pub struct AppState {
     event_hub: EventHub,
     event_history: Arc<Mutex<HashMap<String, VecDeque<SessionEvent>>>>,
     refresh_failures: Arc<Mutex<HashMap<String, usize>>>,
+    local_assets: Arc<Mutex<LocalAssetRegistry>>,
     control_token: Arc<str>,
     codex_adapter: Option<Arc<dyn CodexAdapter>>,
     diagnostics: Arc<RwLock<DiagnosticsReport>>,
@@ -148,6 +150,7 @@ impl AppState {
             event_hub,
             event_history: Arc::new(Mutex::new(HashMap::new())),
             refresh_failures: Arc::new(Mutex::new(HashMap::new())),
+            local_assets: Arc::new(Mutex::new(LocalAssetRegistry::default())),
             control_token: control_token.into(),
             codex_adapter: None,
             diagnostics: Arc::new(RwLock::new(DiagnosticsReport::default())),
@@ -185,10 +188,41 @@ impl AppState {
         }
         thread_events.push_back(event);
     }
+
+    async fn register_local_assets_for_event(&self, mut event: SessionEvent) -> SessionEvent {
+        let Some(attachments) = event
+            .payload
+            .get_mut("attachments")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return event;
+        };
+
+        for index in 0..attachments.len() {
+            let Some(path) = local_image_attachment_path(&attachments[index]) else {
+                continue;
+            };
+            let token = self.local_assets.lock().await.register_image(path);
+
+            if let Some(object) = attachments[index].as_object_mut() {
+                object.remove("path");
+                object.insert(
+                    "src".to_string(),
+                    json!(format!("/api/assets/local-image/{token}")),
+                );
+            }
+        }
+
+        event
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
     let authenticated_routes = Router::new()
+        .route(
+            "/api/assets/local-image/:asset_token",
+            get(get_local_image_asset),
+        )
         .route("/api/devices", get(list_devices))
         .route("/api/devices/:id", delete(revoke_device))
         .route("/api/sessions", get(list_sessions))
@@ -347,9 +381,11 @@ async fn list_session_events(
 ) -> Result<Json<Vec<SessionEvent>>, ApiError> {
     if let Some(adapter) = state.codex_adapter.as_ref() {
         let turns = adapter.list_turns(&thread_id).await?;
-        let events = Normalizer::events_from_turns(&thread_id, &turns);
-        for event in &events {
+        let mut events = Vec::new();
+        for event in Normalizer::events_from_turns(&thread_id, &turns) {
+            let event = state.register_local_assets_for_event(event).await;
             state.record_session_event(event.clone()).await;
+            events.push(event);
         }
         return Ok(Json(events));
     }
@@ -363,6 +399,61 @@ async fn list_session_events(
         .unwrap_or_default();
 
     Ok(Json(events))
+}
+
+async fn get_local_image_asset(
+    State(state): State<AppState>,
+    Path(asset_token): Path<String>,
+) -> Result<Response, ApiError> {
+    let path = state
+        .local_assets
+        .lock()
+        .await
+        .path_for(&asset_token)
+        .ok_or(ApiError::NotFound("local image asset not found"))?;
+    let content_type = image_content_type(&path)
+        .ok_or(ApiError::UnsupportedMediaType("unsupported media type"))?;
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(ApiError::Forbidden("local image asset permission denied"));
+        }
+        Err(_) => return Err(ApiError::NotFound("local image asset not found")),
+    };
+
+    Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
+}
+
+fn local_image_attachment_path(attachment: &serde_json::Value) -> Option<PathBuf> {
+    let object = attachment.as_object()?;
+    let is_image = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value == "image")
+        .unwrap_or(false);
+    if !is_image {
+        return None;
+    }
+
+    object
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+}
+
+fn image_content_type(path: &FsPath) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?;
+    if extension.eq_ignore_ascii_case("png") {
+        Some("image/png")
+    } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
+        Some("image/jpeg")
+    } else if extension.eq_ignore_ascii_case("gif") {
+        Some("image/gif")
+    } else if extension.eq_ignore_ascii_case("webp") {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 async fn send_message(
@@ -538,6 +629,9 @@ fn current_time_ms() -> u64 {
 #[derive(Debug)]
 enum ApiError {
     Unauthorized,
+    Forbidden(&'static str),
+    NotFound(&'static str),
+    UnsupportedMediaType(&'static str),
     Pairing(PairingError),
     Adapter(CodexRpcError),
 }
@@ -558,6 +652,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            Self::Forbidden(message) => (StatusCode::FORBIDDEN, message.to_string()),
+            Self::NotFound(message) => (StatusCode::NOT_FOUND, message.to_string()),
+            Self::UnsupportedMediaType(message) => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, message.to_string())
+            }
             Self::Pairing(PairingError::InvalidToken | PairingError::TokenAlreadyUsed) => {
                 (StatusCode::BAD_REQUEST, "invalid pairing token".to_string())
             }
@@ -1180,6 +1279,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paired_device_receives_scrubbed_image_asset_url_and_can_fetch_image() {
+        let (dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let image_path = dir.path().join("codex-clipboard.png");
+        tokio::fs::write(&image_path, b"png-bytes")
+            .await
+            .expect("image bytes write");
+        let adapter = Arc::new(RecordingAdapter::with_turns(
+            "thread-image",
+            vec![CodexTurn {
+                id: Some("turn-image".to_string()),
+                thread_id: Some("thread-image".to_string()),
+                created_at: Some(1_725_000_000_000),
+                updated_at: None,
+                raw: json!({
+                    "items": [
+                        {
+                            "id": "item-1",
+                            "type": "userMessage",
+                            "content": [
+                                { "type": "input_text", "text": "look at this" },
+                                {
+                                    "type": "localImage",
+                                    "path": image_path.to_string_lossy(),
+                                    "detail": null
+                                }
+                            ]
+                        }
+                    ]
+                }),
+            }],
+        ));
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-image/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let attachment = &body[0]["payload"]["attachments"][0];
+        assert_eq!(attachment["type"], json!("image"));
+        assert_eq!(attachment["name"], json!("codex-clipboard.png"));
+        assert!(attachment.get("path").is_none());
+        let src = attachment["src"].as_str().expect("asset src is present");
+        assert!(src.starts_with("/api/assets/local-image/"));
+
+        let asset_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(src)
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(asset_response.status(), StatusCode::OK);
+        assert_eq!(
+            asset_response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("image/png"))
+        );
+        let bytes = to_bytes(asset_response.into_body(), usize::MAX)
+            .await
+            .expect("asset response body reads");
+        assert_eq!(&bytes[..], b"png-bytes");
+    }
+
+    #[tokio::test]
+    async fn local_image_asset_route_rejects_missing_token() {
+        let (_dir, state) = test_state();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(request(
+                Method::GET,
+                "/api/assets/local-image/missing",
+                Body::empty(),
+            ))
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unregistered_local_image_asset_returns_not_found() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/assets/local-image/missing")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn non_image_local_asset_returns_unsupported_media_type() {
+        let (dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let asset_path = dir.path().join("not-image.txt");
+        tokio::fs::write(&asset_path, b"text-bytes")
+            .await
+            .expect("asset bytes write");
+        let adapter = Arc::new(RecordingAdapter::with_turns(
+            "thread-image",
+            vec![CodexTurn {
+                id: Some("turn-image".to_string()),
+                thread_id: Some("thread-image".to_string()),
+                created_at: Some(1_725_000_000_000),
+                updated_at: None,
+                raw: json!({
+                    "items": [
+                        {
+                            "id": "item-1",
+                            "type": "userMessage",
+                            "content": [
+                                {
+                                    "type": "localImage",
+                                    "path": asset_path.to_string_lossy(),
+                                    "detail": null
+                                }
+                            ]
+                        }
+                    ]
+                }),
+            }],
+        ));
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-image/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        let src = body[0]["payload"]["attachments"][0]["src"]
+            .as_str()
+            .expect("asset src is present");
+
+        let asset_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(src)
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(asset_response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
     async fn paired_device_can_read_message_events_published_through_api() {
         let (_dir, state) = test_state();
         let session_token = pair_device(&state).await;
@@ -1299,6 +1584,15 @@ mod tests {
         fn with_threads(threads: Vec<CodexThread>) -> Self {
             Self {
                 threads: Arc::new(StdMutex::new(threads)),
+                ..Self::default()
+            }
+        }
+
+        fn with_turns(thread_id: impl Into<String>, turns: Vec<CodexTurn>) -> Self {
+            let mut turns_by_thread = StdHashMap::new();
+            turns_by_thread.insert(thread_id.into(), turns);
+            Self {
+                turns: Arc::new(StdMutex::new(turns_by_thread)),
                 ..Self::default()
             }
         }

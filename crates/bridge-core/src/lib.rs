@@ -4,6 +4,7 @@ pub mod codex_rpc;
 pub mod diagnostics;
 pub mod event_hub;
 pub mod http_api;
+pub mod local_assets;
 pub mod normalizer;
 pub mod pairing;
 pub mod protocol;
