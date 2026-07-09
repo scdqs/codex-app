@@ -13,6 +13,7 @@ import {
 } from "react";
 import {
   AlertTriangle,
+  Bot,
   Check,
   ChevronRight,
   CircleDot,
@@ -23,6 +24,7 @@ import {
   Send,
   ShieldAlert,
   TerminalSquare,
+  UserRound,
   X,
 } from "lucide-react";
 import type {
@@ -845,14 +847,15 @@ function EventRow({
   event: SessionEvent;
 }) {
   const attachments = payloadImageAttachments(event.payload);
+  const actor = eventActor(event);
 
   return (
-    <article className="event-row">
+    <article className={`event-row ${actor}`}>
       <span className="event-icon" aria-hidden="true">
-        {event.type === "tool_call" ? <TerminalSquare size={14} /> : <Clock3 size={14} />}
+        {eventIcon(event, actor)}
       </span>
       <div className="event-content">
-        <p className="event-kind">{event.type.replace("_", " ")}</p>
+        <p className="event-kind">{eventKindLabel(event, actor)}</p>
         <MessageBody text={payloadText(event.payload)} />
         {attachments.length > 0 ? (
           <div className="attachment-list" aria-label="Image attachments">
@@ -868,6 +871,40 @@ function EventRow({
       </div>
     </article>
   );
+}
+
+type EventActor = "assistant" | "system" | "user";
+
+function eventActor(event: SessionEvent): EventActor {
+  if (event.type !== "message" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) {
+    return "system";
+  }
+
+  const role = (event.payload as Record<string, unknown>).role;
+  if (role === "user" || role === "assistant") {
+    return role;
+  }
+  return "system";
+}
+
+function eventIcon(event: SessionEvent, actor: EventActor) {
+  if (actor === "user") {
+    return <UserRound size={14} />;
+  }
+  if (actor === "assistant") {
+    return <Bot size={14} />;
+  }
+  return event.type === "tool_call" ? <TerminalSquare size={14} /> : <Clock3 size={14} />;
+}
+
+function eventKindLabel(event: SessionEvent, actor: EventActor) {
+  if (actor === "user") {
+    return "You";
+  }
+  if (actor === "assistant") {
+    return "Codex";
+  }
+  return event.type.replace("_", " ");
 }
 
 function AttachmentImage({

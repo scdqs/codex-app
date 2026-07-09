@@ -563,6 +563,37 @@ h3 {
   border-bottom: 0;
 }
 
+.event-row.user {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.event-row.user .event-icon {
+  grid-column: 2;
+  grid-row: 1;
+  border-color: rgb(66 184 155 / 34%);
+  background: rgb(47 143 123 / 16%);
+  color: #bcebdd;
+}
+
+.event-row.user .event-content {
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: end;
+  width: min(84%, 680px);
+  border-color: rgb(66 184 155 / 32%);
+  background: rgb(28 74 66 / 46%);
+}
+
+.event-row.assistant .event-icon {
+  border-color: rgb(120 213 192 / 24%);
+  background: rgb(31 39 45 / 78%);
+  color: #78d5c0;
+}
+
+.event-row.assistant .event-content {
+  width: min(94%, 760px);
+}
+
 .event-kind {
   color: var(--text-soft);
   font-size: 0.75rem;
@@ -571,8 +602,21 @@ h3 {
   text-transform: uppercase;
 }
 
+.event-row.user .event-kind {
+  color: #bcebdd;
+  text-align: right;
+}
+
+.event-row.assistant .event-kind {
+  color: #78d5c0;
+}
+
 .event-content {
   min-width: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: rgb(31 39 45 / 42%);
 }
 
 .message-body {

@@ -634,6 +634,47 @@ describe("App", () => {
     expect(document.querySelectorAll(".message-body code")).toHaveLength(4);
   });
 
+  it("distinguishes_user_and_codex_message_rows", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-roles", title: "Role thread", preview: "Conversation" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-roles/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-user",
+            threadId: "thread-roles",
+            payload: { role: "user", text: "Can you check this?" },
+          }),
+          sessionEvent({
+            id: "event-assistant",
+            threadId: "thread-roles",
+            payload: { role: "assistant", text: "I checked it." },
+          }),
+        ]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("Can you check this?")).toBeInTheDocument();
+    expect(await screen.findByText("I checked it.")).toBeInTheDocument();
+
+    const rows = Array.from(document.querySelectorAll(".event-row"));
+    expect(rows[0]).toHaveClass("user");
+    expect(rows[0]).toHaveTextContent("You");
+    expect(rows[1]).toHaveClass("assistant");
+    expect(rows[1]).toHaveTextContent("Codex");
+  });
+
   it("renders_image_attachments_with_authenticated_asset_fetch", async () => {
     stubObjectUrls();
     saveActiveSession();
