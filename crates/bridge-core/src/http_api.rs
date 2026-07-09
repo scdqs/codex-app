@@ -32,8 +32,8 @@ use crate::{
     normalizer::Normalizer,
     pairing::{DEFAULT_PAIRING_TOKEN_TTL_MS, PairingError, PairingManager},
     protocol::{
-        ApprovalDecision, DecisionKind, ServerEnvelope, SessionEvent, SessionEventType,
-        SessionSnapshot,
+        ApprovalDecision, ApprovalKind, ApprovalRequest, DecisionKind, ServerEnvelope,
+        SessionEvent, SessionEventType, SessionSnapshot, SessionStatus,
     },
 };
 
@@ -131,6 +131,16 @@ pub struct AcceptedResponse {
 pub struct ApprovalDecisionRequest {
     decision: DecisionKind,
     comment: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DevApprovalRequest {
+    thread_id: Option<String>,
+    kind: Option<ApprovalKind>,
+    title: Option<String>,
+    detail: Option<String>,
+    risk_hint: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -236,6 +246,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/approvals/:approval_id/decision",
             post(decide_approval),
         )
+        .route("/api/dev/approvals", post(trigger_dev_approval))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -590,7 +601,9 @@ async fn decide_approval(
         decided_at: current_time_ms(),
     };
 
-    if let Some(adapter) = state.codex_adapter.as_ref() {
+    if let Some(adapter) = state.codex_adapter.as_ref()
+        && !is_dev_approval_id(&decision.approval_id)
+    {
         adapter
             .respond_approval(&decision.approval_id, &decision)
             .await?;
@@ -604,6 +617,64 @@ async fn decide_approval(
         StatusCode::ACCEPTED,
         Json(AcceptedResponse { accepted: true }),
     ))
+}
+
+async fn trigger_dev_approval(
+    State(state): State<AppState>,
+    Json(request): Json<DevApprovalRequest>,
+) -> Result<(StatusCode, Json<ApprovalRequest>), ApiError> {
+    if !cfg!(debug_assertions) {
+        return Err(ApiError::NotFound("dev approval trigger not available"));
+    }
+
+    let now = current_time_ms();
+    let thread_id = match request.thread_id {
+        Some(thread_id) if !thread_id.trim().is_empty() => thread_id,
+        _ => state
+            .event_hub
+            .all_snapshots()
+            .await
+            .into_iter()
+            .next()
+            .map(|snapshot| snapshot.thread_id)
+            .unwrap_or_else(|| "dev-thread".to_string()),
+    };
+    let approval = ApprovalRequest {
+        id: format!("dev-approval-{now}"),
+        thread_id: thread_id.clone(),
+        kind: request.kind.unwrap_or(ApprovalKind::Command),
+        title: request
+            .title
+            .unwrap_or_else(|| "Dev approval smoke test".to_string()),
+        detail: request
+            .detail
+            .unwrap_or_else(|| "echo approval smoke test".to_string()),
+        risk_hint: request
+            .risk_hint
+            .or_else(|| Some("Debug-only fake approval from local bridge.".to_string())),
+        raw: Some(json!({ "source": "dev_approval_trigger" })),
+        created_at: now,
+        expires_at: None,
+    };
+
+    if let Some(mut snapshot) = state.event_hub.snapshot_for_thread(&thread_id).await {
+        if !snapshot.pending_approval_ids.contains(&approval.id) {
+            snapshot.pending_approval_ids.push(approval.id.clone());
+        }
+        snapshot.status = SessionStatus::WaitingForApproval;
+        snapshot.updated_at = now;
+        state.event_hub.set_snapshot(snapshot).await;
+    }
+
+    state
+        .event_hub
+        .publish(ServerEnvelope::ApprovalRequest(approval.clone()));
+
+    Ok((StatusCode::ACCEPTED, Json(approval)))
+}
+
+fn is_dev_approval_id(approval_id: &str) -> bool {
+    approval_id.starts_with("dev-approval-")
 }
 
 async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
@@ -1167,6 +1238,11 @@ mod tests {
                 uri: "/api/approvals/approval-1/decision",
                 body: Some(json!({ "decision": "approve", "comment": null })),
             },
+            ProtectedRoute {
+                method: Method::POST,
+                uri: "/api/dev/approvals",
+                body: Some(json!({ "threadId": "thread-1" })),
+            },
         ];
 
         for route in routes {
@@ -1219,6 +1295,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dev_approval_trigger_broadcasts_approval_request() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        state
+            .event_hub()
+            .set_snapshot(SessionSnapshot {
+                thread_id: "thread-1".to_string(),
+                title: "Mobile bridge".to_string(),
+                cwd: Some("/tmp/codex-app".to_string()),
+                model_provider: Some("openai".to_string()),
+                preview: Some("Latest response".to_string()),
+                updated_at: 1_725_000_000_100,
+                status: SessionStatus::Idle,
+                pending_approval_ids: Vec::new(),
+            })
+            .await;
+        let mut subscriber = state.event_hub().subscribe().await;
+        assert!(matches!(
+            subscriber.recv().await.expect("initial snapshot replays"),
+            ServerEnvelope::SessionSnapshot(_)
+        ));
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/dev/approvals")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "threadId": "thread-1",
+                            "kind": "command",
+                            "title": "Smoke approval",
+                            "detail": "echo approval smoke"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        let approval_id = body["id"].as_str().expect("approval id is returned");
+        assert_eq!(body["threadId"], json!("thread-1"));
+        assert_eq!(body["title"], json!("Smoke approval"));
+
+        match subscriber.recv().await.expect("snapshot update broadcasts") {
+            ServerEnvelope::SessionSnapshot(snapshot) => {
+                assert_eq!(snapshot.thread_id, "thread-1");
+                assert_eq!(snapshot.status, SessionStatus::WaitingForApproval);
+                assert_eq!(snapshot.pending_approval_ids, vec![approval_id.to_string()]);
+            }
+            envelope => panic!("expected session snapshot, got {envelope:?}"),
+        }
+        match subscriber
+            .recv()
+            .await
+            .expect("approval request broadcasts")
+        {
+            ServerEnvelope::ApprovalRequest(approval) => {
+                assert_eq!(approval.id, approval_id);
+                assert_eq!(approval.thread_id, "thread-1");
+                assert_eq!(approval.title, "Smoke approval");
+            }
+            envelope => panic!("expected approval request, got {envelope:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn approval_decision_routes_to_adapter() {
         let (_dir, state) = test_state();
         let session_token = pair_device(&state).await;
@@ -1248,6 +1397,45 @@ mod tests {
         assert_eq!(decisions[0].device_id, "phone-1");
         assert_eq!(decisions[0].decision, DecisionKind::Approve);
         assert_eq!(decisions[0].comment.as_deref(), Some("ship it"));
+    }
+
+    #[tokio::test]
+    async fn dev_approval_decision_resolves_without_adapter() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::default());
+        let decisions = adapter.decisions();
+        let mut subscriber = state.event_hub().subscribe().await;
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/approvals/dev-approval-1/decision")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "decision": "approve", "comment": "ok" }).to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(decisions.lock().expect("decisions lock").is_empty());
+        match subscriber
+            .recv()
+            .await
+            .expect("approval resolution broadcasts")
+        {
+            ServerEnvelope::ApprovalResolved(decision) => {
+                assert_eq!(decision.approval_id, "dev-approval-1");
+                assert_eq!(decision.decision, DecisionKind::Approve);
+            }
+            envelope => panic!("expected approval resolved, got {envelope:?}"),
+        }
     }
 
     #[tokio::test]
