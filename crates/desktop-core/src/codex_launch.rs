@@ -292,7 +292,26 @@ impl CodexDesktopHost for MacCodexDesktopHost {
                 return Ok(true);
             }
         }
-        Ok(false)
+        let output = Command::new("/bin/ps")
+            .args(["-axo", "args="])
+            .output()
+            .map_err(|source| CodexLaunchHostError::Io {
+                action: "detect ChatGPT/Codex command path",
+                source,
+            })?;
+        if !output.status.success() {
+            return Err(CodexLaunchHostError::CommandFailed {
+                program: "ps".to_string(),
+                status: output.status.to_string(),
+            });
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout.lines().any(|line| {
+            config
+                .app_path_candidates
+                .iter()
+                .any(|app_path| command_line_matches_main_app(line, app_path))
+        }))
     }
 
     async fn cdp_ready(&self, debug_port: u16) -> Result<bool, CodexLaunchHostError> {
@@ -345,6 +364,11 @@ fn default_codex_app_candidates() -> Vec<PathBuf> {
     candidates
 }
 
+fn command_line_matches_main_app(command_line: &str, app_path: &Path) -> bool {
+    let main_executable_dir = app_path.join("Contents/MacOS");
+    command_line.starts_with(&format!("{}/", main_executable_dir.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +407,28 @@ mod tests {
                 .contains(&PathBuf::from("/Applications/Codex.app"))
         );
         assert_eq!(config.process_names, ["ChatGPT", "Codex"]);
+    }
+
+    #[test]
+    fn command_path_detection_matches_only_main_desktop_process() {
+        let app_path = PathBuf::from("/Applications/ChatGPT.app");
+
+        assert!(command_line_matches_main_app(
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+            &app_path
+        ));
+        assert!(command_line_matches_main_app(
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=9229",
+            &app_path
+        ));
+        assert!(!command_line_matches_main_app(
+            "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/150/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer)",
+            &app_path
+        ));
+        assert!(!command_line_matches_main_app(
+            "/Applications/ChatGPT.app/Contents/Resources/codex app-server",
+            &app_path
+        ));
     }
 
     #[tokio::test]
