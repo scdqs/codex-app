@@ -43,6 +43,8 @@ type Diagnostics = {
   detail?: string;
 };
 
+type DiagnosticsBundle = Record<string, unknown>;
+
 const appElement = document.querySelector<HTMLElement>("#app");
 
 if (!appElement) {
@@ -175,7 +177,10 @@ function render() {
         <article class="panel wide">
           <div class="panel-title">
             <h2>诊断</h2>
-            <button data-action="load-diagnostics" ${busy || !bridgeRunning() ? "disabled" : ""}>刷新诊断</button>
+            <div class="button-row">
+              <button data-action="load-diagnostics" ${busy || !bridgeRunning() ? "disabled" : ""}>刷新诊断</button>
+              <button data-action="copy-diagnostics" ${busy ? "disabled" : ""}>复制诊断</button>
+            </div>
           </div>
           ${renderDiagnostics()}
         </article>
@@ -299,6 +304,12 @@ function bindActions() {
       if (action === "stop-tunnel") await runAction("远程链接已关闭", () => invoke("stop_quick_tunnel"));
       if (action === "load-devices") await refresh();
       if (action === "load-diagnostics") await refresh();
+      if (action === "copy-diagnostics") {
+        await runAction("诊断 JSON 已复制", async () => {
+          const bundle = await invoke<DiagnosticsBundle>("get_diagnostics_bundle");
+          await navigator.clipboard.writeText(JSON.stringify(bundle, null, 2));
+        });
+      }
       if (action === "copy-pairing" && status?.lastPairingLink) {
         await navigator.clipboard.writeText(status.lastPairingLink);
         notice = "配对链接已复制";

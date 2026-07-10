@@ -7,8 +7,9 @@ use std::{
 
 use desktop_core::{
     BridgeProcessConfig, BridgeProcessManager, BridgeProcessSnapshot, BridgeProcessStatus,
-    CodexLaunchCommand, CodexLaunchConfig, CodexLaunchManager, CodexLaunchOutcome,
-    QuickTunnelConfig, QuickTunnelManager, TunnelSnapshot, TunnelStatus,
+    CodexLaunchCommand, CodexLaunchConfig, CodexLaunchManager, CodexLaunchOutcome, DiagnosticCheck,
+    DiagnosticLog, DiagnosticsBundleInput, QuickTunnelConfig, QuickTunnelManager, TunnelSnapshot,
+    TunnelStatus, build_diagnostics_bundle,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,6 +88,14 @@ struct DeviceDto {
     display_name: String,
     created_at: u64,
     last_seen_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlDiagnosticsDto {
+    status: String,
+    connection_state: String,
+    detail: Option<String>,
 }
 
 #[tauri::command]
@@ -246,8 +255,55 @@ async fn revoke_device(device_id: String, state: State<'_, ShellState>) -> Resul
     Ok(())
 }
 
+#[tauri::command]
+async fn get_diagnostics_bundle(
+    app: AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<Value, String> {
+    let (bridge_snapshot, control_request) = {
+        let bridge = state.bridge.lock().await;
+        match bridge.as_ref() {
+            Some(manager) => (
+                manager.status(),
+                control_request_parts_from_manager(manager, "/api/control/diagnostics").ok(),
+            ),
+            None => (stopped_bridge_snapshot(), None),
+        }
+    };
+    let control_diagnostics = match control_request {
+        Some((url, token)) => control_get_url(url, token)
+            .await
+            .ok()
+            .and_then(|value| serde_json::from_value::<ControlDiagnosticsDto>(value).ok()),
+        None => None,
+    };
+    let tunnel_snapshot = state.tunnel.lock().await.status();
+    let logs = diagnostic_logs(&app).await;
+    let recent_connection_states = recent_connection_states(
+        &bridge_snapshot,
+        &tunnel_snapshot,
+        control_diagnostics.as_ref(),
+    );
+
+    let bundle = build_diagnostics_bundle(DiagnosticsBundleInput {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        sidecar_version: None,
+        codex_adapter: codex_adapter_check(control_diagnostics.as_ref()),
+        bridge: bridge_check(&bridge_snapshot),
+        tunnel: tunnel_check(&tunnel_snapshot),
+        recent_connection_states,
+        logs,
+    });
+
+    serde_json::to_value(bundle).map_err(|error| error.to_string())
+}
+
 async fn control_get(state: State<'_, ShellState>, path: &str) -> Result<Value, String> {
     let (url, token) = control_request_parts(&state, path).await?;
+    control_get_url(url, token).await
+}
+
+async fn control_get_url(url: String, token: String) -> Result<Value, String> {
     reqwest::Client::new()
         .get(url)
         .header(CONTROL_TOKEN_HEADER, token)
@@ -269,6 +325,13 @@ async fn control_request_parts(
     let manager = bridge
         .as_ref()
         .ok_or_else(|| "bridge service is not initialized".to_string())?;
+    control_request_parts_from_manager(manager, path)
+}
+
+fn control_request_parts_from_manager(
+    manager: &BridgeProcessManager,
+    path: &str,
+) -> Result<(String, String), String> {
     let snapshot = manager.status();
     let health_url = snapshot
         .health_url
@@ -277,6 +340,120 @@ async fn control_request_parts(
         .strip_suffix("/api/health")
         .ok_or_else(|| "bridge health URL has an unexpected shape".to_string())?;
     Ok((format!("{base}{path}"), manager.control_token().to_string()))
+}
+
+async fn diagnostic_logs(app: &AppHandle) -> Vec<DiagnosticLog> {
+    let Ok(app_data_dir) = app.path().app_data_dir() else {
+        return Vec::new();
+    };
+    let log_dir = app_data_dir.join("logs");
+    let mut logs = Vec::new();
+    for (source, filename) in [
+        ("bridge-sidecar.stdout", "bridge-sidecar.stdout.log"),
+        ("bridge-sidecar.stderr", "bridge-sidecar.stderr.log"),
+    ] {
+        if let Some(text) = read_log_tail(&log_dir.join(filename)).await {
+            logs.push(DiagnosticLog {
+                source: source.to_string(),
+                text,
+            });
+        }
+    }
+    logs
+}
+
+async fn read_log_tail(path: &Path) -> Option<String> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    Some(tail_text(&String::from_utf8_lossy(&bytes), 16_384))
+}
+
+fn tail_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[truncated]\n{}", &text[start..])
+}
+
+fn codex_adapter_check(diagnostics: Option<&ControlDiagnosticsDto>) -> DiagnosticCheck {
+    let Some(diagnostics) = diagnostics else {
+        return DiagnosticCheck::unknown("codex diagnostics unavailable");
+    };
+    if diagnostics.status == "ok" {
+        DiagnosticCheck::ok(format!("codex {}", diagnostics.connection_state))
+    } else {
+        DiagnosticCheck::degraded(
+            format!("codex {}", diagnostics.connection_state),
+            diagnostics
+                .detail
+                .clone()
+                .unwrap_or_else(|| "Codex adapter is degraded".to_string()),
+        )
+    }
+}
+
+fn bridge_check(snapshot: &BridgeProcessSnapshot) -> DiagnosticCheck {
+    match snapshot.status {
+        BridgeProcessStatus::Ready => DiagnosticCheck::ok("bridge ready"),
+        BridgeProcessStatus::Degraded => DiagnosticCheck::degraded(
+            "bridge degraded",
+            snapshot
+                .detail
+                .clone()
+                .unwrap_or_else(|| "Bridge health is degraded".to_string()),
+        ),
+        BridgeProcessStatus::Failed => DiagnosticCheck::failed(
+            "bridge failed",
+            snapshot
+                .detail
+                .clone()
+                .unwrap_or_else(|| "Bridge process failed".to_string()),
+        ),
+        BridgeProcessStatus::Starting => DiagnosticCheck::degraded("bridge starting", "starting"),
+        BridgeProcessStatus::Stopping => DiagnosticCheck::degraded("bridge stopping", "stopping"),
+        BridgeProcessStatus::Stopped => DiagnosticCheck::unknown("bridge stopped"),
+    }
+}
+
+fn tunnel_check(snapshot: &TunnelSnapshot) -> DiagnosticCheck {
+    match snapshot.status {
+        TunnelStatus::Ready => DiagnosticCheck::ok(
+            snapshot
+                .session
+                .as_ref()
+                .map(|session| format!("tunnel ready {}", session.public_url))
+                .unwrap_or_else(|| "tunnel ready".to_string()),
+        ),
+        TunnelStatus::Failed => DiagnosticCheck::failed(
+            "tunnel failed",
+            snapshot
+                .detail
+                .clone()
+                .unwrap_or_else(|| "Tunnel provider failed".to_string()),
+        ),
+        TunnelStatus::Starting => DiagnosticCheck::degraded("tunnel starting", "starting"),
+        TunnelStatus::Stopping => DiagnosticCheck::degraded("tunnel stopping", "stopping"),
+        TunnelStatus::Stopped => DiagnosticCheck::unknown("tunnel stopped"),
+    }
+}
+
+fn recent_connection_states(
+    bridge: &BridgeProcessSnapshot,
+    tunnel: &TunnelSnapshot,
+    diagnostics: Option<&ControlDiagnosticsDto>,
+) -> Vec<String> {
+    let mut states = vec![format!("bridge={}", bridge_status(bridge.status))];
+    states.push(format!("tunnel={}", tunnel_status(tunnel.status)));
+    if let Some(diagnostics) = diagnostics {
+        states.push(format!(
+            "codex={} status={}",
+            diagnostics.connection_state, diagnostics.status
+        ));
+    }
+    states
 }
 
 fn bridge_config(app: &AppHandle) -> Result<BridgeProcessConfig, String> {
@@ -525,6 +702,7 @@ fn main() {
             rotate_quick_tunnel,
             stop_quick_tunnel,
             get_control_diagnostics,
+            get_diagnostics_bundle,
             list_devices,
             revoke_device,
         ])
@@ -595,5 +773,36 @@ mod tests {
             choose_pwa_dist_dir(None, Some(resource_dir.path()), Some(workspace_dir.path())),
             workspace_dir.path().join("apps/mobile-pwa/dist")
         );
+    }
+
+    #[test]
+    fn bridge_check_maps_stopped_and_failed_states() {
+        assert_eq!(
+            bridge_check(&stopped_bridge_snapshot()).label,
+            "bridge stopped"
+        );
+        let failed = BridgeProcessSnapshot {
+            status: BridgeProcessStatus::Failed,
+            pid: None,
+            port: None,
+            health_url: None,
+            detail: Some("Authorization: Bearer secret".to_string()),
+        };
+
+        let check = bridge_check(&failed);
+
+        assert_eq!(check.label, "bridge failed");
+        assert_eq!(
+            check.detail.as_deref(),
+            Some("Authorization: Bearer secret")
+        );
+    }
+
+    #[test]
+    fn tail_text_truncates_from_end_on_large_logs() {
+        let text = "0123456789abcdef";
+
+        assert_eq!(tail_text(text, 6), "[truncated]\nabcdef");
+        assert_eq!(tail_text(text, 64), text);
     }
 }
