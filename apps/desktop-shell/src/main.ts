@@ -129,7 +129,7 @@ function render() {
       <section class="grid">
         <article class="panel">
           <div class="panel-title">
-            <h2>Codex Desktop</h2>
+            <h2>ChatGPT / Codex Desktop</h2>
             <button data-action="attach-codex" ${busy ? "disabled" : ""}>检测/启动</button>
           </div>
           ${renderCodexOutcome()}
@@ -193,7 +193,7 @@ function render() {
 
 function renderCodexOutcome() {
   if (!codexOutcome) {
-    return `<p class="muted">点击检测后，应用会附着已开启 debug port 的 Codex，或在安全情况下启动 Codex。</p>`;
+    return `<p class="muted">点击检测后，应用会附着已开启 debug port 的 ChatGPT/Codex，或在安全情况下启动对应桌面应用。</p>`;
   }
   return `
     <dl class="facts">
@@ -292,7 +292,7 @@ function bindActions() {
       const action = button.dataset.action;
       if (action === "refresh") await refresh();
       if (action === "attach-codex") {
-        await runAction("Codex 检测完成", async () => {
+        await runAction("ChatGPT/Codex 检测完成", async () => {
           codexOutcome = await invoke<CodexOutcome>("ensure_codex_ready");
         });
       }

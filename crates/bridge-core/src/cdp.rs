@@ -302,7 +302,7 @@ fn bridge_health_from_targets(targets: &[CdpTarget]) -> BridgeHealth {
         Ok(target) => BridgeHealth::connected(target),
         Err(CdpError::NoCodexTarget) => BridgeHealth::degraded(
             BridgeConnectionState::TargetNotFound,
-            Some("No Codex page target found on the CDP endpoint".to_string()),
+            Some("No ChatGPT/Codex page target found on the CDP endpoint".to_string()),
         ),
         Err(error) => BridgeHealth::degraded(
             BridgeConnectionState::CdpUnavailable,
@@ -322,7 +322,11 @@ fn codex_target_score(target: &CdpTarget) -> Option<u8> {
     let mut score = 0_u8;
     let mut matched_codex = false;
 
-    if title.contains("codex mobile") {
+    if title.contains("codex mobile")
+        || title.contains("chatgpt classic")
+        || url.contains("chatgpt classic.app")
+        || url.contains("chatgpt%20classic.app")
+    {
         return None;
     }
     if url == "app://-/index.html" {
@@ -336,10 +340,20 @@ fn codex_target_score(target: &CdpTarget) -> Option<u8> {
         score = score.saturating_add(50);
         matched_codex = true;
     }
+    if url.contains("chatgpt.app") {
+        score = score.saturating_add(50);
+        matched_codex = true;
+    }
     if title == "codex" {
         score = score.saturating_add(30);
         matched_codex = true;
+    } else if title == "chatgpt" {
+        score = score.saturating_add(30);
+        matched_codex = true;
     } else if title.contains("codex") {
+        score = score.saturating_add(20);
+        matched_codex = true;
+    } else if title.contains("chatgpt") {
         score = score.saturating_add(20);
         matched_codex = true;
     }
@@ -347,10 +361,14 @@ fn codex_target_score(target: &CdpTarget) -> Option<u8> {
         score = score.saturating_add(15);
         matched_codex = true;
     }
+    if url.contains("chatgpt") {
+        score = score.saturating_add(15);
+        matched_codex = true;
+    }
     if !matched_codex {
         return None;
     }
-    if title.contains("chatgpt") && url.contains("codex") {
+    if title.contains("chatgpt") && (url.contains("codex") || url.contains("chatgpt")) {
         score = score.saturating_add(5);
     }
     if target.web_socket_debugger_url.is_some() {
@@ -453,6 +471,32 @@ mod tests {
         let selected = select_codex_target(&targets).expect("codex target is selected");
 
         assert_eq!(selected.id, "page-2");
+    }
+
+    #[test]
+    fn selects_chatgpt_desktop_target_after_codex_rename() {
+        let targets = vec![
+            target("page-1", "page", "Dashboard", "https://example.com"),
+            target("page-2", "page", "ChatGPT", "app://-/index.html"),
+        ];
+
+        let selected = select_codex_target(&targets).expect("chatgpt target is selected");
+
+        assert_eq!(selected.id, "page-2");
+    }
+
+    #[test]
+    fn ignores_chatgpt_classic_target() {
+        let targets = vec![target(
+            "page-1",
+            "page",
+            "ChatGPT Classic",
+            "file:///Applications/ChatGPT%20Classic.app/index.html",
+        )];
+
+        let error = select_codex_target(&targets).expect_err("classic app is ignored");
+
+        assert!(matches!(error, CdpError::NoCodexTarget));
     }
 
     #[test]

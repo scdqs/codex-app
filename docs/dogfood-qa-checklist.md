@@ -4,7 +4,7 @@
 
 ## 试用前提
 
-- macOS 电脑已安装 Codex Desktop，并已用 API 方式登录可正常执行任务。
+- macOS 电脑已安装新版 ChatGPT Desktop 或仍叫 Codex 的旧安装，并已用 API 方式登录可正常执行任务。
 - 手机和电脑在同一可信网络下；外网访问只使用明确标注为 Beta 的临时链接。
 - 试用期间不要把本机端口、pairing URL、control token、诊断日志直接公开到群聊或公网。
 - 配对链接是一次性入口；如果页面提示失效，重新从电脑端生成新链接。
@@ -13,7 +13,7 @@
 
 - 试用日期：
 - macOS 版本：
-- Codex Desktop 版本：
+- ChatGPT/Codex Desktop 版本：
 - Codex Mobile Bridge commit：
 - 手机型号和浏览器：
 - 网络环境：局域网 / 手机热点 / Quick Tunnel Beta
@@ -26,18 +26,19 @@
 - [ ] Bridge 能显示本机局域网访问地址。
 - [ ] Bridge 能显示“生成手机配对链接/二维码”的入口。
 - [ ] 首次启动不要求用户手动复制 control token。
-- [ ] 如果 Codex Desktop 未安装，界面给出安装和打开 Codex 的明确指引。
+- [ ] 如果 ChatGPT/Codex Desktop 未安装，界面给出安装和打开桌面应用的明确指引。
 
 通过标准：用户不需要懂 CDP、remote debugging port 或 sidecar，就能知道下一步该做什么。
 
-## Codex Desktop 附着
+## ChatGPT/Codex Desktop 附着
 
-- [ ] Codex Desktop 未运行时，Bridge 可以打开 Codex，或提示用户点击启动。
-- [ ] Codex Desktop 已运行且 CDP 可用时，Bridge 显示 `writable` 或等价可回写状态。
-- [ ] Codex Desktop 已运行但没有 debug port 时，Bridge 不自动杀进程、不静默重启，必须提示需要用户确认重启。
+- [ ] ChatGPT/Codex Desktop 未运行时，Bridge 可以打开对应桌面应用，或提示用户点击启动。
+- [ ] ChatGPT/Codex Desktop 已运行且 CDP 可用时，Bridge 显示 `writable` 或等价可回写状态。
+- [ ] ChatGPT/Codex Desktop 已运行但没有 debug port 时，Bridge 不自动杀进程、不静默重启，必须提示需要用户确认重启。
+- [ ] 如果机器上只有 `ChatGPT Classic`，Bridge 不应把它当成可用的 Codex-capable 目标。
 - [ ] 降级状态显示具体原因：`cdp_unavailable`、`target_not_found`、`inject_failed`、`rpc_unavailable`、`read_only`。
 
-通过标准：用户知道是“Codex 没启动”、“需要重启 Codex”，还是“当前 Codex 版本注入失败”。
+通过标准：用户知道是“ChatGPT/Codex 没启动”、“需要重启桌面应用”，还是“当前桌面版本注入失败”。
 
 ## 手机配对
 
@@ -51,7 +52,7 @@
 
 ## 会话读取
 
-- [ ] 手机端能看到最近 Codex 会话列表。
+- [ ] 手机端能看到最近 ChatGPT/Codex 会话列表。
 - [ ] 会话列表按 Codex 体验展示，最近更新的任务易于找到。
 - [ ] 进入任一会话后，消息按时间从上到下展示，最新消息在底部。
 - [ ] 用户消息和 Codex 回复有清晰区分。
@@ -64,9 +65,9 @@
 
 - [ ] 选择一个可回写会话。
 - [ ] 在手机输入文本并发送。
-- [ ] Codex Desktop 对应 thread 收到文本并继续执行。
+- [ ] ChatGPT/Codex Desktop 对应 thread 收到文本并继续执行。
 - [ ] 手机端不会重复显示同一条用户消息。
-- [ ] Codex 生成回复后，手机端能在短轮询周期内看到更新。
+- [ ] ChatGPT/Codex 生成回复后，手机端能在短轮询周期内看到更新。
 - [ ] 只读降级时，输入框被禁用并说明原因。
 
 通过标准：手机发送的是对真实 Codex thread 的回写，不只是前端本地新增消息。
@@ -124,4 +125,3 @@ Codex attach 状态：
 是否可复现：
 诊断包已检查并附上：是 / 否
 ```
-

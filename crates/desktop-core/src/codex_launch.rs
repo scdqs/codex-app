@@ -26,9 +26,9 @@ pub struct CodexLaunchConfig {
 impl Default for CodexLaunchConfig {
     fn default() -> Self {
         Self {
-            app_name: "Codex".to_string(),
+            app_name: "ChatGPT / Codex".to_string(),
             app_path_candidates: default_codex_app_candidates(),
-            process_names: vec!["Codex".to_string()],
+            process_names: vec!["ChatGPT".to_string(), "Codex".to_string()],
             debug_port: DEFAULT_DEBUG_PORT,
             launch_timeout: DEFAULT_LAUNCH_TIMEOUT,
             cdp_poll_interval: DEFAULT_CDP_POLL_INTERVAL,
@@ -285,7 +285,7 @@ impl CodexDesktopHost for MacCodexDesktopHost {
                 .args(["-x", process_name])
                 .status()
                 .map_err(|source| CodexLaunchHostError::Io {
-                    action: "detect Codex process",
+                    action: "detect ChatGPT/Codex process",
                     source,
                 })?;
             if status.success() {
@@ -317,7 +317,7 @@ impl CodexDesktopHost for MacCodexDesktopHost {
             .args(&command.args)
             .status()
             .map_err(|source| CodexLaunchHostError::Io {
-                action: "launch Codex",
+                action: "launch ChatGPT/Codex",
                 source,
             })?;
         if status.success() {
@@ -332,9 +332,15 @@ impl CodexDesktopHost for MacCodexDesktopHost {
 }
 
 fn default_codex_app_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from("/Applications/Codex.app")];
+    let mut candidates = vec![PathBuf::from("/Applications/ChatGPT.app")];
     if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join("Applications/Codex.app"));
+        let user_applications = PathBuf::from(home).join("Applications");
+        candidates.push(user_applications.join("ChatGPT.app"));
+    }
+    candidates.push(PathBuf::from("/Applications/Codex.app"));
+    if let Some(home) = std::env::var_os("HOME") {
+        let user_applications = PathBuf::from(home).join("Applications");
+        candidates.push(user_applications.join("Codex.app"));
     }
     candidates
 }
@@ -360,6 +366,23 @@ mod tests {
 
     fn manager(host: MockCodexDesktopHost) -> CodexLaunchManager {
         CodexLaunchManager::new(test_config(), Arc::new(host))
+    }
+
+    #[test]
+    fn default_config_accepts_chatgpt_and_legacy_codex_names() {
+        let config = CodexLaunchConfig::default();
+
+        assert_eq!(config.app_name, "ChatGPT / Codex");
+        assert_eq!(
+            config.app_path_candidates.first(),
+            Some(&PathBuf::from("/Applications/ChatGPT.app"))
+        );
+        assert!(
+            config
+                .app_path_candidates
+                .contains(&PathBuf::from("/Applications/Codex.app"))
+        );
+        assert_eq!(config.process_names, ["ChatGPT", "Codex"]);
     }
 
     #[tokio::test]

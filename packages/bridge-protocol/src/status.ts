@@ -7,7 +7,7 @@ export type ConnectionLabel =
   | "Unpaired"
   | "Pairing"
   | "Connected"
-  | "Codex not running"
+  | "ChatGPT/Codex not running"
   | "Inject failed"
   | "Read-only"
   | "Writable"
@@ -21,7 +21,7 @@ export interface ConnectionViewState {
 export function mapHealthToConnection(health: BridgeHealth): ConnectionViewState {
   const state = normalizeConnectionState(health.connectionState);
   if (state === "codex_not_running" || state === "not_running") {
-    return { label: "Codex not running" };
+    return { label: "ChatGPT/Codex not running" };
   }
   if (state === "inject_failed" || state === "injection_failed") {
     return { label: "Inject failed" };
@@ -47,8 +47,8 @@ export function secondaryStatusText(label: ConnectionLabel): string {
       return "Read-only";
     case "Inject failed":
       return "Desktop bridge unavailable";
-    case "Codex not running":
-      return "Start Codex Desktop";
+    case "ChatGPT/Codex not running":
+      return "Start desktop app";
     case "Connection error":
       return "Needs new link";
     case "Pairing":

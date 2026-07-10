@@ -51,7 +51,7 @@ describe("shared bridge protocol", () => {
       label: "Inject failed",
     });
     expect(mapHealthToConnection({ status: "degraded", connectionState: "codex_not_running" })).toEqual({
-      label: "Codex not running",
+      label: "ChatGPT/Codex not running",
     });
     expect(mapHealthToConnection({ status: "degraded", connectionState: "mystery" })).toEqual({
       label: "Connection error",
@@ -62,6 +62,7 @@ describe("shared bridge protocol", () => {
   it("keeps secondary text and data-enabled state in one shared module", () => {
     expect(secondaryStatusText("Writable")).toBe("Writable");
     expect(secondaryStatusText("Inject failed")).toBe("Desktop bridge unavailable");
+    expect(secondaryStatusText("ChatGPT/Codex not running")).toBe("Start desktop app");
     expect(secondaryStatusText("Connection error")).toBe("Needs new link");
     expect(isSessionDataEnabled("Writable")).toBe(true);
     expect(isSessionDataEnabled("Read-only")).toBe(true);

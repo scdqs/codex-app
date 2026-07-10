@@ -72,7 +72,7 @@ pub async fn diagnose_cdp_app_server(cdp: &CdpClient) -> DiagnosticsReport {
         Err(CdpError::NoCodexTarget) => {
             return DiagnosticsReport::degraded(
                 BridgeConnectionState::TargetNotFound,
-                "No Codex page target found on the CDP endpoint",
+                "No ChatGPT/Codex page target found on the CDP endpoint",
             );
         }
         Err(error) => {
