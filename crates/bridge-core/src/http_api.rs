@@ -9,7 +9,7 @@ use axum::{
     Extension, Json, Router,
     body::Body,
     extract::{
-        Path, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, Request, StatusCode, header},
@@ -17,6 +17,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -25,7 +26,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
 use crate::{
-    codex_rpc::{CodexAdapter, CodexRpcError},
+    codex_rpc::{CodexAdapter, CodexRpcError, UserImageAttachment},
     diagnostics::DiagnosticsReport,
     event_hub::EventHub,
     local_assets::LocalAssetRegistry,
@@ -50,6 +51,9 @@ pub struct AppState {
 }
 
 const EVENT_HISTORY_LIMIT_PER_THREAD: usize = 256;
+const MAX_UPLOAD_IMAGE_ATTACHMENTS: usize = 4;
+const MAX_UPLOAD_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_AUTHENTICATED_JSON_BODY_BYTES: usize = 48 * 1024 * 1024;
 #[cfg(test)]
 const MAX_REFRESH_FAILURES_PER_DEVICE: usize = 5;
 const BRIDGE_CONTROL_TOKEN_HEADER: &str = "x-bridge-control-token";
@@ -118,12 +122,30 @@ pub struct DeviceResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SendMessageRequest {
     text: String,
+    #[serde(default)]
+    attachments: Vec<IncomingImageAttachment>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionRequest {
     text: String,
+    #[serde(default)]
+    attachments: Vec<IncomingImageAttachment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomingImageAttachment {
+    name: String,
+    mime_type: String,
+    data_base64: String,
+}
+
+#[derive(Debug)]
+struct StoredImageAttachment {
+    name: String,
+    path: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,6 +293,7 @@ fn phone_routes(state: AppState) -> Router<AppState> {
             "/api/approvals/:approval_id/decision",
             post(decide_approval),
         )
+        .layer(DefaultBodyLimit::max(MAX_AUTHENTICATED_JSON_BODY_BYTES))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -439,41 +462,37 @@ async fn create_session(
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<SessionSnapshot>), ApiError> {
     let text = request.text.trim().to_string();
-    if text.is_empty() {
-        return Err(ApiError::BadRequest("session text is required"));
+    if text.is_empty() && request.attachments.is_empty() {
+        return Err(ApiError::BadRequest(
+            "session text or attachment is required",
+        ));
     }
+    let attachments = store_incoming_image_attachments(&request.attachments).await?;
+    let adapter_attachments = codex_image_attachments(&attachments);
+    let display_text = preview_text(&text, &attachments);
 
     let now = current_time_ms();
     let thread = if let Some(adapter) = state.codex_adapter.as_ref() {
-        adapter.start_thread(&text).await?
+        adapter.start_thread(&text, &adapter_attachments).await?
     } else {
-        local_thread_for_created_session(&text, now)
+        local_thread_for_created_session(&display_text, now)
     };
     let mut snapshot = Normalizer::snapshot_from_thread(&thread);
     if snapshot.updated_at == 0 {
         snapshot.updated_at = now;
     }
     if snapshot.preview.as_deref().unwrap_or_default().is_empty() {
-        snapshot.preview = Some(text.clone());
+        snapshot.preview = Some(display_text.clone());
     }
-    if snapshot.title == snapshot.thread_id {
-        snapshot.title = session_title_from_text(&text);
+    if snapshot.title == snapshot.thread_id || snapshot.title.trim().is_empty() {
+        snapshot.title = session_title_from_text(&display_text);
     }
     snapshot.status = SessionStatus::Running;
 
     state.event_hub.set_snapshot(snapshot.clone()).await;
-    state
-        .publish_session_event(SessionEvent {
-            id: Uuid::new_v4().to_string(),
-            thread_id: snapshot.thread_id.clone(),
-            event_type: SessionEventType::Message,
-            payload: json!({
-                "role": "user",
-                "text": text,
-            }),
-            created_at: now,
-        })
-        .await;
+    let event = event_for_user_message(snapshot.thread_id.clone(), text, attachments, now);
+    let event = state.register_local_assets_for_event(event).await;
+    state.publish_session_event(event).await;
 
     Ok((StatusCode::CREATED, Json(snapshot)))
 }
@@ -682,25 +701,206 @@ fn session_title_from_text(text: &str) -> String {
     shortened
 }
 
+fn preview_text(text: &str, attachments: &[StoredImageAttachment]) -> String {
+    if !text.trim().is_empty() {
+        return text.to_string();
+    }
+    if attachments.len() == 1 {
+        return format!("Image: {}", attachments[0].name);
+    }
+    format!("{} images from phone", attachments.len())
+}
+
+fn event_for_user_message(
+    thread_id: String,
+    text: String,
+    attachments: Vec<StoredImageAttachment>,
+    created_at: u64,
+) -> SessionEvent {
+    let mut payload = json!({
+        "role": "user",
+        "text": text,
+    });
+
+    if !attachments.is_empty()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "attachments".to_string(),
+            json!(
+                attachments
+                    .into_iter()
+                    .map(|attachment| {
+                        json!({
+                            "type": "image",
+                            "path": attachment.path,
+                            "name": attachment.name,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+
+    SessionEvent {
+        id: Uuid::new_v4().to_string(),
+        thread_id,
+        event_type: SessionEventType::Message,
+        payload,
+        created_at,
+    }
+}
+
+fn codex_image_attachments(attachments: &[StoredImageAttachment]) -> Vec<UserImageAttachment> {
+    attachments
+        .iter()
+        .map(|attachment| UserImageAttachment {
+            path: attachment.path.to_string_lossy().into_owned(),
+        })
+        .collect()
+}
+
+async fn store_incoming_image_attachments(
+    attachments: &[IncomingImageAttachment],
+) -> Result<Vec<StoredImageAttachment>, ApiError> {
+    if attachments.len() > MAX_UPLOAD_IMAGE_ATTACHMENTS {
+        return Err(ApiError::BadRequest("too many image attachments"));
+    }
+
+    let mut stored = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        let bytes = decode_image_attachment_data(&attachment.data_base64)?;
+        if bytes.is_empty() {
+            return Err(ApiError::BadRequest("image attachment is empty"));
+        }
+        if bytes.len() > MAX_UPLOAD_IMAGE_BYTES {
+            return Err(ApiError::BadRequest("image attachment is too large"));
+        }
+
+        let format = supported_image_format(&attachment.mime_type, &bytes)?;
+        let dir = std::env::temp_dir()
+            .join("codex-mobile-bridge")
+            .join("uploads");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|_| ApiError::Internal("failed to prepare image attachment storage"))?;
+        let path = dir.join(format!("{}.{}", Uuid::new_v4(), format.extension));
+        tokio::fs::write(&path, bytes)
+            .await
+            .map_err(|_| ApiError::Internal("failed to store image attachment"))?;
+
+        stored.push(StoredImageAttachment {
+            name: display_name_for_attachment(&attachment.name, format.extension),
+            path,
+        });
+    }
+
+    Ok(stored)
+}
+
+fn decode_image_attachment_data(data_base64: &str) -> Result<Vec<u8>, ApiError> {
+    let encoded = data_base64
+        .split_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(data_base64)
+        .trim();
+    BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|_| ApiError::BadRequest("invalid image attachment data"))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SupportedImageFormat {
+    mime_type: &'static str,
+    extension: &'static str,
+}
+
+fn supported_image_format(mime_type: &str, bytes: &[u8]) -> Result<SupportedImageFormat, ApiError> {
+    let normalized = mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let declared = match normalized.as_str() {
+        "image/png" => SupportedImageFormat {
+            mime_type: "image/png",
+            extension: "png",
+        },
+        "image/jpeg" | "image/jpg" => SupportedImageFormat {
+            mime_type: "image/jpeg",
+            extension: "jpg",
+        },
+        "image/gif" => SupportedImageFormat {
+            mime_type: "image/gif",
+            extension: "gif",
+        },
+        "image/webp" => SupportedImageFormat {
+            mime_type: "image/webp",
+            extension: "webp",
+        },
+        _ => {
+            return Err(ApiError::UnsupportedMediaType(
+                "unsupported image attachment type",
+            ));
+        }
+    };
+
+    if image_bytes_match(declared.mime_type, bytes) {
+        Ok(declared)
+    } else {
+        Err(ApiError::UnsupportedMediaType(
+            "image attachment bytes do not match declared type",
+        ))
+    }
+}
+
+fn image_bytes_match(mime_type: &str, bytes: &[u8]) -> bool {
+    match mime_type {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+fn display_name_for_attachment(name: &str, fallback_extension: &str) -> String {
+    let trimmed = name.trim();
+    let filename = FsPath::new(trimmed)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("image");
+    if FsPath::new(filename).extension().is_some() {
+        filename.to_string()
+    } else {
+        format!("{filename}.{fallback_extension}")
+    }
+}
+
 async fn send_message(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
     Json(request): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
+    let text = request.text.trim().to_string();
+    if text.is_empty() && request.attachments.is_empty() {
+        return Err(ApiError::BadRequest(
+            "message text or attachment is required",
+        ));
+    }
+    let attachments = store_incoming_image_attachments(&request.attachments).await?;
+    let adapter_attachments = codex_image_attachments(&attachments);
+
     if let Some(adapter) = state.codex_adapter.as_ref() {
-        adapter.send_user_message(&thread_id, &request.text).await?;
+        adapter
+            .send_user_message(&thread_id, &text, &adapter_attachments)
+            .await?;
     }
 
-    let event = SessionEvent {
-        id: Uuid::new_v4().to_string(),
-        thread_id,
-        event_type: SessionEventType::Message,
-        payload: json!({
-            "role": "user",
-            "text": request.text,
-        }),
-        created_at: current_time_ms(),
-    };
+    let event = event_for_user_message(thread_id, text, attachments, current_time_ms());
+    let event = state.register_local_assets_for_event(event).await;
     state.publish_session_event(event).await;
 
     Ok((
@@ -929,6 +1129,7 @@ enum ApiError {
     Forbidden(&'static str),
     NotFound(&'static str),
     UnsupportedMediaType(&'static str),
+    Internal(&'static str),
     Pairing(PairingError),
     Adapter(CodexRpcError),
 }
@@ -955,6 +1156,7 @@ impl IntoResponse for ApiError {
             Self::UnsupportedMediaType(message) => {
                 (StatusCode::UNSUPPORTED_MEDIA_TYPE, message.to_string())
             }
+            Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message.to_string()),
             Self::Pairing(PairingError::InvalidToken | PairingError::TokenAlreadyUsed) => {
                 (StatusCode::BAD_REQUEST, "invalid pairing token".to_string())
             }
@@ -2318,8 +2520,77 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(
             messages.lock().expect("messages lock").as_slice(),
-            &[("thread-1".to_string(), "hello Codex".to_string())]
+            &[("thread-1".to_string(), "hello Codex".to_string(), vec![])]
         );
+    }
+
+    #[tokio::test]
+    async fn paired_device_send_message_with_image_routes_to_adapter_and_scrubs_event_path() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::default());
+        let messages = adapter.messages();
+        let mut subscriber = state.event_hub().subscribe().await;
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions/thread-1/messages")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "text": "what is in this image?",
+                            "attachments": [{
+                                "name": "phone.png",
+                                "mimeType": "image/png",
+                                "dataBase64": "iVBORw0KGgo="
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let recorded = messages.lock().expect("messages lock").clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "thread-1");
+        assert_eq!(recorded[0].1, "what is in this image?");
+        assert_eq!(recorded[0].2.len(), 1);
+        let image_path = PathBuf::from(&recorded[0].2[0].path);
+        assert!(
+            image_path
+                .parent()
+                .expect("stored image has parent")
+                .ends_with("codex-mobile-bridge/uploads")
+        );
+        assert_eq!(
+            tokio::fs::read(&image_path)
+                .await
+                .expect("stored image reads"),
+            b"\x89PNG\r\n\x1a\n"
+        );
+
+        match subscriber.recv().await.expect("message event broadcasts") {
+            ServerEnvelope::SessionEvent(event) => {
+                let serialized_event =
+                    serde_json::to_string(&event).expect("event serializes to json");
+                assert!(!serialized_event.contains(image_path.to_string_lossy().as_ref()));
+                assert_eq!(event.payload["text"], json!("what is in this image?"));
+                assert_eq!(event.payload["attachments"][0]["name"], json!("phone.png"));
+                let src = event.payload["attachments"][0]["src"]
+                    .as_str()
+                    .expect("asset src is returned");
+                assert!(src.starts_with("/api/assets/local-image/"));
+            }
+            envelope => panic!("expected session event, got {envelope:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2463,7 +2734,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingAdapter {
         decisions: Arc<StdMutex<Vec<ApprovalDecision>>>,
-        messages: Arc<StdMutex<Vec<(String, String)>>>,
+        messages: Arc<StdMutex<Vec<(String, String, Vec<UserImageAttachment>)>>>,
         started_threads: Arc<StdMutex<Vec<String>>>,
         threads: Arc<StdMutex<Vec<CodexThread>>>,
         turns: Arc<StdMutex<StdHashMap<String, Vec<CodexTurn>>>>,
@@ -2501,7 +2772,7 @@ mod tests {
             self.decisions.clone()
         }
 
-        fn messages(&self) -> Arc<StdMutex<Vec<(String, String)>>> {
+        fn messages(&self) -> Arc<StdMutex<Vec<(String, String, Vec<UserImageAttachment>)>>> {
             self.messages.clone()
         }
 
@@ -2516,7 +2787,11 @@ mod tests {
             Ok(self.threads.lock().expect("threads lock").clone())
         }
 
-        async fn start_thread(&self, text: &str) -> Result<CodexThread, CodexRpcError> {
+        async fn start_thread(
+            &self,
+            text: &str,
+            _attachments: &[UserImageAttachment],
+        ) -> Result<CodexThread, CodexRpcError> {
             let id = {
                 let mut started_threads =
                     self.started_threads.lock().expect("started threads lock");
@@ -2574,11 +2849,13 @@ mod tests {
             &self,
             thread_id: &str,
             text: &str,
+            attachments: &[UserImageAttachment],
         ) -> Result<(), CodexRpcError> {
-            self.messages
-                .lock()
-                .expect("messages lock")
-                .push((thread_id.to_string(), text.to_string()));
+            self.messages.lock().expect("messages lock").push((
+                thread_id.to_string(),
+                text.to_string(),
+                attachments.to_vec(),
+            ));
             Ok(())
         }
 

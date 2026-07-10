@@ -1026,6 +1026,68 @@ describe("App", () => {
     expect(input).toHaveValue("");
   });
 
+  it("send_message_can_include_image_attachment", async () => {
+    const user = userEvent.setup();
+    stubObjectUrls();
+    saveActiveSession();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-send", title: "Reply target", preview: "Waiting" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-send/events") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-send/messages" && init?.method === "POST") {
+        return jsonResponse({ accepted: true });
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const input = await screen.findByPlaceholderText("Message Reply target");
+    const fileInput = screen.getByLabelText("Choose image attachment");
+    const image = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], "phone.png", {
+      type: "image/png",
+    });
+    await user.upload(fileInput, image);
+    expect(screen.getByRole("img", { name: "phone.png" })).toHaveAttribute("src", "blob:codex-image");
+    await user.type(input, "look at this");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://bridge.local/api/sessions/thread-send/messages",
+        expect.objectContaining({
+          method: "POST",
+          headers: {
+            Authorization: "Bearer session-1",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            text: "look at this",
+            attachments: [
+              {
+                name: "phone.png",
+                mimeType: "image/png",
+                dataBase64: "iVBORw0KGgo=",
+              },
+            ],
+          }),
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("img", { name: "phone.png" })).not.toBeInTheDocument();
+    });
+  });
+
   it("creates_new_session_from_the_phone_and_selects_it", async () => {
     const user = userEvent.setup();
     saveActiveSession();
@@ -1660,6 +1722,33 @@ describe("App", () => {
     const merged = mergePolledSessionEvents(current, polled);
 
     expect(merged.map((event) => event.id)).toEqual(["turn-old:item-2", "local-pending"]);
+  });
+
+  it("reconciles_image_only_pending_user_message_after_polling", () => {
+    const current = [
+      sessionEvent({
+        id: "local-image-pending",
+        threadId: "thread-a",
+        payload: { role: "user", text: "", pending: true },
+        createdAt: 1_783_515_392_000,
+      }),
+    ];
+    const polled = [
+      sessionEvent({
+        id: "turn-image:item-1",
+        threadId: "thread-a",
+        payload: {
+          role: "user",
+          text: "",
+          attachments: [{ type: "image", src: "/api/assets/local-image/asset-1", name: "phone.png" }],
+        },
+        createdAt: 1_783_515_393_000,
+      }),
+    ];
+
+    const merged = mergePolledSessionEvents(current, polled);
+
+    expect(merged.map((event) => event.id)).toEqual(["turn-image:item-1"]);
   });
 
   it("orders_same_turn_events_by_item_number_when_timestamps_match", () => {

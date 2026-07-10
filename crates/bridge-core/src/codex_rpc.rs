@@ -13,16 +13,30 @@ use crate::{
 #[async_trait]
 pub trait CodexAdapter: Send + Sync {
     async fn list_threads(&self) -> Result<Vec<CodexThread>, CodexRpcError>;
-    async fn start_thread(&self, text: &str) -> Result<CodexThread, CodexRpcError>;
+    async fn start_thread(
+        &self,
+        text: &str,
+        attachments: &[UserImageAttachment],
+    ) -> Result<CodexThread, CodexRpcError>;
     async fn resume_thread(&self, thread_id: &str) -> Result<Option<CodexThread>, CodexRpcError>;
     async fn list_turns(&self, thread_id: &str) -> Result<Vec<CodexTurn>, CodexRpcError>;
-    async fn send_user_message(&self, thread_id: &str, text: &str) -> Result<(), CodexRpcError>;
+    async fn send_user_message(
+        &self,
+        thread_id: &str,
+        text: &str,
+        attachments: &[UserImageAttachment],
+    ) -> Result<(), CodexRpcError>;
     async fn subscribe_events(&self, thread_id: Option<&str>) -> Result<(), CodexRpcError>;
     async fn respond_approval(
         &self,
         approval_id: &str,
         decision: &ApprovalDecision,
     ) -> Result<(), CodexRpcError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserImageAttachment {
+    pub path: String,
 }
 
 #[async_trait]
@@ -191,14 +205,19 @@ where
         Ok(extract_thread_value(&result).map(map_thread).transpose()?)
     }
 
-    async fn start_thread(&self, text: &str) -> Result<CodexThread, CodexRpcError> {
+    async fn start_thread(
+        &self,
+        text: &str,
+        attachments: &[UserImageAttachment],
+    ) -> Result<CodexThread, CodexRpcError> {
         let result = self.call("thread/start", json!({})).await?;
         let thread_value = extract_thread_value(&result).ok_or(CodexRpcError::InvalidResponse {
             method: "thread/start",
             reason: "missing thread",
         })?;
         let thread = map_thread(thread_value)?;
-        self.start_turn_without_resume(&thread.id, text).await?;
+        self.start_turn_without_resume(&thread.id, text, attachments)
+            .await?;
 
         Ok(thread)
     }
@@ -215,9 +234,15 @@ where
         Ok(items.into_iter().map(map_turn).collect())
     }
 
-    async fn send_user_message(&self, thread_id: &str, text: &str) -> Result<(), CodexRpcError> {
+    async fn send_user_message(
+        &self,
+        thread_id: &str,
+        text: &str,
+        attachments: &[UserImageAttachment],
+    ) -> Result<(), CodexRpcError> {
         self.resume_thread(thread_id).await?;
-        self.start_turn_without_resume(thread_id, text).await
+        self.start_turn_without_resume(thread_id, text, attachments)
+            .await
     }
 
     async fn subscribe_events(&self, _thread_id: Option<&str>) -> Result<(), CodexRpcError> {
@@ -245,17 +270,27 @@ where
         &self,
         thread_id: &str,
         text: &str,
+        attachments: &[UserImageAttachment],
     ) -> Result<(), CodexRpcError> {
         let client_user_message_id = format!(
             "codex-mobile-{}",
             self.next_client_message_id.fetch_add(1, Ordering::SeqCst)
+        );
+        let mut input = Vec::new();
+        if !text.trim().is_empty() {
+            input.push(json!({ "type": "text", "text": text }));
+        }
+        input.extend(
+            attachments
+                .iter()
+                .map(|attachment| json!({ "type": "localImage", "path": attachment.path })),
         );
         self.call(
             "turn/start",
             json!({
                 "threadId": thread_id,
                 "clientUserMessageId": client_user_message_id,
-                "input": [{ "type": "text", "text": text }],
+                "input": input,
             }),
         )
         .await?;
@@ -435,7 +470,7 @@ mod tests {
         let client = AppServerJsonRpcClient::new(transport);
 
         client
-            .send_user_message("thread-1", "same text")
+            .send_user_message("thread-1", "same text", &[])
             .await
             .expect("message sends");
 
@@ -450,6 +485,38 @@ mod tests {
                 "threadId": "thread-1",
                 "clientUserMessageId": "codex-mobile-1",
                 "input": [{ "type": "text", "text": "same text" }]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_sends_turn_start_with_local_image_attachments() {
+        let transport = RecordingTransport::new(vec![json!({}), json!({ "accepted": true })]);
+        let requests = transport.requests();
+        let client = AppServerJsonRpcClient::new(transport);
+
+        client
+            .send_user_message(
+                "thread-1",
+                "what is in this image?",
+                &[UserImageAttachment {
+                    path: "/tmp/codex-mobile/image-1.png".to_string(),
+                }],
+            )
+            .await
+            .expect("message sends");
+
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests[1].method, "turn/start");
+        assert_eq!(
+            requests[1].params,
+            json!({
+                "threadId": "thread-1",
+                "clientUserMessageId": "codex-mobile-1",
+                "input": [
+                    { "type": "text", "text": "what is in this image?" },
+                    { "type": "localImage", "path": "/tmp/codex-mobile/image-1.png" }
+                ]
             })
         );
     }
@@ -471,7 +538,7 @@ mod tests {
         let client = AppServerJsonRpcClient::new(transport);
 
         let thread = client
-            .start_thread("start this from phone")
+            .start_thread("start this from phone", &[])
             .await
             .expect("thread starts");
 
@@ -505,7 +572,7 @@ mod tests {
         let client = AppServerJsonRpcClient::new(transport);
 
         let thread = client
-            .start_thread("phone task")
+            .start_thread("phone task", &[])
             .await
             .expect("thread starts");
 
@@ -528,7 +595,7 @@ mod tests {
         let client = AppServerJsonRpcClient::new(transport);
 
         let thread = client
-            .start_thread("phone task")
+            .start_thread("phone task", &[])
             .await
             .expect("thread starts");
 

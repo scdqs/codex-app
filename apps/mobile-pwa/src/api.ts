@@ -30,6 +30,12 @@ export interface SessionResponse {
 
 export type HealthResponse = BridgeHealth;
 
+export interface OutgoingImageAttachment {
+  name: string;
+  mimeType: string;
+  dataBase64: string;
+}
+
 export function readPairingPayloadFromUrl(url: string): PairingPayload | null {
   const parsed = new URL(url, window.location.href);
   const pairingToken = parsed.searchParams.get("pairingToken") ?? parsed.searchParams.get("token");
@@ -109,6 +115,7 @@ export async function createSession(
   bridgeUrl: string,
   sessionToken: string,
   text: string,
+  attachments: OutgoingImageAttachment[] = [],
 ): Promise<SessionSnapshot> {
   const response = await fetch(apiUrl(bridgeUrl, "/api/sessions"), {
     method: "POST",
@@ -116,7 +123,7 @@ export async function createSession(
       Authorization: `Bearer ${sessionToken}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(messageBody(text, attachments)),
   });
 
   if (!response.ok) {
@@ -186,6 +193,7 @@ export async function sendTextMessage(
   sessionToken: string,
   threadId: string,
   text: string,
+  attachments: OutgoingImageAttachment[] = [],
 ): Promise<void> {
   const response = await fetch(apiUrl(bridgeUrl, `/api/sessions/${encodeURIComponent(threadId)}/messages`), {
     method: "POST",
@@ -193,12 +201,19 @@ export async function sendTextMessage(
       Authorization: `Bearer ${sessionToken}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(messageBody(text, attachments)),
   });
 
   if (!response.ok) {
     throw new ApiError(response.status, `Send message request failed with ${response.status}`);
   }
+}
+
+function messageBody(text: string, attachments: OutgoingImageAttachment[]): { text: string; attachments?: OutgoingImageAttachment[] } {
+  if (attachments.length === 0) {
+    return { text };
+  }
+  return { text, attachments };
 }
 
 export async function decideApproval(

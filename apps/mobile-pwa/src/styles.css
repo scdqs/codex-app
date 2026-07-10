@@ -834,13 +834,68 @@ h3 {
 
 .composer {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: end;
   gap: 10px;
   min-height: calc(var(--composer-height) + var(--safe-bottom));
   padding: 10px 12px calc(10px + var(--safe-bottom));
   border-top: 1px solid var(--border);
   background: rgb(16 20 24 / 96%);
+}
+
+.composer-attachments,
+.composer-error {
+  grid-column: 1 / -1;
+}
+
+.composer-attachments {
+  display: flex;
+  min-width: 0;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 1px;
+}
+
+.composer-attachment {
+  position: relative;
+  display: inline-flex;
+  width: 52px;
+  height: 52px;
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+
+.composer-attachment img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.composer-attachment-remove {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  min-height: 0;
+  place-items: center;
+  border: 1px solid rgb(12 17 21 / 70%);
+  border-radius: 999px;
+  padding: 0;
+  background: rgb(16 20 24 / 88%);
+  color: var(--text);
+}
+
+.composer-error {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #f0aaa5;
+  font-size: 0.78rem;
 }
 
 .composer textarea {
@@ -873,9 +928,26 @@ h3 {
   color: #75818b;
 }
 
+.attach-button,
 .send-button {
   width: 46px;
   height: 46px;
+}
+
+.attach-button {
+  display: grid;
+  place-items: center;
+  border-color: var(--border-strong);
+  background: var(--surface-strong);
+  color: var(--text-soft);
+}
+
+.attach-button:disabled {
+  cursor: not-allowed;
+  color: #69747d;
+}
+
+.send-button {
   border-color: rgb(66 184 155 / 34%);
   background: var(--accent);
   color: #effbf7;

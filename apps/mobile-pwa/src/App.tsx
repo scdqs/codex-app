@@ -20,6 +20,7 @@ import {
   Clock3,
   Command,
   FilePenLine,
+  ImagePlus,
   Menu,
   Plus,
   Send,
@@ -58,6 +59,7 @@ import {
   refreshSession,
   sendTextMessage,
   type HealthResponse,
+  type OutgoingImageAttachment,
   type PairingPayload,
 } from "./api";
 import { createDeviceSession, loadSession, saveSession, type DeviceSession } from "./storage";
@@ -67,10 +69,24 @@ const SESSION_LIST_REFRESH_MS = 5_000;
 const SESSION_EVENTS_REFRESH_MS = 2_000;
 const HIDDEN_PAGE_POLL_MULTIPLIER = 6;
 const MAX_POLL_BACKOFF_MS = 30_000;
+const MAX_DRAFT_IMAGE_ATTACHMENTS = 4;
+const MAX_DRAFT_IMAGE_BYTES = 8 * 1024 * 1024;
+const SUPPORTED_DRAFT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+interface DraftImageAttachment {
+  id: string;
+  file: File;
+  name: string;
+  mimeType: string;
+  previewUrl: string;
+  size: number;
+}
 
 function App() {
   const [selectedThreadId, setSelectedThreadId] = useState("");
   const [draft, setDraft] = useState("");
+  const [draftImages, setDraftImages] = useState<DraftImageAttachment[]>([]);
+  const [draftAttachmentError, setDraftAttachmentError] = useState("");
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false);
   const [isNewSessionSheetOpen, setIsNewSessionSheetOpen] = useState(false);
   const [newSessionDraft, setNewSessionDraft] = useState("");
@@ -87,6 +103,7 @@ function App() {
   const sessionRefreshPromiseRef = useRef<Promise<DeviceSession> | null>(null);
   const sessionListFailureCountRef = useRef(0);
   const sessionEventsFailureCountRef = useRef(0);
+  const draftImagesRef = useRef<DraftImageAttachment[]>([]);
   const canSyncSessionData =
     Boolean(deviceSession) && (isSessionDataEnabled(connection.label) || connection.label === "Connection error");
   const sessions = liveSessions ?? [];
@@ -438,16 +455,39 @@ function App() {
     };
   }, [connection.label, deviceSession, socketReconnectNonce]);
 
+  useEffect(() => {
+    draftImagesRef.current = draftImages;
+  }, [draftImages]);
+
+  useEffect(() => {
+    return () => {
+      for (const image of draftImagesRef.current) {
+        URL.revokeObjectURL(image.previewUrl);
+      }
+    };
+  }, []);
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const activeSession = deviceSession;
-    if (!canSend || sending || !draft.trim() || !activeSession || !selectedSession) {
+    const text = draft.trim();
+    const images = draftImages;
+    if (!canSend || sending || (!text && images.length === 0) || !activeSession || !selectedSession) {
       return;
     }
 
-    const text = draft.trim();
     const threadId = selectedSession.threadId;
     setSending(true);
+    setDraftAttachmentError("");
+    let outgoingAttachments: OutgoingImageAttachment[];
+    try {
+      outgoingAttachments = await draftImagesToOutgoingAttachments(images);
+    } catch (error) {
+      setDraftAttachmentError(error instanceof Error ? error.message : "Unable to read image attachment");
+      setSending(false);
+      return;
+    }
+
     setEventsByThread((current) => {
       const localEvent: SessionEvent = {
         id: `local-${Date.now()}`,
@@ -461,9 +501,10 @@ function App() {
         [threadId]: sortSessionEvents(appendOrMergeSessionEvent(current[threadId] ?? [], localEvent)),
       };
     });
-    setDraft("");
     try {
-      await sendTextMessage(activeSession.bridgeUrl, activeSession.sessionToken, threadId, text);
+      await sendTextMessage(activeSession.bridgeUrl, activeSession.sessionToken, threadId, text, outgoingAttachments);
+      setDraft("");
+      clearDraftImages();
     } catch (error) {
       setConnection({ label: "Connection error", detail: connectionErrorText(error) });
     } finally {
@@ -590,6 +631,62 @@ function App() {
     handleCloseSessionDrawer();
   }
 
+  function handleAttachDraftImages(files: FileList) {
+    const incoming = Array.from(files);
+    if (incoming.length === 0) {
+      return;
+    }
+
+    const next = [...draftImages];
+    let rejected = "";
+
+    for (const file of incoming) {
+      if (next.length >= MAX_DRAFT_IMAGE_ATTACHMENTS) {
+        rejected = `Up to ${MAX_DRAFT_IMAGE_ATTACHMENTS} images per message`;
+        break;
+      }
+      if (!SUPPORTED_DRAFT_IMAGE_TYPES.has(file.type)) {
+        rejected = "Only PNG, JPEG, GIF, or WebP images are supported";
+        continue;
+      }
+      if (file.size > MAX_DRAFT_IMAGE_BYTES) {
+        rejected = "Image must be 8 MB or smaller";
+        continue;
+      }
+      next.push({
+        id: draftImageId(),
+        file,
+        name: file.name || "image",
+        mimeType: file.type,
+        previewUrl: URL.createObjectURL(file),
+        size: file.size,
+      });
+    }
+
+    setDraftAttachmentError(rejected);
+    setDraftImages(next);
+  }
+
+  function handleRemoveDraftImage(id: string) {
+    setDraftImages((current) => {
+      const removed = current.find((image) => image.id === id);
+      if (removed) {
+        URL.revokeObjectURL(removed.previewUrl);
+      }
+      return current.filter((image) => image.id !== id);
+    });
+    setDraftAttachmentError("");
+  }
+
+  function clearDraftImages() {
+    setDraftImages((current) => {
+      for (const image of current) {
+        URL.revokeObjectURL(image.previewUrl);
+      }
+      return [];
+    });
+  }
+
   return (
     <main className="app-shell" aria-label="Codex mobile workbench">
       <ConnectionBar
@@ -650,10 +747,14 @@ function App() {
       />
 
       <Composer
+        attachments={draftImages}
+        attachmentError={draftAttachmentError}
         draft={draft}
         selectedTitle={selectedSession?.title ?? "No session selected"}
         disabled={!canSend || sending}
+        onAttachFiles={handleAttachDraftImages}
         onDraftChange={setDraft}
+        onRemoveAttachment={handleRemoveDraftImage}
         onSubmit={handleSubmit}
       />
     </main>
@@ -1249,23 +1350,83 @@ function AttachmentImage({
 }
 
 function Composer({
+  attachments,
+  attachmentError,
   disabled,
   draft,
+  onAttachFiles,
   onDraftChange,
+  onRemoveAttachment,
   onSubmit,
   selectedTitle,
 }: {
+  attachments: DraftImageAttachment[];
+  attachmentError: string;
   disabled: boolean;
   draft: string;
+  onAttachFiles: (files: FileList) => void;
   onDraftChange: (value: string) => void;
+  onRemoveAttachment: (id: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   selectedTitle: string;
 }) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const canSubmit = !disabled && (draft.trim().length > 0 || attachments.length > 0);
+
   return (
     <form className="composer" aria-label="Message composer" onSubmit={onSubmit}>
+      {attachments.length > 0 ? (
+        <div className="composer-attachments" aria-label="Selected image attachments">
+          {attachments.map((attachment) => (
+            <span className="composer-attachment" key={attachment.id}>
+              <img src={attachment.previewUrl} alt={attachment.name} />
+              <button
+                className="composer-attachment-remove"
+                disabled={disabled}
+                onClick={() => onRemoveAttachment(attachment.id)}
+                type="button"
+                aria-label={`Remove ${attachment.name}`}
+              >
+                <X size={12} aria-hidden="true" />
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {attachmentError ? (
+        <div className="composer-error" role="alert">
+          <AlertTriangle size={14} aria-hidden="true" />
+          {attachmentError}
+        </div>
+      ) : null}
       <label className="sr-only" htmlFor="codex-message">
         Message selected Codex session
       </label>
+      <input
+        accept="image/png,image/jpeg,image/gif,image/webp"
+        aria-label="Choose image attachment"
+        className="sr-only"
+        disabled={disabled}
+        multiple
+        onChange={(event) => {
+          const files = event.currentTarget.files;
+          if (files) {
+            onAttachFiles(files);
+          }
+          event.currentTarget.value = "";
+        }}
+        ref={fileInputRef}
+        type="file"
+      />
+      <button
+        className="attach-button"
+        disabled={disabled}
+        onClick={() => fileInputRef.current?.click()}
+        type="button"
+        aria-label="Attach image"
+      >
+        <ImagePlus size={17} aria-hidden="true" />
+      </button>
       <textarea
         id="codex-message"
         name="message"
@@ -1275,7 +1436,7 @@ function Composer({
         disabled={disabled}
         value={draft}
       />
-      <button className="send-button" type="submit" aria-label="Send message" disabled={disabled || !draft.trim()}>
+      <button className="send-button" type="submit" aria-label="Send message" disabled={!canSubmit}>
         <Send size={17} />
       </button>
     </form>
@@ -1291,6 +1452,39 @@ function ApprovalIcon({ kind }: { kind: ApprovalKind }) {
 
 function StatusBadge({ status }: { status: SessionSnapshot["status"] }) {
   return <span className={`status-badge ${status}`}>{status.replaceAll("_", " ")}</span>;
+}
+
+async function draftImagesToOutgoingAttachments(images: DraftImageAttachment[]): Promise<OutgoingImageAttachment[]> {
+  return Promise.all(
+    images.map(async (image) => ({
+      name: image.name,
+      mimeType: image.mimeType,
+      dataBase64: await fileToBase64(image.file),
+    })),
+  );
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Unable to read image attachment"));
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== "string") {
+        reject(new Error("Unable to read image attachment"));
+        return;
+      }
+      resolve(result.split(",").at(1) ?? "");
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function draftImageId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `draft-image-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 type MarkdownBlock =
@@ -1651,14 +1845,14 @@ export function mergePolledSessionEvents(current: SessionEvent[], polled: Sessio
   const polledUserTexts = new Set(
     polled
       .map(normalizedUserMessageText)
-      .filter((text): text is string => Boolean(text)),
+      .filter((text): text is string => text !== null),
   );
   const carried = current.filter((event) => {
     if (!isPendingPayload(event.payload)) {
       return false;
     }
     const text = normalizedUserMessageText(event);
-    if (text && polledUserTexts.has(text)) {
+    if (text !== null && polledUserTexts.has(text)) {
       return false;
     }
     return true;

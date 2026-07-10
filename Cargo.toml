@@ -16,6 +16,7 @@ repository = "https://github.com/damon/codex-app"
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
+base64 = "0.22"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
