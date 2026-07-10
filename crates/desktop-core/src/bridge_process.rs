@@ -186,7 +186,7 @@ impl BridgeProcessManager {
         let control_bridge_url = format!("http://{}:{port}", host_for_url(self.config.health_ip));
         let health_url = format!("{control_bridge_url}/api/health");
         let advertised_bridge_url = format!("http://{}:{port}", self.config.advertised_host);
-        let pairing_start_url = format!("{control_bridge_url}/api/pairing/start");
+        let pairing_start_url = format!("{control_bridge_url}/api/control/pairing/start");
         let stdout_log = log_dir.join("bridge-sidecar.stdout.log");
         let stderr_log = log_dir.join("bridge-sidecar.stderr.log");
         let env = vec![

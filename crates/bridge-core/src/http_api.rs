@@ -232,13 +232,25 @@ impl AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    let authenticated_routes = Router::new()
+    phone_routes(state.clone())
+        .merge(control_routes(state.clone()))
+        .with_state(state)
+}
+
+pub fn build_phone_router(state: AppState) -> Router {
+    phone_routes(state.clone()).with_state(state)
+}
+
+pub fn build_control_router(state: AppState) -> Router {
+    control_routes(state.clone()).with_state(state)
+}
+
+fn phone_routes(state: AppState) -> Router<AppState> {
+    let authenticated_phone_routes = Router::new()
         .route(
             "/api/assets/local-image/:asset_token",
             get(get_local_image_asset),
         )
-        .route("/api/devices", get(list_devices))
-        .route("/api/devices/:id", delete(revoke_device))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/:thread_id/events", get(list_session_events))
         .route("/api/sessions/:thread_id/messages", post(send_message))
@@ -246,7 +258,6 @@ pub fn build_router(state: AppState) -> Router {
             "/api/approvals/:approval_id/decision",
             post(decide_approval),
         )
-        .route("/api/dev/approvals", post(trigger_dev_approval))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -261,17 +272,34 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/pairing/start", post(start_pairing))
         .route("/api/pairing/complete", post(complete_pairing))
         .route("/api/session/refresh", post(refresh_session))
-        .merge(authenticated_routes)
+        .merge(authenticated_phone_routes)
         .merge(websocket_route)
-        .with_state(state)
+}
+
+fn control_routes(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/api/control/pairing/start", post(start_pairing))
+        .route("/api/control/devices", get(list_devices))
+        .route("/api/control/devices/:id", delete(revoke_device))
+        .route("/api/control/dev/approvals", post(trigger_dev_approval))
+        .route_layer(middleware::from_fn_with_state(state, require_control_auth))
 }
 
 pub fn build_router_with_static_dir(state: AppState, static_dir: impl Into<PathBuf>) -> Router {
     let static_dir = static_dir.into();
     build_router(state).fallback_service(
+        ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html"))),
+    )
+}
+
+pub fn build_phone_router_with_static_dir(
+    state: AppState,
+    static_dir: impl Into<PathBuf>,
+) -> Router {
+    let static_dir = static_dir.into();
+    build_phone_router(state).fallback_service(
         ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html"))),
     )
 }
@@ -286,10 +314,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 
 async fn start_pairing(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<PairingStartResponse>, ApiError> {
-    require_control_token(&state, &headers)?;
-
     let mut pairing = state.pairing.lock().await;
     let pairing_token = pairing.create_token()?;
 
@@ -723,6 +748,16 @@ async fn require_websocket_auth(
     Ok(next.run(request).await)
 }
 
+async fn require_control_auth(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, ApiError> {
+    require_control_token(&state, request.headers())?;
+
+    Ok(next.run(request).await)
+}
+
 async fn authenticate_token(state: &AppState, token: &str) -> Result<String, ApiError> {
     let pairing = state.pairing.lock().await;
     pairing
@@ -856,6 +891,20 @@ pub async fn serve_with_static_dir(
     Ok(())
 }
 
+pub async fn serve_phone_with_static_dir(
+    addr: SocketAddr,
+    state: AppState,
+    static_dir: impl Into<PathBuf>,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(
+        listener,
+        build_phone_router_with_static_dir(state, static_dir),
+    )
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -978,10 +1027,10 @@ mod tests {
         let app = build_router(state);
 
         for request in [
-            request(Method::POST, "/api/pairing/start", Body::empty()),
+            request(Method::POST, "/api/control/pairing/start", Body::empty()),
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/pairing/start")
+                .uri("/api/control/pairing/start")
                 .header(header::AUTHORIZATION, "Bearer wrong-control-token")
                 .body(Body::empty())
                 .expect("request builds"),
@@ -1004,7 +1053,7 @@ mod tests {
         for request in [
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/pairing/start")
+                .uri("/api/control/pairing/start")
                 .header(
                     header::AUTHORIZATION,
                     format!("Bearer {TEST_CONTROL_TOKEN}"),
@@ -1013,7 +1062,7 @@ mod tests {
                 .expect("request builds"),
             Request::builder()
                 .method(Method::POST)
-                .uri("/api/pairing/start")
+                .uri("/api/control/pairing/start")
                 .header(BRIDGE_CONTROL_TOKEN_HEADER, TEST_CONTROL_TOKEN)
                 .body(Body::empty())
                 .expect("request builds"),
@@ -1210,16 +1259,6 @@ mod tests {
         let routes = [
             ProtectedRoute {
                 method: Method::GET,
-                uri: "/api/devices",
-                body: None,
-            },
-            ProtectedRoute {
-                method: Method::DELETE,
-                uri: "/api/devices/phone-1",
-                body: None,
-            },
-            ProtectedRoute {
-                method: Method::GET,
                 uri: "/api/sessions",
                 body: None,
             },
@@ -1237,11 +1276,6 @@ mod tests {
                 method: Method::POST,
                 uri: "/api/approvals/approval-1/decision",
                 body: Some(json!({ "decision": "approve", "comment": null })),
-            },
-            ProtectedRoute {
-                method: Method::POST,
-                uri: "/api/dev/approvals",
-                body: Some(json!({ "threadId": "thread-1" })),
             },
         ];
 
@@ -1295,9 +1329,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dev_approval_trigger_broadcasts_approval_request() {
+    async fn phone_router_does_not_mount_local_control_routes() {
+        let (_dir, state) = test_state();
+        let app = build_phone_router(state);
+
+        for request in [
+            request(Method::POST, "/api/control/pairing/start", Body::empty()),
+            request(Method::GET, "/api/control/devices", Body::empty()),
+            request(
+                Method::DELETE,
+                "/api/control/devices/phone-1",
+                Body::empty(),
+            ),
+            json_request(
+                Method::POST,
+                "/api/control/dev/approvals",
+                json!({ "threadId": "thread-1" }),
+            ),
+            request(Method::POST, "/api/pairing/start", Body::empty()),
+            request(Method::GET, "/api/devices", Body::empty()),
+            json_request(
+                Method::POST,
+                "/api/dev/approvals",
+                json!({ "threadId": "thread-1" }),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("request succeeds");
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+    }
+
+    #[tokio::test]
+    async fn control_routes_reject_phone_session_tokens() {
         let (_dir, state) = test_state();
         let session_token = pair_device(&state).await;
+        let app = build_control_router(state);
+
+        for request in [
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/control/devices")
+                .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                .body(Body::empty())
+                .expect("request builds"),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/control/dev/approvals")
+                .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "threadId": "thread-1" }).to_string()))
+                .expect("request builds"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("request succeeds");
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn control_routes_accept_control_token_for_device_management() {
+        let (_dir, state) = test_state();
+        pair_device(&state).await;
+        let app = build_control_router(state);
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/control/devices")
+                    .header(BRIDGE_CONTROL_TOKEN_HEADER, TEST_CONTROL_TOKEN)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let body = response_json(list_response).await;
+        assert_eq!(body[0]["deviceId"], json!("phone-1"));
+
+        let revoke_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/control/devices/phone-1")
+                    .header(BRIDGE_CONTROL_TOKEN_HEADER, TEST_CONTROL_TOKEN)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(revoke_response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn dev_approval_trigger_broadcasts_approval_request() {
+        let (_dir, state) = test_state();
         state
             .event_hub()
             .set_snapshot(SessionSnapshot {
@@ -1322,8 +1460,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/dev/approvals")
-                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .uri("/api/control/dev/approvals")
+                    .header(BRIDGE_CONTROL_TOKEN_HEADER, TEST_CONTROL_TOKEN)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({
