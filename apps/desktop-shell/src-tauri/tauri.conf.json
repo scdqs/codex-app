@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Codex Mobile Bridge",
+  "version": "0.1.0",
+  "identifier": "com.damon.codex-mobile-bridge",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:57325",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Codex Mobile Bridge",
+        "width": 1040,
+        "height": 760,
+        "minWidth": 860,
+        "minHeight": 640
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": ["../../mobile-pwa/public/icon-512.png"],
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    }
+  }
+}

@@ -1,0 +1,483 @@
+use std::{
+    env,
+    net::{IpAddr, Ipv4Addr, UdpSocket},
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+use desktop_core::{
+    BridgeProcessConfig, BridgeProcessManager, BridgeProcessSnapshot, BridgeProcessStatus,
+    CodexLaunchCommand, CodexLaunchConfig, CodexLaunchManager, CodexLaunchOutcome,
+    QuickTunnelConfig, QuickTunnelManager, TunnelSnapshot, TunnelStatus,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tauri::{AppHandle, Manager, State};
+use tokio::sync::Mutex;
+
+const DEFAULT_DEBUG_PORT: u16 = 9229;
+const DEFAULT_BRIDGE_PORT: u16 = 57324;
+const CONTROL_TOKEN_HEADER: &str = "x-bridge-control-token";
+
+struct ShellState {
+    bridge: Mutex<Option<BridgeProcessManager>>,
+    tunnel: Mutex<QuickTunnelManager>,
+    last_pairing_link: Mutex<Option<String>>,
+}
+
+impl Default for ShellState {
+    fn default() -> Self {
+        Self {
+            bridge: Mutex::new(None),
+            tunnel: Mutex::new(QuickTunnelManager::new(QuickTunnelConfig::default())),
+            last_pairing_link: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShellStatusDto {
+    bridge: BridgeProcessSnapshotDto,
+    tunnel: TunnelSnapshotDto,
+    last_pairing_link: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeProcessSnapshotDto {
+    status: String,
+    pid: Option<u32>,
+    port: Option<u16>,
+    health_url: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TunnelSnapshotDto {
+    status: String,
+    public_url: Option<String>,
+    local_url: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexLaunchOutcomeDto {
+    status: String,
+    debug_port: u16,
+    app_path: Option<String>,
+    launch_command: Option<CodexLaunchCommandDto>,
+    detail: Option<String>,
+    instructions: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexLaunchCommandDto {
+    program: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceDto {
+    device_id: String,
+    display_name: String,
+    created_at: u64,
+    last_seen_at: u64,
+}
+
+#[tauri::command]
+async fn get_app_status(state: State<'_, ShellState>) -> Result<ShellStatusDto, String> {
+    let bridge = {
+        let bridge = state.bridge.lock().await;
+        bridge
+            .as_ref()
+            .map(BridgeProcessManager::status)
+            .unwrap_or_else(stopped_bridge_snapshot)
+    };
+    let tunnel = state.tunnel.lock().await.status();
+    let last_pairing_link = state.last_pairing_link.lock().await.clone();
+
+    Ok(ShellStatusDto {
+        bridge: BridgeProcessSnapshotDto::from(bridge),
+        tunnel: TunnelSnapshotDto::from(tunnel),
+        last_pairing_link,
+    })
+}
+
+#[tauri::command]
+async fn ensure_codex_ready() -> CodexLaunchOutcomeDto {
+    let mut config = CodexLaunchConfig::default();
+    config.debug_port = debug_port();
+    CodexLaunchManager::mac_default(config)
+        .ensure_ready()
+        .await
+        .into()
+}
+
+#[tauri::command]
+async fn start_bridge(
+    app: AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<BridgeProcessSnapshotDto, String> {
+    let mut bridge = state.bridge.lock().await;
+    if bridge.is_none() {
+        *bridge = Some(BridgeProcessManager::new(bridge_config(&app)?));
+    }
+
+    let manager = bridge.as_mut().expect("bridge manager is initialized");
+    let snapshot = manager.start().await.map_err(|error| error.to_string())?;
+    Ok(snapshot.into())
+}
+
+#[tauri::command]
+async fn stop_bridge(state: State<'_, ShellState>) -> Result<BridgeProcessSnapshotDto, String> {
+    let mut bridge = state.bridge.lock().await;
+    let manager = bridge
+        .as_mut()
+        .ok_or_else(|| "bridge service is not initialized".to_string())?;
+    let snapshot = manager.stop().await.map_err(|error| error.to_string())?;
+    *state.last_pairing_link.lock().await = None;
+    Ok(snapshot.into())
+}
+
+#[tauri::command]
+async fn create_pairing_link(state: State<'_, ShellState>) -> Result<String, String> {
+    let link = {
+        let bridge = state.bridge.lock().await;
+        let manager = bridge
+            .as_ref()
+            .ok_or_else(|| "bridge service is not initialized".to_string())?;
+        manager
+            .create_pairing_link()
+            .await
+            .map_err(|error| error.to_string())?
+    };
+    *state.last_pairing_link.lock().await = Some(link.clone());
+    Ok(link)
+}
+
+#[tauri::command]
+async fn start_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnapshotDto, String> {
+    let (snapshot, pairing_link) = {
+        let bridge = state.bridge.lock().await;
+        let manager = bridge
+            .as_ref()
+            .ok_or_else(|| "bridge service must be running before tunnel starts".to_string())?;
+        let local_url = bridge_local_url(manager)?;
+        let mut tunnel = state.tunnel.lock().await;
+        let snapshot = tunnel
+            .start(local_url)
+            .await
+            .map_err(|error| error.to_string())?;
+        let pairing_link = match snapshot.session.as_ref() {
+            Some(session) => Some(
+                manager
+                    .create_pairing_link_for_bridge_url(&session.public_url)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            ),
+            None => None,
+        };
+        (snapshot, pairing_link)
+    };
+    *state.last_pairing_link.lock().await = pairing_link;
+    Ok(snapshot.into())
+}
+
+#[tauri::command]
+async fn rotate_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnapshotDto, String> {
+    let (snapshot, pairing_link) = {
+        let bridge = state.bridge.lock().await;
+        let manager = bridge
+            .as_ref()
+            .ok_or_else(|| "bridge service must be running before tunnel rotates".to_string())?;
+        let mut tunnel = state.tunnel.lock().await;
+        let snapshot = tunnel.rotate().await.map_err(|error| error.to_string())?;
+        let pairing_link = match snapshot.session.as_ref() {
+            Some(session) => Some(
+                manager
+                    .create_pairing_link_for_bridge_url(&session.public_url)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            ),
+            None => None,
+        };
+        (snapshot, pairing_link)
+    };
+    *state.last_pairing_link.lock().await = pairing_link;
+    Ok(snapshot.into())
+}
+
+#[tauri::command]
+async fn stop_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnapshotDto, String> {
+    let mut tunnel = state.tunnel.lock().await;
+    let snapshot = tunnel.stop().await.map_err(|error| error.to_string())?;
+    *state.last_pairing_link.lock().await = None;
+    Ok(snapshot.into())
+}
+
+#[tauri::command]
+async fn get_control_diagnostics(state: State<'_, ShellState>) -> Result<Value, String> {
+    control_get(state, "/api/control/diagnostics").await
+}
+
+#[tauri::command]
+async fn list_devices(state: State<'_, ShellState>) -> Result<Vec<DeviceDto>, String> {
+    let value = control_get(state, "/api/control/devices").await?;
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn revoke_device(device_id: String, state: State<'_, ShellState>) -> Result<(), String> {
+    let (url, token) =
+        control_request_parts(&state, &format!("/api/control/devices/{device_id}")).await?;
+    reqwest::Client::new()
+        .delete(url)
+        .header(CONTROL_TOKEN_HEADER, token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn control_get(state: State<'_, ShellState>, path: &str) -> Result<Value, String> {
+    let (url, token) = control_request_parts(&state, path).await?;
+    reqwest::Client::new()
+        .get(url)
+        .header(CONTROL_TOKEN_HEADER, token)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
+        .json()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn control_request_parts(
+    state: &State<'_, ShellState>,
+    path: &str,
+) -> Result<(String, String), String> {
+    let bridge = state.bridge.lock().await;
+    let manager = bridge
+        .as_ref()
+        .ok_or_else(|| "bridge service is not initialized".to_string())?;
+    let snapshot = manager.status();
+    let health_url = snapshot
+        .health_url
+        .ok_or_else(|| "bridge health URL is not available".to_string())?;
+    let base = health_url
+        .strip_suffix("/api/health")
+        .ok_or_else(|| "bridge health URL has an unexpected shape".to_string())?;
+    Ok((format!("{base}{path}"), manager.control_token().to_string()))
+}
+
+fn bridge_config(app: &AppHandle) -> Result<BridgeProcessConfig, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("resolve app data dir: {error}"))?;
+    let mut config = BridgeProcessConfig::new(sidecar_binary(), app_data_dir, pwa_dist_dir());
+    config.preferred_port = Some(DEFAULT_BRIDGE_PORT);
+    config.bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+    config.health_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    config.advertised_host = advertised_host();
+    config.debug_port = debug_port();
+    Ok(config)
+}
+
+fn bridge_local_url(manager: &BridgeProcessManager) -> Result<String, String> {
+    let snapshot = manager.status();
+    let port = snapshot
+        .port
+        .ok_or_else(|| "bridge port is not available".to_string())?;
+    Ok(format!("http://127.0.0.1:{port}"))
+}
+
+fn sidecar_binary() -> PathBuf {
+    env::var_os("CODEX_MOBILE_BRIDGE_SIDECAR_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_path("target/debug/bridge-sidecar"))
+}
+
+fn pwa_dist_dir() -> PathBuf {
+    env::var_os("CODEX_MOBILE_BRIDGE_PWA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_path("apps/mobile-pwa/dist"))
+}
+
+fn workspace_path(path: &str) -> PathBuf {
+    let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    find_workspace_root(&current_dir)
+        .unwrap_or(current_dir)
+        .join(path)
+}
+
+fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    start.ancestors().find_map(|candidate| {
+        let has_workspace_manifest = candidate.join("Cargo.toml").is_file();
+        let has_desktop_core = candidate.join("crates/desktop-core").is_dir();
+        (has_workspace_manifest && has_desktop_core).then(|| candidate.to_path_buf())
+    })
+}
+
+fn debug_port() -> u16 {
+    env::var("CODEX_MOBILE_BRIDGE_DEBUG_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_DEBUG_PORT)
+}
+
+fn advertised_host() -> String {
+    if let Ok(host) = env::var("CODEX_MOBILE_BRIDGE_ADVERTISED_HOST")
+        && !host.trim().is_empty()
+    {
+        return host;
+    }
+
+    macos_wifi_ip()
+        .or_else(lan_ip)
+        .filter(|ip| is_phone_reachable_ip(*ip))
+        .map(host_for_url)
+        .unwrap_or_else(|| Ipv4Addr::LOCALHOST.to_string())
+}
+
+fn macos_wifi_ip() -> Option<IpAddr> {
+    let output = Command::new("ipconfig")
+        .args(["getifaddr", "en0"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
+fn lan_ip() -> Option<IpAddr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
+fn is_phone_reachable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_loopback() && !ip.is_link_local() && !matches!(ip.octets(), [198, 18 | 19, _, _])
+        }
+        IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+    }
+}
+
+fn host_for_url(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+fn stopped_bridge_snapshot() -> BridgeProcessSnapshot {
+    BridgeProcessSnapshot {
+        status: BridgeProcessStatus::Stopped,
+        pid: None,
+        port: None,
+        health_url: None,
+        detail: None,
+    }
+}
+
+impl From<BridgeProcessSnapshot> for BridgeProcessSnapshotDto {
+    fn from(snapshot: BridgeProcessSnapshot) -> Self {
+        Self {
+            status: bridge_status(snapshot.status).to_string(),
+            pid: snapshot.pid,
+            port: snapshot.port,
+            health_url: snapshot.health_url,
+            detail: snapshot.detail,
+        }
+    }
+}
+
+impl From<TunnelSnapshot> for TunnelSnapshotDto {
+    fn from(snapshot: TunnelSnapshot) -> Self {
+        let (public_url, local_url) = snapshot
+            .session
+            .map(|session| (Some(session.public_url), Some(session.local_url)))
+            .unwrap_or((None, None));
+        Self {
+            status: tunnel_status(snapshot.status).to_string(),
+            public_url,
+            local_url,
+            detail: snapshot.detail,
+        }
+    }
+}
+
+impl From<CodexLaunchOutcome> for CodexLaunchOutcomeDto {
+    fn from(outcome: CodexLaunchOutcome) -> Self {
+        Self {
+            status: format!("{:?}", outcome.status),
+            debug_port: outcome.debug_port,
+            app_path: outcome.app_path.map(|path| path.display().to_string()),
+            launch_command: outcome.launch_command.map(Into::into),
+            detail: outcome.detail,
+            instructions: outcome.instructions,
+        }
+    }
+}
+
+impl From<CodexLaunchCommand> for CodexLaunchCommandDto {
+    fn from(command: CodexLaunchCommand) -> Self {
+        Self {
+            program: command.program,
+            args: command.args,
+        }
+    }
+}
+
+fn bridge_status(status: BridgeProcessStatus) -> &'static str {
+    match status {
+        BridgeProcessStatus::Stopped => "stopped",
+        BridgeProcessStatus::Starting => "starting",
+        BridgeProcessStatus::Ready => "ready",
+        BridgeProcessStatus::Degraded => "degraded",
+        BridgeProcessStatus::Failed => "failed",
+        BridgeProcessStatus::Stopping => "stopping",
+    }
+}
+
+fn tunnel_status(status: TunnelStatus) -> &'static str {
+    match status {
+        TunnelStatus::Stopped => "stopped",
+        TunnelStatus::Starting => "starting",
+        TunnelStatus::Ready => "ready",
+        TunnelStatus::Failed => "failed",
+        TunnelStatus::Stopping => "stopping",
+    }
+}
+
+fn main() {
+    tauri::Builder::default()
+        .manage(ShellState::default())
+        .invoke_handler(tauri::generate_handler![
+            get_app_status,
+            ensure_codex_ready,
+            start_bridge,
+            stop_bridge,
+            create_pairing_link,
+            start_quick_tunnel,
+            rotate_quick_tunnel,
+            stop_quick_tunnel,
+            get_control_diagnostics,
+            list_devices,
+            revoke_device,
+        ])
+        .run(tauri::generate_context!())
+        .expect("failed to run Codex Mobile Bridge desktop shell");
+}

@@ -1,3 +1,6 @@
 /target/
+node_modules/
+apps/*/dist/
+apps/*/src-tauri/gen/
 bridge.sqlite
 .superpowers/
