@@ -137,6 +137,7 @@ sidecar 的诊断顺序：
 ## 试用与发布
 
 - 内部同事试用流程见 [docs/dogfood-qa-checklist.md](docs/dogfood-qa-checklist.md)。
+- 共享内部包前先跑 `scripts/dogfood-smoke.sh`；最近一次 dogfood 记录见 [docs/dogfood-runs/2026-07-10-dogfood-20260710.1.md](docs/dogfood-runs/2026-07-10-dogfood-20260710.1.md)。
 - dev / beta / stable 发布门禁见 [docs/release-gates.md](docs/release-gates.md)。
 - `scripts/check-release-gate.sh --channel stable` 会阻止未签名、未公证、缺 updater metadata 或把 Quick Tunnel 当稳定远程能力的公开发布。
 

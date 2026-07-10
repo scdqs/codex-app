@@ -15,8 +15,21 @@
 - macOS 版本：
 - ChatGPT/Codex Desktop 版本：
 - Codex Mobile Bridge commit：
+- Codex Mobile Bridge tag：
 - 手机型号和浏览器：
 - 网络环境：局域网 / 手机热点 / Quick Tunnel Beta
+
+共享内部包前，先在构建机器运行：
+
+```bash
+scripts/dogfood-smoke.sh
+```
+
+如果只想快速验证代码、不重新打桌面包，可以运行：
+
+```bash
+scripts/dogfood-smoke.sh --skip-bundle
+```
 
 ## 安装与首次启动
 
