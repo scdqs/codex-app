@@ -288,6 +288,7 @@ fn phone_routes(state: AppState) -> Router<AppState> {
 fn control_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/api/control/pairing/start", post(start_pairing))
+        .route("/api/control/diagnostics", get(control_diagnostics))
         .route("/api/control/devices", get(list_devices))
         .route("/api/control/devices/:id", delete(revoke_device))
         .route("/api/control/dev/approvals", post(trigger_dev_approval))
@@ -329,6 +330,11 @@ async fn start_pairing(
         pairing_token,
         expires_in_ms: DEFAULT_PAIRING_TOKEN_TTL_MS,
     }))
+}
+
+async fn control_diagnostics(State(state): State<AppState>) -> Json<DiagnosticsReport> {
+    let diagnostics = state.diagnostics.read().await;
+    Json(diagnostics.clone())
 }
 
 async fn refresh_session(
@@ -929,7 +935,9 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
+        cdp::BridgeConnectionState,
         codex_rpc::{CodexAdapter, CodexRpcError, CodexThread, CodexTurn},
+        diagnostics::DiagnosticsReport,
         local_assets::LocalAssetRegistryConfig,
         pairing::PairingManager,
         protocol::{ApprovalDecision, SessionSnapshot, SessionStatus},
@@ -1085,6 +1093,38 @@ mod tests {
             assert!(body["pairingToken"].as_str().is_some());
             assert_eq!(body["expiresInMs"], json!(DEFAULT_PAIRING_TOKEN_TTL_MS));
         }
+    }
+
+    #[tokio::test]
+    async fn control_diagnostics_returns_detail_to_control_clients() {
+        let (_dir, state) = test_state();
+        let state = state.with_diagnostics(DiagnosticsReport::degraded(
+            BridgeConnectionState::InjectFailed,
+            "app-server bridge module was not found",
+        ));
+        let app = build_control_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/control/diagnostics")
+                    .header(BRIDGE_CONTROL_TOKEN_HEADER, TEST_CONTROL_TOKEN)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "status": "degraded",
+                "connectionState": "inject_failed",
+                "detail": "app-server bridge module was not found",
+            })
+        );
     }
 
     #[tokio::test]
@@ -1342,6 +1382,7 @@ mod tests {
 
         for request in [
             request(Method::POST, "/api/control/pairing/start", Body::empty()),
+            request(Method::GET, "/api/control/diagnostics", Body::empty()),
             request(Method::GET, "/api/control/devices", Body::empty()),
             request(
                 Method::DELETE,
@@ -1381,6 +1422,12 @@ mod tests {
             Request::builder()
                 .method(Method::GET)
                 .uri("/api/control/devices")
+                .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                .body(Body::empty())
+                .expect("request builds"),
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/control/diagnostics")
                 .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
                 .body(Body::empty())
                 .expect("request builds"),
