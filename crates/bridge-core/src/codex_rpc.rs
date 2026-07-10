@@ -13,6 +13,7 @@ use crate::{
 #[async_trait]
 pub trait CodexAdapter: Send + Sync {
     async fn list_threads(&self) -> Result<Vec<CodexThread>, CodexRpcError>;
+    async fn start_thread(&self, text: &str) -> Result<CodexThread, CodexRpcError>;
     async fn resume_thread(&self, thread_id: &str) -> Result<Option<CodexThread>, CodexRpcError>;
     async fn list_turns(&self, thread_id: &str) -> Result<Vec<CodexTurn>, CodexRpcError>;
     async fn send_user_message(&self, thread_id: &str, text: &str) -> Result<(), CodexRpcError>;
@@ -190,6 +191,18 @@ where
         Ok(extract_thread_value(&result).map(map_thread).transpose()?)
     }
 
+    async fn start_thread(&self, text: &str) -> Result<CodexThread, CodexRpcError> {
+        let result = self.call("thread/start", json!({})).await?;
+        let thread_value = extract_thread_value(&result).ok_or(CodexRpcError::InvalidResponse {
+            method: "thread/start",
+            reason: "missing thread",
+        })?;
+        let thread = map_thread(thread_value)?;
+        self.start_turn_without_resume(&thread.id, text).await?;
+
+        Ok(thread)
+    }
+
     async fn list_turns(&self, thread_id: &str) -> Result<Vec<CodexTurn>, CodexRpcError> {
         let result = self
             .call("thread/turns/list", json!({ "threadId": thread_id }))
@@ -204,21 +217,7 @@ where
 
     async fn send_user_message(&self, thread_id: &str, text: &str) -> Result<(), CodexRpcError> {
         self.resume_thread(thread_id).await?;
-        let client_user_message_id = format!(
-            "codex-mobile-{}",
-            self.next_client_message_id.fetch_add(1, Ordering::SeqCst)
-        );
-        self.call(
-            "turn/start",
-            json!({
-                "threadId": thread_id,
-                "clientUserMessageId": client_user_message_id,
-                "input": [{ "type": "text", "text": text }],
-            }),
-        )
-        .await?;
-
-        Ok(())
+        self.start_turn_without_resume(thread_id, text).await
     }
 
     async fn subscribe_events(&self, _thread_id: Option<&str>) -> Result<(), CodexRpcError> {
@@ -235,6 +234,33 @@ where
         Err(CodexRpcError::Unsupported {
             method: "respond_approval",
         })
+    }
+}
+
+impl<T> AppServerJsonRpcClient<T>
+where
+    T: JsonRpcTransport,
+{
+    async fn start_turn_without_resume(
+        &self,
+        thread_id: &str,
+        text: &str,
+    ) -> Result<(), CodexRpcError> {
+        let client_user_message_id = format!(
+            "codex-mobile-{}",
+            self.next_client_message_id.fetch_add(1, Ordering::SeqCst)
+        );
+        self.call(
+            "turn/start",
+            json!({
+                "threadId": thread_id,
+                "clientUserMessageId": client_user_message_id,
+                "input": [{ "type": "text", "text": text }],
+            }),
+        )
+        .await?;
+
+        Ok(())
     }
 }
 
@@ -289,6 +315,19 @@ fn extract_array<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Vec<Value>> 
 }
 
 fn extract_thread_value(value: &Value) -> Option<&Value> {
+    if string_field(value, &["id", "threadId", "thread_id"]).is_some() {
+        return Some(value);
+    }
+    if let Some(data) = value.get("data")
+        && string_field(data, &["id", "threadId", "thread_id"]).is_some()
+    {
+        return Some(data);
+    }
+    if let Some(result) = value.get("result")
+        && string_field(result, &["id", "threadId", "thread_id"]).is_some()
+    {
+        return Some(result);
+    }
     if let Some(thread) = value.get("thread") {
         return Some(thread);
     }
@@ -413,6 +452,88 @@ mod tests {
                 "input": [{ "type": "text", "text": "same text" }]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn adapter_starts_thread_then_sends_first_user_text() {
+        let transport = RecordingTransport::new(vec![
+            json!({
+                "thread": {
+                    "id": "thread-new",
+                    "title": "New mobile task",
+                    "cwd": "/repo",
+                    "updatedAt": 1_725_000_000_000_u64
+                }
+            }),
+            json!({ "accepted": true }),
+        ]);
+        let requests = transport.requests();
+        let client = AppServerJsonRpcClient::new(transport);
+
+        let thread = client
+            .start_thread("start this from phone")
+            .await
+            .expect("thread starts");
+
+        assert_eq!(thread.id, "thread-new");
+        assert_eq!(thread.title.as_deref(), Some("New mobile task"));
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "thread/start");
+        assert_eq!(requests[0].params, json!({}));
+        assert_eq!(requests[1].method, "turn/start");
+        assert_eq!(
+            requests[1].params,
+            json!({
+                "threadId": "thread-new",
+                "clientUserMessageId": "codex-mobile-1",
+                "input": [{ "type": "text", "text": "start this from phone" }]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_maps_top_level_thread_start_response() {
+        let transport = RecordingTransport::new(vec![
+            json!({
+                "id": "thread-top-level",
+                "preview": "Top level thread",
+                "updatedAt": 1_725_000_000_000_u64
+            }),
+            json!({ "accepted": true }),
+        ]);
+        let client = AppServerJsonRpcClient::new(transport);
+
+        let thread = client
+            .start_thread("phone task")
+            .await
+            .expect("thread starts");
+
+        assert_eq!(thread.id, "thread-top-level");
+        assert_eq!(thread.preview.as_deref(), Some("Top level thread"));
+    }
+
+    #[tokio::test]
+    async fn adapter_maps_data_thread_start_response() {
+        let transport = RecordingTransport::new(vec![
+            json!({
+                "data": {
+                    "id": "thread-data",
+                    "preview": "Data thread",
+                    "updatedAt": 1_725_000_000_000_u64
+                }
+            }),
+            json!({ "accepted": true }),
+        ]);
+        let client = AppServerJsonRpcClient::new(transport);
+
+        let thread = client
+            .start_thread("phone task")
+            .await
+            .expect("thread starts");
+
+        assert_eq!(thread.id, "thread-data");
+        assert_eq!(thread.preview.as_deref(), Some("Data thread"));
     }
 
     #[derive(Clone)]

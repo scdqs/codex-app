@@ -3,6 +3,7 @@ import {
   ApiValidationError,
   completePairing,
   connectWebSocket,
+  createSession,
   fetchAssetBlob,
   readPairingPayloadFromUrl,
 } from "./api";
@@ -220,6 +221,38 @@ describe("pairing API helpers", () => {
     expect(blob.type).toBe("image/png");
     expect(fetchMock).toHaveBeenCalledWith("http://bridge.local/api/assets/local-image/asset-1", {
       headers: { Authorization: "Bearer session-1" },
+    });
+  });
+
+  it("createSession_posts_initial_text_and_parses_snapshot", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse({
+        threadId: "thread-new",
+        title: "Start from phone",
+        preview: "Start from phone",
+        updatedAt: 1_783_584_000_000,
+        status: "running",
+        pendingApprovalIds: [],
+      }),
+    );
+
+    const snapshot = await createSession("http://bridge.local", "session-1", "Start from phone");
+
+    expect(snapshot).toEqual({
+      threadId: "thread-new",
+      title: "Start from phone",
+      preview: "Start from phone",
+      updatedAt: 1_783_584_000_000,
+      status: "running",
+      pendingApprovalIds: [],
+    });
+    expect(fetchMock).toHaveBeenCalledWith("http://bridge.local/api/sessions", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer session-1",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ text: "Start from phone" }),
     });
   });
 });

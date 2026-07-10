@@ -21,6 +21,7 @@ import {
   Command,
   FilePenLine,
   Menu,
+  Plus,
   Send,
   ShieldAlert,
   TerminalSquare,
@@ -47,6 +48,7 @@ import {
   ApiError,
   completePairing,
   connectWebSocket,
+  createSession,
   decideApproval,
   fetchAssetBlob,
   getHealth,
@@ -70,6 +72,9 @@ function App() {
   const [selectedThreadId, setSelectedThreadId] = useState("");
   const [draft, setDraft] = useState("");
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false);
+  const [isNewSessionSheetOpen, setIsNewSessionSheetOpen] = useState(false);
+  const [newSessionDraft, setNewSessionDraft] = useState("");
+  const [newSessionError, setNewSessionError] = useState("");
   const [connection, setConnection] = useState<ConnectionViewState>({ label: "Unpaired" });
   const [deviceSession, setDeviceSession] = useState<DeviceSession | null>(null);
   const [liveSessions, setLiveSessions] = useState<SessionSnapshot[] | null>(null);
@@ -93,6 +98,7 @@ function App() {
   const selectedEvents = selectedSession ? eventsByThread[selectedSession.threadId] ?? [] : [];
   const pendingCount = approvals.length;
   const canSend = (connection.label === "Connected" || connection.label === "Writable") && Boolean(deviceSession) && Boolean(selectedSession);
+  const canCreateSession = (connection.label === "Connected" || connection.label === "Writable") && Boolean(deviceSession);
 
   const statusText = useMemo(() => {
     if (pendingCount > 0) {
@@ -465,6 +471,57 @@ function App() {
     }
   }
 
+  async function createSessionWithRefresh(session: DeviceSession, text: string): Promise<SessionSnapshot> {
+    try {
+      return await createSession(session.bridgeUrl, session.sessionToken, text);
+    } catch (error) {
+      if (!isAuthError(error)) {
+        throw error;
+      }
+      const refreshedSession = await refreshActiveSession(session);
+      return createSession(refreshedSession.bridgeUrl, refreshedSession.sessionToken, text);
+    }
+  }
+
+  async function handleCreateSession(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const activeSession = deviceSession;
+    const text = newSessionDraft.trim();
+    if (!activeSession || !canCreateSession || sending || !text) {
+      return;
+    }
+
+    setSending(true);
+    setNewSessionError("");
+    try {
+      const snapshot = await createSessionWithRefresh(activeSession, text);
+      setLiveSessions((current) => sortSessions(upsertSession(current ?? [], snapshot)));
+      setSelectedThreadId(snapshot.threadId);
+      setEventsByThread((current) => {
+        const localEvent: SessionEvent = {
+          id: `local-new-session-${Date.now()}`,
+          threadId: snapshot.threadId,
+          type: "message",
+          payload: { role: "user", text, pending: true },
+          createdAt: Date.now(),
+        };
+        return {
+          ...current,
+          [snapshot.threadId]: sortSessionEvents(
+            appendOrMergeSessionEvent(current[snapshot.threadId] ?? [], localEvent),
+          ),
+        };
+      });
+      setNewSessionDraft("");
+      setIsNewSessionSheetOpen(false);
+      markSessionDataRecovered();
+    } catch (error) {
+      setNewSessionError(connectionErrorText(error));
+    } finally {
+      setSending(false);
+    }
+  }
+
   async function handleApprovalDecision(approval: ApprovalRequest, decision: DecisionKind) {
     const activeSession = deviceSession;
     if (!activeSession || decidingApprovalIds[approval.id]) {
@@ -511,6 +568,18 @@ function App() {
     setIsSessionDrawerOpen(true);
   }
 
+  function handleOpenNewSession() {
+    setNewSessionError("");
+    setIsSessionDrawerOpen(false);
+    setIsNewSessionSheetOpen(true);
+  }
+
+  function handleCloseNewSession() {
+    if (!sending) {
+      setIsNewSessionSheetOpen(false);
+    }
+  }
+
   function handleCloseSessionDrawer() {
     setIsSessionDrawerOpen(false);
     sessionMenuButtonRef.current?.focus();
@@ -525,8 +594,11 @@ function App() {
     <main className="app-shell" aria-label="Codex mobile workbench">
       <ConnectionBar
         connection={connection}
+        newSessionDisabled={!canCreateSession || sending}
         statusText={statusText}
         showSessionMenuButton
+        showNewSessionButton
+        onCreateSession={handleOpenNewSession}
         sessionMenuButtonRef={sessionMenuButtonRef}
         onOpenSessions={handleOpenSessionDrawer}
       />
@@ -559,10 +631,22 @@ function App() {
 
       <SessionDrawer
         isOpen={isSessionDrawerOpen}
+        onCreateSession={handleOpenNewSession}
         sessions={sessions}
         selectedThreadId={selectedSession?.threadId ?? ""}
         onClose={handleCloseSessionDrawer}
         onSelect={handleSelectSession}
+      />
+
+      <NewSessionSheet
+        disabled={!canCreateSession || sending}
+        draft={newSessionDraft}
+        error={newSessionError}
+        isOpen={isNewSessionSheetOpen}
+        onClose={handleCloseNewSession}
+        onDraftChange={setNewSessionDraft}
+        onSubmit={handleCreateSession}
+        submitting={sending}
       />
 
       <Composer
@@ -578,14 +662,20 @@ function App() {
 
 function ConnectionBar({
   connection,
+  newSessionDisabled = false,
+  onCreateSession,
   onOpenSessions,
   sessionMenuButtonRef,
+  showNewSessionButton = false,
   showSessionMenuButton = false,
   statusText,
 }: {
   connection: ConnectionViewState;
+  newSessionDisabled?: boolean;
+  onCreateSession?: () => void;
   onOpenSessions?: () => void;
   sessionMenuButtonRef?: Ref<HTMLButtonElement>;
+  showNewSessionButton?: boolean;
   showSessionMenuButton?: boolean;
   statusText: string;
 }) {
@@ -602,6 +692,17 @@ function ConnectionBar({
           aria-label="Open sessions"
         >
           <Menu size={18} aria-hidden="true" />
+        </button>
+      ) : null}
+      {showNewSessionButton ? (
+        <button
+          className="new-session-button"
+          disabled={newSessionDisabled}
+          onClick={onCreateSession}
+          type="button"
+          aria-label="New session"
+        >
+          <Plus size={18} aria-hidden="true" />
         </button>
       ) : null}
       <div className="connection-primary">
@@ -688,12 +789,14 @@ function ApprovalQueue({
 function SessionDrawer({
   isOpen,
   onClose,
+  onCreateSession,
   onSelect,
   selectedThreadId,
   sessions,
 }: {
   isOpen: boolean;
   onClose: () => void;
+  onCreateSession: () => void;
   onSelect: (threadId: string) => void;
   selectedThreadId: string;
   sessions: SessionSnapshot[];
@@ -736,6 +839,10 @@ function SessionDrawer({
         <div className="drawer-heading">
           <h2>Sessions</h2>
           <div className="drawer-heading-actions">
+            <button className="drawer-new-button" onClick={onCreateSession} type="button">
+              <Plus size={14} aria-hidden="true" />
+              New
+            </button>
             <span>{sessions.length}</span>
             <button ref={closeButtonRef} className="icon-button" onClick={onClose} type="button" aria-label="Close sessions">
               <X size={16} aria-hidden="true" />
@@ -744,6 +851,96 @@ function SessionDrawer({
         </div>
         <SessionList sessions={sessions} selectedThreadId={selectedThreadId} onSelect={onSelect} />
       </aside>
+    </div>
+  );
+}
+
+function NewSessionSheet({
+  disabled,
+  draft,
+  error,
+  isOpen,
+  onClose,
+  onDraftChange,
+  onSubmit,
+  submitting,
+}: {
+  disabled: boolean;
+  draft: string;
+  error: string;
+  isOpen: boolean;
+  onClose: () => void;
+  onDraftChange: (value: string) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  submitting: boolean;
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    textareaRef.current?.focus();
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isOpen, onClose]);
+
+  if (!isOpen) {
+    return null;
+  }
+
+  return (
+    <div className="new-session-layer">
+      <button className="new-session-backdrop" onClick={onClose} type="button" aria-label="Close new session" />
+      <section className="new-session-sheet" role="dialog" aria-modal="true" aria-labelledby="new-session-heading">
+        <div className="sheet-heading">
+          <div>
+            <p className="eyebrow">New thread</p>
+            <h2 id="new-session-heading">Start from phone</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} type="button" aria-label="Close new session">
+            <X size={16} aria-hidden="true" />
+          </button>
+        </div>
+        <form className="new-session-form" onSubmit={onSubmit}>
+          <label className="sr-only" htmlFor="new-session-message">
+            First message for new session
+          </label>
+          <textarea
+            id="new-session-message"
+            onChange={(event) => onDraftChange(event.target.value)}
+            placeholder="Describe the task Codex should start"
+            ref={textareaRef}
+            rows={4}
+            value={draft}
+          />
+          {error ? (
+            <div className="sheet-error" role="alert">
+              <AlertTriangle size={15} aria-hidden="true" />
+              {error}
+            </div>
+          ) : null}
+          <button className="create-session-button" disabled={disabled || !draft.trim()} type="submit">
+            {submitting ? "Creating..." : "Create & send"}
+          </button>
+        </form>
+      </section>
     </div>
   );
 }
@@ -871,23 +1068,16 @@ function SessionDetail({
   return (
     <section className="session-detail" aria-labelledby="session-detail-heading">
       <div className="detail-header">
-        <div>
-          <p className="eyebrow">Selected thread</p>
+        <div className="detail-title-wrap">
           <h2 id="session-detail-heading">{session.title}</h2>
         </div>
         <StatusBadge status={session.status} />
+        <div className="compact-session-meta" aria-label="Session metadata">
+          <span>{session.cwd ?? "Unknown workspace"}</span>
+          <span className="dot-separator" aria-hidden="true">/</span>
+          <span className="model-meta">{session.modelProvider ?? "Unset model"}</span>
+        </div>
       </div>
-
-      <dl className="session-facts">
-        <div>
-          <dt>Workspace</dt>
-          <dd>{session.cwd ?? "Unknown"}</dd>
-        </div>
-        <div>
-          <dt>Model</dt>
-          <dd>{session.modelProvider ?? "Unset"}</dd>
-        </div>
-      </dl>
 
       {sessionApprovals.length > 0 ? (
         <div className="inline-alert" role="status">

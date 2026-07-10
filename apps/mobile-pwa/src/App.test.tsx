@@ -198,7 +198,7 @@ describe("App", () => {
           : `.${stylesUrl.pathname}`;
     const css = readFileSync(stylesPath, "utf8");
 
-    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.connection-bar\s*\{[\s\S]*grid-template-columns:\s*38px minmax\(0, 1fr\) minmax\(0, auto\);/);
+    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.connection-bar\s*\{[\s\S]*grid-template-columns:\s*38px 38px minmax\(0, 1fr\) minmax\(0, auto\);/);
     expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.session-menu-button\s*\{[\s\S]*display:\s*grid;/);
     expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.desktop-session-panel\s*\{[\s\S]*display:\s*none;/);
     expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.session-drawer\s*\{[\s\S]*width:\s*min\(84vw, 340px\);/);
@@ -1024,6 +1024,99 @@ describe("App", () => {
       );
     });
     expect(input).toHaveValue("");
+  });
+
+  it("creates_new_session_from_the_phone_and_selects_it", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions" && init?.method === "POST") {
+        return jsonResponse(
+          sessionSnapshot({
+            threadId: "thread-created",
+            title: "Start from phone",
+            preview: "Start from phone",
+            status: "running",
+          }),
+          201,
+        );
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-created/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const newSessionButton = await screen.findByRole("button", { name: "New session" });
+    await waitFor(() => {
+      expect(newSessionButton).toBeEnabled();
+    });
+    await user.click(newSessionButton);
+    await user.type(screen.getByLabelText("First message for new session"), "Start from phone");
+    await user.click(screen.getByRole("button", { name: "Create & send" }));
+
+    await waitFor(() => {
+      expect(globalThis.fetch).toHaveBeenCalledWith(
+        "http://bridge.local/api/sessions",
+        expect.objectContaining({
+          method: "POST",
+          headers: {
+            Authorization: "Bearer session-1",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ text: "Start from phone" }),
+        }),
+      );
+    });
+    expect(screen.queryByRole("dialog", { name: "Start from phone" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Start from phone" })).toBeInTheDocument();
+    expect(screen.getAllByText("Start from phone").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByPlaceholderText("Message Start from phone")).toBeInTheDocument();
+  });
+
+  it("keeps_new_session_failure_inside_sheet_without_replacing_current_thread", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions" && init?.method === "POST") {
+        return jsonResponse({ error: "thread/start failed" }, 500);
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-existing", title: "Existing thread", preview: "Keep me selected" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-existing/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Existing thread" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "New session" }));
+    const textarea = screen.getByLabelText("First message for new session");
+    await user.type(textarea, "This should stay in the sheet");
+    await user.click(screen.getByRole("button", { name: "Create & send" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Create session request failed with 500");
+    expect(textarea).toHaveValue("This should stay in the sheet");
+    expect(screen.getByRole("heading", { name: "Existing thread" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("Writable");
   });
 
   it("polls_selected_thread_events_after_initial_load", async () => {

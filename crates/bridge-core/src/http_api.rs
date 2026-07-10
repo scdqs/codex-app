@@ -120,6 +120,12 @@ pub struct SendMessageRequest {
     text: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSessionRequest {
+    text: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcceptedResponse {
@@ -258,7 +264,7 @@ fn phone_routes(state: AppState) -> Router<AppState> {
             "/api/assets/local-image/:asset_token",
             get(get_local_image_asset),
         )
-        .route("/api/sessions", get(list_sessions))
+        .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:thread_id/events", get(list_session_events))
         .route("/api/sessions/:thread_id/messages", post(send_message))
         .route(
@@ -428,6 +434,50 @@ async fn list_sessions(
     Ok(Json(state.event_hub.all_snapshots().await))
 }
 
+async fn create_session(
+    State(state): State<AppState>,
+    Json(request): Json<CreateSessionRequest>,
+) -> Result<(StatusCode, Json<SessionSnapshot>), ApiError> {
+    let text = request.text.trim().to_string();
+    if text.is_empty() {
+        return Err(ApiError::BadRequest("session text is required"));
+    }
+
+    let now = current_time_ms();
+    let thread = if let Some(adapter) = state.codex_adapter.as_ref() {
+        adapter.start_thread(&text).await?
+    } else {
+        local_thread_for_created_session(&text, now)
+    };
+    let mut snapshot = Normalizer::snapshot_from_thread(&thread);
+    if snapshot.updated_at == 0 {
+        snapshot.updated_at = now;
+    }
+    if snapshot.preview.as_deref().unwrap_or_default().is_empty() {
+        snapshot.preview = Some(text.clone());
+    }
+    if snapshot.title == snapshot.thread_id {
+        snapshot.title = session_title_from_text(&text);
+    }
+    snapshot.status = SessionStatus::Running;
+
+    state.event_hub.set_snapshot(snapshot.clone()).await;
+    state
+        .publish_session_event(SessionEvent {
+            id: Uuid::new_v4().to_string(),
+            thread_id: snapshot.thread_id.clone(),
+            event_type: SessionEventType::Message,
+            payload: json!({
+                "role": "user",
+                "text": text,
+            }),
+            created_at: now,
+        })
+        .await;
+
+    Ok((StatusCode::CREATED, Json(snapshot)))
+}
+
 async fn list_session_events(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
@@ -595,6 +645,41 @@ fn image_content_type(path: &FsPath) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn local_thread_for_created_session(text: &str, now: u64) -> crate::codex_rpc::CodexThread {
+    let id = format!("local-{}", Uuid::new_v4());
+    crate::codex_rpc::CodexThread {
+        id: id.clone(),
+        title: Some(session_title_from_text(text)),
+        cwd: None,
+        model_provider: None,
+        preview: Some(text.to_string()),
+        created_at: Some(now),
+        updated_at: Some(now),
+        raw: json!({
+            "id": id,
+            "title": session_title_from_text(text),
+            "preview": text,
+            "updatedAt": now,
+            "status": "running",
+        }),
+    }
+}
+
+fn session_title_from_text(text: &str) -> String {
+    let title = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(text)
+        .trim();
+    if title.chars().count() <= 80 {
+        return title.to_string();
+    }
+
+    let mut shortened = title.chars().take(80).collect::<String>();
+    shortened.push_str("...");
+    shortened
 }
 
 async fn send_message(
@@ -840,6 +925,7 @@ fn current_time_ms() -> u64 {
 #[derive(Debug)]
 enum ApiError {
     Unauthorized,
+    BadRequest(&'static str),
     Forbidden(&'static str),
     NotFound(&'static str),
     UnsupportedMediaType(&'static str),
@@ -863,6 +949,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message.to_string()),
             Self::Forbidden(message) => (StatusCode::FORBIDDEN, message.to_string()),
             Self::NotFound(message) => (StatusCode::NOT_FOUND, message.to_string()),
             Self::UnsupportedMediaType(message) => {
@@ -1030,6 +1117,23 @@ mod tests {
 
         let response = app
             .oneshot(request(Method::GET, "/api/sessions", Body::empty()))
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn unpaired_request_cannot_create_session() {
+        let (_dir, state) = test_state();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/api/sessions",
+                json!({ "text": "start from phone" }),
+            ))
             .await
             .expect("request succeeds");
 
@@ -2219,6 +2323,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paired_device_create_session_routes_to_codex_adapter_and_records_first_message() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::default());
+        let started_threads = adapter.started_threads();
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "text": "start a fresh task from phone" }).to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = response_json(response).await;
+        assert_eq!(body["threadId"], json!("thread-created-1"));
+        assert_eq!(body["title"], json!("start a fresh task from phone"));
+        assert_eq!(body["preview"], json!("start a fresh task from phone"));
+        assert_eq!(body["status"], json!("running"));
+        assert_eq!(
+            started_threads
+                .lock()
+                .expect("started threads lock")
+                .as_slice(),
+            &["start a fresh task from phone".to_string()]
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-created-1/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body[0]["threadId"], json!("thread-created-1"));
+        assert_eq!(
+            body[0]["payload"]["text"],
+            json!("start a fresh task from phone")
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_device_create_session_rejects_blank_text() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::default());
+        let started_threads = adapter.started_threads();
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "text": "   " }).to_string()))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            started_threads
+                .lock()
+                .expect("started threads lock")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn app_state_publish_session_event_records_history_and_broadcasts() {
         let (_dir, state) = test_state();
         let session_token = pair_device(&state).await;
@@ -2271,6 +2464,7 @@ mod tests {
     struct RecordingAdapter {
         decisions: Arc<StdMutex<Vec<ApprovalDecision>>>,
         messages: Arc<StdMutex<Vec<(String, String)>>>,
+        started_threads: Arc<StdMutex<Vec<String>>>,
         threads: Arc<StdMutex<Vec<CodexThread>>>,
         turns: Arc<StdMutex<StdHashMap<String, Vec<CodexTurn>>>>,
     }
@@ -2310,12 +2504,53 @@ mod tests {
         fn messages(&self) -> Arc<StdMutex<Vec<(String, String)>>> {
             self.messages.clone()
         }
+
+        fn started_threads(&self) -> Arc<StdMutex<Vec<String>>> {
+            self.started_threads.clone()
+        }
     }
 
     #[async_trait]
     impl CodexAdapter for RecordingAdapter {
         async fn list_threads(&self) -> Result<Vec<CodexThread>, CodexRpcError> {
             Ok(self.threads.lock().expect("threads lock").clone())
+        }
+
+        async fn start_thread(&self, text: &str) -> Result<CodexThread, CodexRpcError> {
+            let id = {
+                let mut started_threads =
+                    self.started_threads.lock().expect("started threads lock");
+                started_threads.push(text.to_string());
+                format!("thread-created-{}", started_threads.len())
+            };
+            self.turns.lock().expect("turns lock").insert(
+                id.clone(),
+                vec![CodexTurn {
+                    id: Some("turn-created-1".to_string()),
+                    thread_id: Some(id.clone()),
+                    created_at: Some(1_725_000_000_000),
+                    updated_at: Some(1_725_000_000_000),
+                    raw: json!({
+                        "id": "turn-created-1",
+                        "items": [{
+                            "id": "item-0",
+                            "type": "userMessage",
+                            "text": text,
+                            "createdAt": 1_725_000_000_000_u64,
+                        }],
+                    }),
+                }],
+            );
+            Ok(CodexThread {
+                id: id.clone(),
+                title: None,
+                cwd: Some("/repo".to_string()),
+                model_provider: Some("OpenAI".to_string()),
+                preview: None,
+                created_at: None,
+                updated_at: None,
+                raw: json!({ "id": id }),
+            })
         }
 
         async fn resume_thread(

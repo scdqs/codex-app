@@ -105,6 +105,27 @@ export async function listSessionEvents(
   return parseSessionEvents(await response.json());
 }
 
+export async function createSession(
+  bridgeUrl: string,
+  sessionToken: string,
+  text: string,
+): Promise<SessionSnapshot> {
+  const response = await fetch(apiUrl(bridgeUrl, "/api/sessions"), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${sessionToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ text }),
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status, `Create session request failed with ${response.status}`);
+  }
+
+  return parseSessionSnapshot(await response.json());
+}
+
 export async function fetchAssetBlob(
   bridgeUrl: string,
   sessionToken: string,
