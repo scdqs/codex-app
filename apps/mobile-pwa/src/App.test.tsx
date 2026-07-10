@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import App, { appendOrMergeSessionEvent, mergePolledSessionEvents } from "./App";
+import App, { appendOrMergeSessionEvent, mergePolledSessionEvents, nextPollDelay } from "./App";
 import type { SessionEvent, SessionSnapshot } from "@codex/bridge-protocol";
 import { clearSession, loadSession, saveSession } from "./storage";
 
@@ -1058,6 +1058,13 @@ describe("App", () => {
       expect(screen.getByText("Polled reply")).toBeInTheDocument();
     });
     expect(eventFetches).toBeGreaterThanOrEqual(2);
+  });
+
+  it("calculates_adaptive_poll_delay_for_backoff_and_hidden_pages", () => {
+    expect(nextPollDelay(2_000, 0, "visible")).toBe(2_000);
+    expect(nextPollDelay(2_000, 2, "visible")).toBe(8_000);
+    expect(nextPollDelay(2_000, 0, "hidden")).toBe(12_000);
+    expect(nextPollDelay(5_000, 5, "hidden")).toBe(30_000);
   });
 
   it("renders_empty_state_and_disables_composer_when_sessions_are_empty", async () => {

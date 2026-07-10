@@ -138,6 +138,8 @@ const sampleEvents: SessionEvent[] = [
 const pairingAttempts = new Map<string, Promise<DeviceSession>>();
 const SESSION_LIST_REFRESH_MS = 5_000;
 const SESSION_EVENTS_REFRESH_MS = 2_000;
+const HIDDEN_PAGE_POLL_MULTIPLIER = 6;
+const MAX_POLL_BACKOFF_MS = 30_000;
 
 function App() {
   const hasInitialPairingPayload = useMemo(() => readPairingPayloadFromUrl(window.location.href) !== null, []);
@@ -153,7 +155,11 @@ function App() {
   const [decidingApprovalIds, setDecidingApprovalIds] = useState<Record<string, DecisionKind>>({});
   const sessionMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const sessionRefreshPromiseRef = useRef<Promise<DeviceSession> | null>(null);
+  const sessionListFailureCountRef = useRef(0);
+  const sessionEventsFailureCountRef = useRef(0);
   const showSampleData = connection.label === "Unpaired" && !hasInitialPairingPayload && !deviceSession;
+  const canSyncSessionData =
+    Boolean(deviceSession) && (isSessionDataEnabled(connection.label) || connection.label === "Connection error");
   const sessions = liveSessions ?? (showSampleData ? sampleSessions : []);
   const approvals = showSampleData ? sampleApprovals : liveApprovals;
   const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? null;
@@ -285,19 +291,26 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!deviceSession || !isSessionDataEnabled(connection.label)) {
+    if (!deviceSession || !canSyncSessionData) {
       return;
     }
 
     let cancelled = false;
+    let loading = false;
+    let timeoutId: number | null = null;
     const activeSession = deviceSession;
 
     async function loadSessionList() {
+      if (loading) {
+        return;
+      }
+      loading = true;
       try {
         const items = await listSessionsWithRefresh(activeSession);
         if (cancelled) {
           return;
         }
+        sessionListFailureCountRef.current = 0;
         const sorted = sortSessions(items);
         setLiveSessions(sorted);
         setSelectedThreadId((current) => {
@@ -308,11 +321,15 @@ function App() {
         });
       } catch (error) {
         if (!cancelled) {
+          sessionListFailureCountRef.current += 1;
           setConnection({
             label: "Connection error",
             detail: connectionErrorText(error),
           });
         }
+      } finally {
+        loading = false;
+        scheduleNextSessionListLoad();
       }
     }
 
@@ -328,16 +345,38 @@ function App() {
       }
     }
 
-    void loadSessionList();
-    const intervalId = window.setInterval(() => {
+    function scheduleNextSessionListLoad() {
+      if (cancelled) {
+        return;
+      }
+      timeoutId = window.setTimeout(() => {
+        void loadSessionList();
+      }, nextPollDelay(SESSION_LIST_REFRESH_MS, sessionListFailureCountRef.current));
+    }
+
+    function refreshWhenVisible() {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
       void loadSessionList();
-    }, SESSION_LIST_REFRESH_MS);
+    }
+
+    sessionListFailureCountRef.current = 0;
+    void loadSessionList();
+    document.addEventListener("visibilitychange", refreshWhenVisible);
 
     return () => {
       cancelled = true;
-      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
     };
-  }, [connection.label, deviceSession]);
+  }, [canSyncSessionData, deviceSession]);
 
   useEffect(() => {
     if (!deviceSession || !liveSessions || !selectedSession) {
@@ -345,13 +384,20 @@ function App() {
     }
 
     let cancelled = false;
+    let loading = false;
+    let timeoutId: number | null = null;
     const activeSession = deviceSession;
     const threadId = selectedSession.threadId;
 
     async function loadEvents() {
+      if (loading) {
+        return;
+      }
+      loading = true;
       try {
         const items = await listSessionEventsWithRefresh(activeSession, threadId);
         if (!cancelled) {
+          sessionEventsFailureCountRef.current = 0;
           setEventsByThread((current) => ({
             ...current,
             [threadId]: mergePolledSessionEvents(current[threadId] ?? [], items),
@@ -359,11 +405,15 @@ function App() {
         }
       } catch (error) {
         if (!cancelled) {
+          sessionEventsFailureCountRef.current += 1;
           setConnection({
             label: "Connection error",
             detail: connectionErrorText(error),
           });
         }
+      } finally {
+        loading = false;
+        scheduleNextEventsLoad();
       }
     }
 
@@ -379,14 +429,36 @@ function App() {
       }
     }
 
-    void loadEvents();
-    const intervalId = window.setInterval(() => {
+    function scheduleNextEventsLoad() {
+      if (cancelled) {
+        return;
+      }
+      timeoutId = window.setTimeout(() => {
+        void loadEvents();
+      }, nextPollDelay(SESSION_EVENTS_REFRESH_MS, sessionEventsFailureCountRef.current));
+    }
+
+    function refreshWhenVisible() {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
       void loadEvents();
-    }, SESSION_EVENTS_REFRESH_MS);
+    }
+
+    sessionEventsFailureCountRef.current = 0;
+    void loadEvents();
+    document.addEventListener("visibilitychange", refreshWhenVisible);
 
     return () => {
       cancelled = true;
-      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
     };
   }, [deviceSession, liveSessions, selectedSession]);
 
@@ -1650,6 +1722,16 @@ function isAuthError(error: unknown): boolean {
 
 function isPairingTokenError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 400;
+}
+
+export function nextPollDelay(
+  baseMs: number,
+  failureCount: number,
+  visibilityState: DocumentVisibilityState = document.visibilityState,
+): number {
+  const hiddenMultiplier = visibilityState === "hidden" ? HIDDEN_PAGE_POLL_MULTIPLIER : 1;
+  const backoffMultiplier = Math.min(2 ** Math.max(0, failureCount), 8);
+  return Math.min(baseMs * hiddenMultiplier * backoffMultiplier, MAX_POLL_BACKOFF_MS);
 }
 
 function sortSessions(items: SessionSnapshot[]): SessionSnapshot[] {
