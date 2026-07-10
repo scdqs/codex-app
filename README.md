@@ -89,6 +89,12 @@ sidecar 的诊断顺序：
 4. 选择 thread，发送文本，确认 Codex Desktop 对应 thread 继续执行。
 5. 触发需要确认的命令或文件编辑，确认 PWA 出现审批卡片，批准或拒绝后桌面任务继续。
 
+## 试用与发布
+
+- 内部同事试用流程见 [docs/dogfood-qa-checklist.md](docs/dogfood-qa-checklist.md)。
+- dev / beta / stable 发布门禁见 [docs/release-gates.md](docs/release-gates.md)。
+- `scripts/check-release-gate.sh --channel stable` 会阻止未签名、未公证、缺 updater metadata 或把 Quick Tunnel 当稳定远程能力的公开发布。
+
 ## 参考
 
 - CodexPlusPlus mobile relay 和 CDP bridge 方向验证：<https://github.com/BigPizzaV3/CodexPlusPlus>

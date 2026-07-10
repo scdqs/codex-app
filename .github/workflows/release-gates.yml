@@ -1,0 +1,53 @@
+name: Release gates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feature/**
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel to validate
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - beta
+          - stable
+      artifact:
+        description: Optional artifact path to validate
+        required: false
+        type: string
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    env:
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+      TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+      UPDATE_MANIFEST_URL: ${{ vars.UPDATE_MANIFEST_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release gate
+        run: |
+          channel="${{ github.event_name == 'workflow_dispatch' && inputs.channel || 'dev' }}"
+          artifact="${{ github.event_name == 'workflow_dispatch' && inputs.artifact || '' }}"
+          args=(--channel "$channel")
+          if [ -n "$artifact" ]; then
+            args+=(--artifact "$artifact")
+          fi
+          scripts/check-release-gate.sh "${args[@]}"
