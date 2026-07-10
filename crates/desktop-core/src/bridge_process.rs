@@ -291,6 +291,21 @@ impl BridgeProcessManager {
     }
 
     pub async fn create_pairing_link(&self) -> Result<String, BridgeProcessError> {
+        let advertised_bridge_url = self
+            .state
+            .plan
+            .as_ref()
+            .ok_or(BridgeProcessError::InvalidPairingResponse)?
+            .advertised_bridge_url
+            .clone();
+        self.create_pairing_link_for_bridge_url(&advertised_bridge_url)
+            .await
+    }
+
+    pub async fn create_pairing_link_for_bridge_url(
+        &self,
+        bridge_url: &str,
+    ) -> Result<String, BridgeProcessError> {
         let plan = self
             .state
             .plan
@@ -314,11 +329,9 @@ impl BridgeProcessManager {
         if response.pairing_token.is_empty() {
             return Err(BridgeProcessError::InvalidPairingResponse);
         }
-        Ok(format!(
-            "{}/?pairingToken={}&bridgeUrl={}",
-            plan.advertised_bridge_url,
-            url_encode_component(&response.pairing_token),
-            url_encode_component(&plan.advertised_bridge_url)
+        Ok(pairing_link_for_bridge_url(
+            bridge_url,
+            &response.pairing_token,
         ))
     }
 
@@ -468,6 +481,15 @@ fn url_encode_component(value: &str) -> String {
         .collect()
 }
 
+pub fn pairing_link_for_bridge_url(bridge_url: &str, pairing_token: &str) -> String {
+    let bridge_url = bridge_url.trim_end_matches('/');
+    format!(
+        "{bridge_url}/?pairingToken={}&bridgeUrl={}",
+        url_encode_component(pairing_token),
+        url_encode_component(bridge_url)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,6 +593,19 @@ mod tests {
         assert!(
             plan.advertised_bridge_url
                 .starts_with("http://192.168.68.181:")
+        );
+    }
+
+    #[test]
+    fn pairing_link_can_target_rotated_tunnel_url() {
+        let link = pairing_link_for_bridge_url(
+            "https://mobile-codex.trycloudflare.com/",
+            "token with spaces",
+        );
+
+        assert_eq!(
+            link,
+            "https://mobile-codex.trycloudflare.com/?pairingToken=token%20with%20spaces&bridgeUrl=https%3A%2F%2Fmobile-codex.trycloudflare.com"
         );
     }
 
