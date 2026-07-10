@@ -28,6 +28,10 @@
     "active": true,
     "targets": ["app", "dmg"],
     "icon": ["../../mobile-pwa/public/icon-512.png"],
+    "resources": {
+      "resources/bin/": "bin/",
+      "resources/mobile-pwa/": "mobile-pwa/"
+    },
     "macOS": {
       "minimumSystemVersion": "12.0"
     }

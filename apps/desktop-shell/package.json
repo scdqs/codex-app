@@ -6,8 +6,9 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 57325",
     "build": "tsc --noEmit && vite build",
+    "prepare:bundle": "../../scripts/prepare-desktop-bundle.sh",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "npm run prepare:bundle && tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0"

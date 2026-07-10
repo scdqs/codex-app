@@ -284,7 +284,13 @@ fn bridge_config(app: &AppHandle) -> Result<BridgeProcessConfig, String> {
         .path()
         .app_data_dir()
         .map_err(|error| format!("resolve app data dir: {error}"))?;
-    let mut config = BridgeProcessConfig::new(sidecar_binary(), app_data_dir, pwa_dist_dir());
+    let resource_dir = app.path().resource_dir().ok();
+    let workspace_root = workspace_root();
+    let mut config = BridgeProcessConfig::new(
+        sidecar_binary(resource_dir.as_deref(), workspace_root.as_deref()),
+        app_data_dir,
+        pwa_dist_dir(resource_dir.as_deref(), workspace_root.as_deref()),
+    );
     config.preferred_port = Some(DEFAULT_BRIDGE_PORT);
     config.bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     config.health_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -301,22 +307,66 @@ fn bridge_local_url(manager: &BridgeProcessManager) -> Result<String, String> {
     Ok(format!("http://127.0.0.1:{port}"))
 }
 
-fn sidecar_binary() -> PathBuf {
-    env::var_os("CODEX_MOBILE_BRIDGE_SIDECAR_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_path("target/debug/bridge-sidecar"))
+fn sidecar_binary(resource_dir: Option<&Path>, workspace_root: Option<&Path>) -> PathBuf {
+    choose_sidecar_binary(
+        env::var_os("CODEX_MOBILE_BRIDGE_SIDECAR_BIN").map(PathBuf::from),
+        resource_dir,
+        workspace_root,
+    )
 }
 
-fn pwa_dist_dir() -> PathBuf {
-    env::var_os("CODEX_MOBILE_BRIDGE_PWA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_path("apps/mobile-pwa/dist"))
+fn pwa_dist_dir(resource_dir: Option<&Path>, workspace_root: Option<&Path>) -> PathBuf {
+    choose_pwa_dist_dir(
+        env::var_os("CODEX_MOBILE_BRIDGE_PWA_DIR").map(PathBuf::from),
+        resource_dir,
+        workspace_root,
+    )
 }
 
-fn workspace_path(path: &str) -> PathBuf {
+fn choose_sidecar_binary(
+    env_path: Option<PathBuf>,
+    resource_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = env_path {
+        return path;
+    }
+    if let Some(path) = resource_dir
+        .map(|dir| dir.join("bin/bridge-sidecar"))
+        .filter(|path| path.is_file())
+    {
+        return path;
+    }
+    workspace_path(workspace_root, "target/debug/bridge-sidecar")
+}
+
+fn choose_pwa_dist_dir(
+    env_path: Option<PathBuf>,
+    resource_dir: Option<&Path>,
+    workspace_root: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = env_path {
+        return path;
+    }
+    if let Some(path) = resource_dir
+        .map(|dir| dir.join("mobile-pwa"))
+        .filter(|path| path.join("index.html").is_file())
+    {
+        return path;
+    }
+    workspace_path(workspace_root, "apps/mobile-pwa/dist")
+}
+
+fn workspace_root() -> Option<PathBuf> {
     let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     find_workspace_root(&current_dir)
-        .unwrap_or(current_dir)
+}
+
+fn workspace_path(workspace_root: Option<&Path>, path: &str) -> PathBuf {
+    workspace_root
+        .map(Path::to_path_buf)
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
         .join(path)
 }
 
@@ -480,4 +530,70 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Codex Mobile Bridge desktop shell");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn sidecar_binary_prefers_env_path() {
+        let resource_dir = tempdir().expect("resource tempdir");
+        let workspace_dir = tempdir().expect("workspace tempdir");
+        let env_path = PathBuf::from("/custom/bridge-sidecar");
+
+        assert_eq!(
+            choose_sidecar_binary(
+                Some(env_path.clone()),
+                Some(resource_dir.path()),
+                Some(workspace_dir.path())
+            ),
+            env_path
+        );
+    }
+
+    #[test]
+    fn sidecar_binary_prefers_bundled_resource_over_workspace_fallback() {
+        let resource_dir = tempdir().expect("resource tempdir");
+        let bundled_sidecar = resource_dir.path().join("bin/bridge-sidecar");
+        fs::create_dir_all(bundled_sidecar.parent().expect("parent")).expect("bin dir");
+        fs::write(&bundled_sidecar, "sidecar").expect("sidecar file");
+        let workspace_dir = tempdir().expect("workspace tempdir");
+
+        assert_eq!(
+            choose_sidecar_binary(None, Some(resource_dir.path()), Some(workspace_dir.path())),
+            bundled_sidecar
+        );
+    }
+
+    #[test]
+    fn pwa_dist_prefers_bundled_resource_with_index() {
+        let resource_dir = tempdir().expect("resource tempdir");
+        let bundled_pwa = resource_dir.path().join("mobile-pwa");
+        fs::create_dir_all(&bundled_pwa).expect("pwa dir");
+        fs::write(bundled_pwa.join("index.html"), "<html></html>").expect("index");
+        let workspace_dir = tempdir().expect("workspace tempdir");
+
+        assert_eq!(
+            choose_pwa_dist_dir(None, Some(resource_dir.path()), Some(workspace_dir.path())),
+            bundled_pwa
+        );
+    }
+
+    #[test]
+    fn resource_lookup_falls_back_to_workspace_paths_when_bundle_is_incomplete() {
+        let resource_dir = tempdir().expect("resource tempdir");
+        let workspace_dir = tempdir().expect("workspace tempdir");
+
+        assert_eq!(
+            choose_sidecar_binary(None, Some(resource_dir.path()), Some(workspace_dir.path())),
+            workspace_dir.path().join("target/debug/bridge-sidecar")
+        );
+        assert_eq!(
+            choose_pwa_dist_dir(None, Some(resource_dir.path()), Some(workspace_dir.path())),
+            workspace_dir.path().join("apps/mobile-pwa/dist")
+        );
+    }
 }
