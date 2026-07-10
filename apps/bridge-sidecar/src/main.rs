@@ -42,7 +42,8 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_PWA_DIR));
     let storage = Storage::open(db_path).context("open bridge storage")?;
-    let control_token = Uuid::new_v4().to_string();
+    let control_token = env::var("CODEX_MOBILE_BRIDGE_CONTROL_TOKEN")
+        .unwrap_or_else(|_| Uuid::new_v4().to_string());
     let mut pairing = PairingManager::new(storage);
     let startup_pairing_token = pairing
         .create_token()
