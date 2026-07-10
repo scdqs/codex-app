@@ -1,4 +1,5 @@
 /target/
+/artifacts/
 node_modules/
 apps/*/dist/
 apps/*/src-tauri/gen/

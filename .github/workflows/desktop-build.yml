@@ -1,0 +1,87 @@
+name: Desktop build
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - beta
+          - stable
+      bundles:
+        description: Tauri bundle target
+        required: true
+        default: dmg
+        type: choice
+        options:
+          - app
+          - dmg
+          - app,dmg
+
+jobs:
+  desktop-build:
+    runs-on: macos-latest
+    env:
+      RELEASE_CHANNEL: ${{ inputs.channel }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+      TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+      UPDATE_MANIFEST_URL: ${{ vars.UPDATE_MANIFEST_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            apps/mobile-pwa/package-lock.json
+            apps/desktop-shell/package-lock.json
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Validate release channel gate
+        run: scripts/check-release-gate.sh --channel "$RELEASE_CHANNEL"
+
+      - name: Install desktop shell dependencies
+        working-directory: apps/desktop-shell
+        run: npm ci
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Build desktop bundle
+        working-directory: apps/desktop-shell
+        run: npm run tauri:build -- --bundles "${{ inputs.bundles }}"
+
+      - name: Collect desktop artifacts
+        run: scripts/collect-desktop-artifacts.sh artifacts/desktop-shell
+
+      - name: Validate artifact gates
+        run: |
+          while IFS= read -r artifact; do
+            scripts/check-release-gate.sh --channel "$RELEASE_CHANNEL" --artifact "$artifact"
+          done < artifacts/desktop-shell/artifact-paths.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codex-mobile-bridge-${{ inputs.channel }}-macos
+          path: artifacts/desktop-shell/
+          if-no-files-found: error

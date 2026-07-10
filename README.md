@@ -48,6 +48,8 @@ npm run tauri:build
 
 `tauri:build` 会先运行 `prepare:bundle`，构建 release sidecar 和 mobile PWA，并复制到 `apps/desktop-shell/src-tauri/resources/`。这些生成物不会提交到仓库；Tauri 打包时会把它们放进 App resources，运行时桌面壳会优先使用 bundle 内资源，找不到时才回退到开发路径。
 
+GitHub Actions 可手动生成内部试用包：运行 **Desktop build** workflow，`channel` 选 `dev` 或 `beta`，`bundles` 选 `dmg`。
+
 ## 启动
 
 先构建 PWA：

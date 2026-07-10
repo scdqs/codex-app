@@ -67,6 +67,15 @@ UPDATE_MANIFEST_URL="https://..."
 
 `.github/workflows/release-gates.yml` 在 push / PR 上默认跑 dev gate。手动触发 workflow 时可选择 `dev`、`beta` 或 `stable`。stable 会从 repository secrets 读取签名、公证和 updater 变量；缺失时 workflow 会失败，这是预期行为。
 
+`.github/workflows/desktop-build.yml` 用于手动构建 macOS 试用包：
+
+1. 在 Actions 里选择 **Desktop build**。
+2. `channel` 选 `dev` 或 `beta` 生成内部试用包；`stable` 会先经过签名、公证和 updater metadata 门禁。
+3. `bundles` 选 `dmg` 生成 DMG，或选 `app,dmg` 同时上传 `.app.zip` 和 DMG。
+4. workflow 会运行 workspace 测试、准备 bundled sidecar/PWA resources、执行 Tauri build、收集 artifact，并对 artifact 再跑一次 release gate。
+
+内部试用产物可以是 unsigned。stable 产物不能靠这个 workflow 绕过签名、公证和 updater metadata 检查。
+
 ## 进入 stable 前的人工检查
 
 - [ ] 完成 `docs/dogfood-qa-checklist.md` 中的 install、pairing、send message、approval、revoke、diagnostics 流程。
@@ -74,4 +83,3 @@ UPDATE_MANIFEST_URL="https://..."
 - [ ] 断网、换 Wi-Fi、手机锁屏后恢复，确认连接状态可理解。
 - [ ] 诊断包人工检查无 token、API key、完整本机路径。
 - [ ] README 和下载页不承诺当前实现做不到的远程稳定性。
-
