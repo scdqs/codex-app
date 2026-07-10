@@ -245,12 +245,12 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
     return true;
   };
 
-  const installHostBridge = (sendRequest) => {
+  const installHostBridge = (sendRequest, mode = "host-module") => {
     if (typeof sendRequest !== "function") {
       return false;
     }
     globalThis.__codexMobileBridge = {
-      mode: "host-module",
+      mode,
       rpc: async (request) => {
         if (!request || typeof request.method !== "string") {
           throw new Error("Invalid Codex mobile bridge request");
@@ -266,6 +266,10 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
     return true;
   };
 
+  const moduleUrls = Array.from(document.querySelectorAll('link[rel="modulepreload"], script[type="module"], script[src]'))
+    .map((element) => element.href || element.src)
+    .filter(Boolean);
+
   const candidates = [
     globalThis.__codexAppServerClient,
     globalThis.__codex?.appServerClient,
@@ -277,23 +281,93 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
     return true;
   }
 
-  const moduleUrls = Array.from(document.querySelectorAll('link[rel="modulepreload"], script[type="module"], script[src]'))
-    .map((element) => element.href || element.src)
-    .filter(Boolean);
   const hostModuleUrl =
     moduleUrls.find((url) => url.includes("new-thread-panel-page")) ||
     moduleUrls.find((url) => url.includes("app-server-manager-signals"));
-  if (!hostModuleUrl) {
-    return false;
+  if (hostModuleUrl) {
+    try {
+      const hostModule = await import(hostModuleUrl);
+      if (installHostBridge(hostModule.pv)) {
+        return true;
+      }
+    } catch (error) {
+      globalThis.__codexMobileBridgeLastError = error?.message || String(error);
+    }
   }
 
+  const isExportedAppServerSender = (candidate) => {
+    if (typeof candidate !== "function" || candidate.length < 2) {
+      return false;
+    }
+    let source;
+    try {
+      source = Function.prototype.toString.call(candidate);
+    } catch (_error) {
+      return false;
+    }
+    return /return\s+[A-Za-z0-9_$]+\.sendRequest\([A-Za-z0-9_$]+,[A-Za-z0-9_$]+\)/.test(source);
+  };
+
+  const findExportedAppServerSender = (module) => {
+    for (const value of Object.values(module || {})) {
+      if (isExportedAppServerSender(value)) {
+        return value;
+      }
+    }
+    return null;
+  };
+
+  const findRpcHostModuleUrls = async () => {
+    const candidates = new Set(
+      moduleUrls.filter((url) =>
+        url.includes("app-server") ||
+        url.includes("pull-request-code-review") ||
+        url.includes("hotkey-window-thread-page") ||
+        /\/rpc-[^/]+\.js$/.test(url)
+      )
+    );
+
+    await Promise.all(
+      moduleUrls.map(async (url) => {
+        try {
+          const text = await fetch(url).then((response) => response.text());
+          if (
+            text.includes("Missing AppServer request message handler") &&
+            text.includes("send-cli-request-for-host")
+          ) {
+            candidates.add(url);
+          }
+          if (/\/rpc-[^/]+\.js$/.test(url)) {
+            for (const match of text.matchAll(/from\s*["'](\.\/[^"']+\.js)["']/g)) {
+              candidates.add(new URL(match[1], url).href);
+            }
+          }
+        } catch (_error) {
+          // Best effort only; some lazy modules may not be fetchable in every build.
+        }
+      })
+    );
+
+    return Array.from(candidates);
+  };
+
   try {
-    const hostModule = await import(hostModuleUrl);
-    return installHostBridge(hostModule.pv);
+    for (const url of await findRpcHostModuleUrls()) {
+      try {
+        const module = await import(url);
+        const sender = findExportedAppServerSender(module);
+        if (installHostBridge(sender, "exported-host-sender")) {
+          return true;
+        }
+      } catch (error) {
+        globalThis.__codexMobileBridgeLastError = error?.message || String(error);
+      }
+    }
   } catch (error) {
     globalThis.__codexMobileBridgeLastError = error?.message || String(error);
-    return false;
   }
+
+  return false;
 })()
 "#;
 
@@ -517,6 +591,14 @@ mod tests {
     fn bridge_script_uses_current_codex_host_module_bridge() {
         assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("new-thread-panel-page"));
         assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("send-cli-request-for-host"));
+    }
+
+    #[test]
+    fn bridge_script_discovers_chatgpt_exported_host_sender() {
+        assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("exported-host-sender"));
+        assert!(
+            CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("Missing AppServer request message handler")
+        );
     }
 
     #[test]

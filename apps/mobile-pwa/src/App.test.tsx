@@ -28,28 +28,20 @@ describe("App", () => {
     restoreObjectUrls();
   });
 
-  it("renders the mobile workbench regions and selected session detail", () => {
+  it("renders an empty unpaired workbench without demo data", () => {
     render(<App />);
 
     expect(screen.getByLabelText("Connection status")).toHaveTextContent("Unpaired");
     expect(screen.getByRole("button", { name: "Open sessions" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Pending approvals" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Pending approvals" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Sessions" })).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "Sessions" })).not.toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Mobile bridge MVP" })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("Message Mobile bridge MVP")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reject Run npm install" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Approve Run npm install" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reject Create PWA scaffold" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Approve Create PWA scaffold" })).toBeInTheDocument();
-
-    expect(screen.getByRole("button", { name: /Mobile bridge MVP/ })).toHaveAttribute("aria-current", "true");
-
-    fireEvent.click(screen.getByRole("button", { name: /Bridge sidecar API/ }));
-
-    expect(screen.getByRole("heading", { name: "Bridge sidecar API" })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("Message Bridge sidecar API")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Bridge sidecar API/ })).toHaveAttribute("aria-current", "true");
+    expect(screen.queryByText("Run npm install")).not.toBeInTheDocument();
+    expect(screen.queryByText("Mobile bridge MVP")).not.toBeInTheDocument();
+    expect(screen.queryByText("Bridge sidecar API")).not.toBeInTheDocument();
+    expect(screen.getByText("No live sessions yet. Use the newest pairing URL from the bridge terminal.")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "No sessions available" })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Message No session selected")).toBeDisabled();
   });
 
   it("opens_and_closes_the_mobile_session_drawer", async () => {
@@ -82,16 +74,33 @@ describe("App", () => {
 
   it("selects_a_session_from_the_mobile_drawer_and_closes_it", async () => {
     const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-live", title: "Live thread", preview: "Real session" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-live/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
 
     render(<App />);
 
+    await screen.findByRole("heading", { name: "Live thread" });
     await user.click(screen.getByRole("button", { name: "Open sessions" }));
     const drawer = screen.getByRole("dialog", { name: "Sessions" });
-    await user.click(within(drawer).getByRole("button", { name: /Bridge sidecar API/ }));
+    await user.click(within(drawer).getByRole("button", { name: /Live thread/ }));
 
     expect(screen.queryByRole("dialog", { name: "Sessions" })).not.toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Bridge sidecar API" })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("Message Bridge sidecar API")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Live thread" })).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Message Live thread")).toBeInTheDocument();
   });
 
   it("keeps_focus_on_drawer_session_row_during_live_session_updates", async () => {
@@ -1058,6 +1067,76 @@ describe("App", () => {
       expect(screen.getByText("Polled reply")).toBeInTheDocument();
     });
     expect(eventFetches).toBeGreaterThanOrEqual(2);
+  });
+
+  it("recovers_connection_status_after_visible_session_poll_succeeds", async () => {
+    saveActiveSession();
+    let sessionFetches = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        sessionFetches += 1;
+        if (sessionFetches === 1) {
+          return jsonResponse({ message: "phone slept" }, 503);
+        }
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-recovered", title: "Recovered thread", preview: "Back online" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-recovered/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Connection error");
+    });
+
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    expect(await screen.findByRole("heading", { name: "Recovered thread" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("Writable");
+  });
+
+  it("reconnects_websocket_when_page_returns_to_foreground", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-live", title: "Live thread", preview: "Real session" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-live/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Live thread" });
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    await waitFor(() => {
+      expect(MockWebSocket.instances).toHaveLength(2);
+    });
+    expect(MockWebSocket.instances[0].closed).toBe(true);
   });
 
   it("calculates_adaptive_poll_delay_for_backoff_and_hidden_pages", () => {

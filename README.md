@@ -7,7 +7,23 @@ macOS 优先的 ChatGPT/Codex Desktop 手机桥接 MVP。电脑侧运行 Rust si
 - 桌面端优先支持新版 ChatGPT Desktop App，并兼容仍叫 Codex 的旧安装；通过 CDP target 发现和注入 bridge 脚本连接 app-server JSON-RPC。
 - 手机端是 PWA，由 sidecar 静态托管，扫码或复制 URL 打开。
 - 设备配对为本机长期绑定；MVP 安全策略是“已配对手机等同本机用户审批”。
-- 第一版只做局域网直连；公网 tunnel、云端账号、多租户、Web Push、原生 App 和复杂授权策略不在当前范围。
+- 第一版默认局域网直连；Quick Tunnel 只作为用户显式开启的 Beta 远程能力。云端账号、多租户、Web Push、原生 App 和复杂授权策略不在当前范围。
+
+## Mac App 快速体验
+
+当前内部体验优先使用 `Codex Mobile Bridge.app`，不要求普通试用同事手动运行 sidecar 或复制 control token。
+
+1. 启动 `Codex Mobile Bridge.app`。
+2. 点击 **检测/启动**，让 Bridge 附着或启动新版 `ChatGPT.app` / 旧版 `Codex.app`。
+3. 点击 **Bridge Service / 启动**，等待状态变成 `ready` 或 `degraded`。只有 `writable` 才允许手机回写消息。
+4. 局域网体验：点击 **手机配对 / 生成新链接**，用手机扫码或复制完整链接打开。
+5. 远程体验：先点击 **远程链接 Beta / 开启**，再使用桌面端生成的远程配对链接。`trycloudflare.com` 是临时通道，断网、睡眠、重启、换链接后可能失效。
+
+链接语义：
+
+- 带 `pairingToken=...` 的完整链接是一次性配对入口，用过或过期后需要在 Mac App 里重新生成。
+- 同一台手机、同一个浏览器配对成功后，可以重复打开当前 bridge URL；如果显示 `Unpaired`、`Needs new link` 或 `Session revoked or expired`，重新生成配对链接。
+- 直接打开远程根地址但没有保存过设备 session 时，只会显示未配对空态，不应展示任何 demo 会话。
 
 ## 开发命令
 

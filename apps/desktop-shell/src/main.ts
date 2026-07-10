@@ -93,6 +93,10 @@ async function runAction(label: string, action: () => Promise<void>) {
   }
 }
 
+async function copyText(text: string) {
+  await invoke("copy_text", { text });
+}
+
 async function refresh(showErrors = true) {
   try {
     status = await invoke<ShellStatus>("get_app_status");
@@ -362,11 +366,11 @@ function bindActions() {
       if (action === "copy-diagnostics") {
         await runAction("诊断 JSON 已复制", async () => {
           const bundle = await invoke<DiagnosticsBundle>("get_diagnostics_bundle");
-          await navigator.clipboard.writeText(JSON.stringify(bundle, null, 2));
+          await copyText(JSON.stringify(bundle, null, 2));
         });
       }
       if (action === "copy-pairing" && status?.lastPairingLink) {
-        await navigator.clipboard.writeText(status.lastPairingLink);
+        await copyText(status.lastPairingLink);
         notice = "配对链接已复制";
         render();
       }

@@ -1,8 +1,9 @@
 use std::{
     env,
+    io::Write,
     net::{IpAddr, Ipv4Addr, UdpSocket},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use desktop_core::{
@@ -24,6 +25,7 @@ struct ShellState {
     bridge: Mutex<Option<BridgeProcessManager>>,
     tunnel: Mutex<QuickTunnelManager>,
     last_pairing_link: Mutex<Option<String>>,
+    last_pairing_source: Mutex<Option<PairingLinkSource>>,
 }
 
 impl Default for ShellState {
@@ -32,8 +34,15 @@ impl Default for ShellState {
             bridge: Mutex::new(None),
             tunnel: Mutex::new(QuickTunnelManager::new(QuickTunnelConfig::default())),
             last_pairing_link: Mutex::new(None),
+            last_pairing_source: Mutex::new(None),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingLinkSource {
+    Local,
+    Tunnel,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,7 +116,11 @@ async fn get_app_status(state: State<'_, ShellState>) -> Result<ShellStatusDto, 
             .map(BridgeProcessManager::status)
             .unwrap_or_else(stopped_bridge_snapshot)
     };
-    let tunnel = state.tunnel.lock().await.status();
+    let tunnel = {
+        let mut tunnel = state.tunnel.lock().await;
+        tunnel.status()
+    };
+    clear_stale_tunnel_pairing_link(&state, &tunnel).await;
     let last_pairing_link = state.last_pairing_link.lock().await.clone();
 
     Ok(ShellStatusDto {
@@ -150,6 +163,7 @@ async fn stop_bridge(state: State<'_, ShellState>) -> Result<BridgeProcessSnapsh
         .ok_or_else(|| "bridge service is not initialized".to_string())?;
     let snapshot = manager.stop().await.map_err(|error| error.to_string())?;
     *state.last_pairing_link.lock().await = None;
+    *state.last_pairing_source.lock().await = None;
     Ok(snapshot.into())
 }
 
@@ -166,6 +180,7 @@ async fn create_pairing_link(state: State<'_, ShellState>) -> Result<String, Str
             .map_err(|error| error.to_string())?
     };
     *state.last_pairing_link.lock().await = Some(link.clone());
+    *state.last_pairing_source.lock().await = Some(PairingLinkSource::Local);
     Ok(link)
 }
 
@@ -194,6 +209,7 @@ async fn start_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnapsh
         (snapshot, pairing_link)
     };
     *state.last_pairing_link.lock().await = pairing_link;
+    *state.last_pairing_source.lock().await = Some(PairingLinkSource::Tunnel);
     Ok(snapshot.into())
 }
 
@@ -218,6 +234,7 @@ async fn rotate_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnaps
         (snapshot, pairing_link)
     };
     *state.last_pairing_link.lock().await = pairing_link;
+    *state.last_pairing_source.lock().await = Some(PairingLinkSource::Tunnel);
     Ok(snapshot.into())
 }
 
@@ -226,7 +243,20 @@ async fn stop_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnapsho
     let mut tunnel = state.tunnel.lock().await;
     let snapshot = tunnel.stop().await.map_err(|error| error.to_string())?;
     *state.last_pairing_link.lock().await = None;
+    *state.last_pairing_source.lock().await = None;
     Ok(snapshot.into())
+}
+
+async fn clear_stale_tunnel_pairing_link(state: &ShellState, tunnel: &TunnelSnapshot) {
+    if tunnel.status == TunnelStatus::Ready {
+        return;
+    }
+    let mut source = state.last_pairing_source.lock().await;
+    if *source != Some(PairingLinkSource::Tunnel) {
+        return;
+    }
+    *state.last_pairing_link.lock().await = None;
+    *source = None;
 }
 
 #[tauri::command]
@@ -296,6 +326,41 @@ async fn get_diagnostics_bundle(
     });
 
     serde_json::to_value(bundle).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn copy_text(text: String) -> Result<(), String> {
+    write_text_to_clipboard(&text)
+}
+
+#[cfg(target_os = "macos")]
+fn write_text_to_clipboard(text: &str) -> Result<(), String> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("launch pbcopy: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "pbcopy stdin is not available".to_string())?;
+    stdin
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("write clipboard text: {error}"))?;
+    drop(stdin);
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("wait for pbcopy: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("pbcopy exited with {status}"))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_text_to_clipboard(_text: &str) -> Result<(), String> {
+    Err("clipboard copy is only implemented on macOS".to_string())
 }
 
 async fn control_get(state: State<'_, ShellState>, path: &str) -> Result<Value, String> {
@@ -633,10 +698,14 @@ impl From<BridgeProcessSnapshot> for BridgeProcessSnapshotDto {
 
 impl From<TunnelSnapshot> for TunnelSnapshotDto {
     fn from(snapshot: TunnelSnapshot) -> Self {
-        let (public_url, local_url) = snapshot
-            .session
-            .map(|session| (Some(session.public_url), Some(session.local_url)))
-            .unwrap_or((None, None));
+        let (public_url, local_url) = if snapshot.status == TunnelStatus::Ready {
+            snapshot
+                .session
+                .map(|session| (Some(session.public_url), Some(session.local_url)))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
         Self {
             status: tunnel_status(snapshot.status).to_string(),
             public_url,
@@ -703,6 +772,7 @@ fn main() {
             stop_quick_tunnel,
             get_control_diagnostics,
             get_diagnostics_bundle,
+            copy_text,
             list_devices,
             revoke_device,
         ])
@@ -796,6 +866,24 @@ mod tests {
             check.detail.as_deref(),
             Some("Authorization: Bearer secret")
         );
+    }
+
+    #[test]
+    fn tunnel_dto_hides_urls_when_tunnel_failed() {
+        let dto = TunnelSnapshotDto::from(TunnelSnapshot {
+            status: TunnelStatus::Failed,
+            session: Some(desktop_core::TunnelSession {
+                id: "tunnel-1".to_string(),
+                local_url: "http://127.0.0.1:57324".to_string(),
+                public_url: "https://stale.trycloudflare.com".to_string(),
+                started_at: 1,
+            }),
+            detail: Some("tunnel provider exited".to_string()),
+        });
+
+        assert_eq!(dto.status, "failed");
+        assert_eq!(dto.public_url, None);
+        assert_eq!(dto.local_url, None);
     }
 
     #[test]

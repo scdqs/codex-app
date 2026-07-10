@@ -60,81 +60,6 @@ import {
 } from "./api";
 import { createDeviceSession, loadSession, saveSession, type DeviceSession } from "./storage";
 
-const sampleSessions: SessionSnapshot[] = [
-  {
-    threadId: "thread-mobile-bridge",
-    title: "Mobile bridge MVP",
-    cwd: "/Users/damon/Documents/my_ai/codex-app",
-    modelProvider: "OpenAI",
-    preview: "Scaffold PWA workbench and keep sidecar protocol aligned.",
-    updatedAt: 1_783_515_380_000,
-    status: "waiting_for_approval",
-    pendingApprovalIds: ["approval-install"],
-  },
-  {
-    threadId: "thread-sidecar",
-    title: "Bridge sidecar API",
-    cwd: "/Users/damon/Documents/my_ai/codex-app",
-    modelProvider: "OpenAI",
-    preview: "HTTP health, pairing, and WebSocket replay are ready for PWA wiring.",
-    updatedAt: 1_783_514_520_000,
-    status: "running",
-    pendingApprovalIds: [],
-  },
-  {
-    threadId: "thread-docs",
-    title: "MVP plan notes",
-    preview: "Next tasks add pairing, connection state, and live session streams.",
-    updatedAt: 1_783_510_800_000,
-    status: "idle",
-    pendingApprovalIds: [],
-  },
-];
-
-const sampleApprovals: ApprovalRequest[] = [
-  {
-    id: "approval-install",
-    threadId: "thread-mobile-bridge",
-    kind: "command",
-    title: "Run npm install",
-    detail: "cd apps/mobile-pwa && npm install",
-    riskHint: "Writes node_modules and package-lock.json in the PWA package.",
-    createdAt: 1_783_515_360_000,
-  },
-  {
-    id: "approval-build",
-    threadId: "thread-mobile-bridge",
-    kind: "file_edit",
-    title: "Create PWA scaffold",
-    detail: "Add Vite React files under apps/mobile-pwa.",
-    createdAt: 1_783_515_080_000,
-  },
-];
-
-const sampleEvents: SessionEvent[] = [
-  {
-    id: "event-1",
-    threadId: "thread-mobile-bridge",
-    type: "message",
-    payload: { role: "user", text: "Implement Task 6 only. Do not touch Rust." },
-    createdAt: 1_783_515_000_000,
-  },
-  {
-    id: "event-2",
-    threadId: "thread-mobile-bridge",
-    type: "tool_call",
-    payload: { tool: "read_memory", text: "Loaded project constraints and current scope." },
-    createdAt: 1_783_515_120_000,
-  },
-  {
-    id: "event-3",
-    threadId: "thread-mobile-bridge",
-    type: "approval_requested",
-    payload: { text: "Waiting for dependency install approval." },
-    createdAt: 1_783_515_360_000,
-  },
-];
-
 const pairingAttempts = new Map<string, Promise<DeviceSession>>();
 const SESSION_LIST_REFRESH_MS = 5_000;
 const SESSION_EVENTS_REFRESH_MS = 2_000;
@@ -142,8 +67,7 @@ const HIDDEN_PAGE_POLL_MULTIPLIER = 6;
 const MAX_POLL_BACKOFF_MS = 30_000;
 
 function App() {
-  const hasInitialPairingPayload = useMemo(() => readPairingPayloadFromUrl(window.location.href) !== null, []);
-  const [selectedThreadId, setSelectedThreadId] = useState(sampleSessions[0].threadId);
+  const [selectedThreadId, setSelectedThreadId] = useState("");
   const [draft, setDraft] = useState("");
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false);
   const [connection, setConnection] = useState<ConnectionViewState>({ label: "Unpaired" });
@@ -151,26 +75,22 @@ function App() {
   const [liveSessions, setLiveSessions] = useState<SessionSnapshot[] | null>(null);
   const [eventsByThread, setEventsByThread] = useState<Record<string, SessionEvent[]>>({});
   const [liveApprovals, setLiveApprovals] = useState<ApprovalRequest[]>([]);
+  const [socketReconnectNonce, setSocketReconnectNonce] = useState(0);
   const [sending, setSending] = useState(false);
   const [decidingApprovalIds, setDecidingApprovalIds] = useState<Record<string, DecisionKind>>({});
   const sessionMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const sessionRefreshPromiseRef = useRef<Promise<DeviceSession> | null>(null);
   const sessionListFailureCountRef = useRef(0);
   const sessionEventsFailureCountRef = useRef(0);
-  const showSampleData = connection.label === "Unpaired" && !hasInitialPairingPayload && !deviceSession;
   const canSyncSessionData =
     Boolean(deviceSession) && (isSessionDataEnabled(connection.label) || connection.label === "Connection error");
-  const sessions = liveSessions ?? (showSampleData ? sampleSessions : []);
-  const approvals = showSampleData ? sampleApprovals : liveApprovals;
+  const sessions = liveSessions ?? [];
+  const approvals = liveApprovals;
   const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? null;
   const selectedApprovals = selectedSession
     ? approvals.filter((approval) => approval.threadId === selectedSession.threadId)
     : [];
-  const selectedEvents =
-    selectedSession
-      ? eventsByThread[selectedSession.threadId] ??
-        (showSampleData ? sampleEvents.filter((event) => event.threadId === selectedSession.threadId) : [])
-      : [];
+  const selectedEvents = selectedSession ? eventsByThread[selectedSession.threadId] ?? [] : [];
   const pendingCount = approvals.length;
   const canSend = (connection.label === "Connected" || connection.label === "Writable") && Boolean(deviceSession) && Boolean(selectedSession);
 
@@ -209,6 +129,10 @@ function App() {
     }
 
     return sessionRefreshPromiseRef.current;
+  }
+
+  function markSessionDataRecovered() {
+    setConnection((current) => (current.label === "Connection error" ? { label: "Writable" } : current));
   }
 
   useEffect(() => {
@@ -311,6 +235,7 @@ function App() {
           return;
         }
         sessionListFailureCountRef.current = 0;
+        markSessionDataRecovered();
         const sorted = sortSessions(items);
         setLiveSessions(sorted);
         setSelectedThreadId((current) => {
@@ -398,6 +323,7 @@ function App() {
         const items = await listSessionEventsWithRefresh(activeSession, threadId);
         if (!cancelled) {
           sessionEventsFailureCountRef.current = 0;
+          markSessionDataRecovered();
           setEventsByThread((current) => ({
             ...current,
             [threadId]: mergePolledSessionEvents(current[threadId] ?? [], items),
@@ -463,6 +389,31 @@ function App() {
   }, [deviceSession, liveSessions, selectedSession]);
 
   useEffect(() => {
+    if (!deviceSession) {
+      return;
+    }
+
+    function reconnectWhenVisible() {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      setSocketReconnectNonce((current) => current + 1);
+    }
+
+    function reconnectWhenOnline() {
+      setSocketReconnectNonce((current) => current + 1);
+    }
+
+    document.addEventListener("visibilitychange", reconnectWhenVisible);
+    window.addEventListener("online", reconnectWhenOnline);
+
+    return () => {
+      document.removeEventListener("visibilitychange", reconnectWhenVisible);
+      window.removeEventListener("online", reconnectWhenOnline);
+    };
+  }, [deviceSession]);
+
+  useEffect(() => {
     if (!deviceSession || !isSessionDataEnabled(connection.label) || typeof WebSocket === "undefined") {
       return;
     }
@@ -479,7 +430,7 @@ function App() {
     return () => {
       ws.close();
     };
-  }, [connection.label, deviceSession]);
+  }, [connection.label, deviceSession, socketReconnectNonce]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

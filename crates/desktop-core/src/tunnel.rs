@@ -1,4 +1,5 @@
 use std::{
+    env,
     path::PathBuf,
     process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -52,7 +53,13 @@ pub struct QuickTunnelConfig {
 impl Default for QuickTunnelConfig {
     fn default() -> Self {
         Self {
-            binary: PathBuf::from("cloudflared"),
+            binary: choose_tunnel_binary(
+                env::var_os("CODEX_MOBILE_BRIDGE_TUNNEL_BIN").map(PathBuf::from),
+                &[
+                    PathBuf::from("/opt/homebrew/bin/cloudflared"),
+                    PathBuf::from("/usr/local/bin/cloudflared"),
+                ],
+            ),
             args_template: vec![
                 "tunnel".to_string(),
                 "--url".to_string(),
@@ -139,11 +146,23 @@ impl QuickTunnelManager {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn().map_err(TunnelError::Spawn)?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let error = TunnelError::Spawn(error);
+                self.state = TunnelState {
+                    status: TunnelStatus::Failed,
+                    session: None,
+                    detail: Some(error.to_string()),
+                };
+                return Err(error);
+            }
+        };
         let mut output = tunnel_output_lines(&mut child);
 
         match self.wait_for_public_url(&mut child, &mut output).await {
             Ok(public_url) => {
+                drain_tunnel_output(output);
                 let session = TunnelSession {
                     id: Uuid::new_v4().to_string(),
                     local_url,
@@ -269,6 +288,7 @@ impl QuickTunnelManager {
         {
             self.child = None;
             self.state.status = TunnelStatus::Failed;
+            self.state.session = None;
             self.state.detail = Some(format!("tunnel provider exited: {status}"));
         }
     }
@@ -280,6 +300,17 @@ impl QuickTunnelManager {
             detail: self.state.detail.clone(),
         }
     }
+}
+
+fn choose_tunnel_binary(env_path: Option<PathBuf>, common_paths: &[PathBuf]) -> PathBuf {
+    if let Some(path) = env_path {
+        return path;
+    }
+    common_paths
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("cloudflared"))
 }
 
 pub fn parse_quick_tunnel_url(line: &str) -> Option<String> {
@@ -311,6 +342,10 @@ fn tunnel_output_lines(child: &mut Child) -> mpsc::Receiver<Result<String, std::
         spawn_line_reader(stderr, sender);
     }
     receiver
+}
+
+fn drain_tunnel_output(mut output: mpsc::Receiver<Result<String, std::io::Error>>) {
+    tokio::spawn(async move { while output.recv().await.is_some() {} });
 }
 
 fn spawn_line_reader<R>(reader: R, sender: mpsc::Sender<Result<String, std::io::Error>>)
@@ -346,6 +381,7 @@ fn current_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn shell_config(script: &str) -> QuickTunnelConfig {
         QuickTunnelConfig {
@@ -365,6 +401,30 @@ mod tests {
             Some("https://mobile-codex.trycloudflare.com".to_string())
         );
         assert_eq!(parse_quick_tunnel_url("https://example.com"), None);
+    }
+
+    #[test]
+    fn tunnel_binary_prefers_env_override() {
+        assert_eq!(
+            choose_tunnel_binary(
+                Some(PathBuf::from("/custom/cloudflared")),
+                &[PathBuf::from("/opt/homebrew/bin/cloudflared")]
+            ),
+            PathBuf::from("/custom/cloudflared")
+        );
+    }
+
+    #[test]
+    fn tunnel_binary_uses_first_existing_common_path() {
+        let dir = tempdir().expect("tempdir");
+        let missing = dir.path().join("missing-cloudflared");
+        let existing = dir.path().join("cloudflared");
+        std::fs::write(&existing, "provider").expect("write provider");
+
+        assert_eq!(
+            choose_tunnel_binary(None, &[missing, existing.clone()]),
+            existing
+        );
     }
 
     #[test]
@@ -415,6 +475,76 @@ mod tests {
 
         assert!(matches!(error, TunnelError::PublicUrlTimeout(_)));
         assert_eq!(manager.status().status, TunnelStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn start_marks_failed_when_provider_binary_is_missing() {
+        let mut manager = QuickTunnelManager::new(QuickTunnelConfig {
+            binary: PathBuf::from("/definitely/missing/cloudflared"),
+            args_template: QuickTunnelConfig::default().args_template,
+            startup_timeout: Duration::from_millis(300),
+            poll_interval: Duration::from_millis(10),
+        });
+
+        let error = manager
+            .start("http://127.0.0.1:57324")
+            .await
+            .expect_err("missing provider fails");
+        let snapshot = manager.status();
+
+        assert!(matches!(error, TunnelError::Spawn(_)));
+        assert_eq!(snapshot.status, TunnelStatus::Failed);
+        assert!(snapshot.detail.expect("detail").contains("failed to spawn"));
+    }
+
+    #[tokio::test]
+    async fn status_clears_session_when_provider_exits_after_ready() {
+        let mut manager = QuickTunnelManager::new(shell_config(
+            "echo 'INF https://done.trycloudflare.com' >&2; sleep 0.05",
+        ));
+
+        let ready = manager
+            .start("http://127.0.0.1:57324")
+            .await
+            .expect("tunnel starts");
+        assert_eq!(ready.status, TunnelStatus::Ready);
+        assert!(ready.session.is_some());
+
+        sleep(Duration::from_millis(100)).await;
+        let failed = manager.status();
+
+        assert_eq!(failed.status, TunnelStatus::Failed);
+        assert_eq!(failed.session, None);
+        assert!(
+            failed
+                .detail
+                .expect("detail is present")
+                .contains("tunnel provider exited")
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_provider_running_after_public_url_when_logs_continue() {
+        let mut manager = QuickTunnelManager::new(shell_config(
+            "echo 'INF https://steady.trycloudflare.com' >&2; i=0; while [ $i -lt 30 ]; do echo \"INF still running $i\" >&2; i=$((i+1)); sleep 0.01; done; sleep 5",
+        ));
+
+        let ready = manager
+            .start("http://127.0.0.1:57324")
+            .await
+            .expect("tunnel starts");
+        assert_eq!(ready.status, TunnelStatus::Ready);
+
+        sleep(Duration::from_millis(200)).await;
+        let snapshot = manager.status();
+
+        assert_eq!(snapshot.status, TunnelStatus::Ready);
+        assert_eq!(
+            snapshot.session.expect("session remains").public_url,
+            "https://steady.trycloudflare.com"
+        );
+
+        let _ = manager.stop().await;
     }
 
     #[tokio::test]
