@@ -19,6 +19,8 @@ macOS 优先的 ChatGPT/Codex Desktop 手机桥接 MVP。电脑侧运行 Rust si
 4. 局域网体验：点击 **手机配对 / 生成新链接**，用手机扫码或复制完整链接打开。
 5. 远程体验：先点击 **远程链接 Beta / 开启**，再使用桌面端生成的远程配对链接。`trycloudflare.com` 是临时通道，断网、睡眠、重启、换链接后可能失效。
 
+远程链接依赖 Cloudflare `cloudflared`。内部试用包会把 `cloudflared` 打进 `Codex Mobile Bridge.app/Contents/Resources/bin/`；如果旧包显示 `failed to spawn tunnel provider: No such file or directory`，说明该包没有内置 provider，重新安装新版 DMG 即可。
+
 链接语义：
 
 - 带 `pairingToken=...` 的完整链接是一次性配对入口，用过或过期后需要在 Mac App 里重新生成。
@@ -137,7 +139,7 @@ sidecar 的诊断顺序：
 ## 试用与发布
 
 - 内部同事试用流程见 [docs/dogfood-qa-checklist.md](docs/dogfood-qa-checklist.md)。
-- 共享内部包前先跑 `scripts/dogfood-smoke.sh`；最近一次 dogfood 记录见 [docs/dogfood-runs/2026-07-10-dogfood-20260710.1.md](docs/dogfood-runs/2026-07-10-dogfood-20260710.1.md)。
+- 共享内部包前先跑 `scripts/dogfood-smoke.sh`；最近一次 dogfood 记录见 [docs/dogfood-runs/2026-07-10-dogfood-20260710.2.md](docs/dogfood-runs/2026-07-10-dogfood-20260710.2.md)。
 - dev / beta / stable 发布门禁见 [docs/release-gates.md](docs/release-gates.md)。
 - `scripts/check-release-gate.sh --channel stable` 会阻止未签名、未公证、缺 updater metadata 或把 Quick Tunnel 当稳定远程能力的公开发布。
 

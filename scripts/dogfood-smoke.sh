@@ -57,6 +57,11 @@ if [ "${run_bundle}" = "true" ]; then
     cd apps/desktop-shell
     npm run tauri:build -- --debug --bundles app
   )
+  bundled_cloudflared="target/debug/bundle/macos/Codex Mobile Bridge.app/Contents/Resources/bin/cloudflared"
+  if [ ! -x "${bundled_cloudflared}" ]; then
+    echo "Bundled cloudflared is missing or not executable: ${bundled_cloudflared}" >&2
+    exit 1
+  fi
 else
   echo "==> desktop debug app bundle skipped"
 fi

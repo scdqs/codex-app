@@ -4,6 +4,7 @@ node_modules/
 apps/*/dist/
 apps/*/src-tauri/gen/
 apps/desktop-shell/src-tauri/resources/bin/bridge-sidecar*
+apps/desktop-shell/src-tauri/resources/bin/cloudflared*
 apps/desktop-shell/src-tauri/resources/mobile-pwa/*
 !apps/desktop-shell/src-tauri/resources/mobile-pwa/.keep
 bridge.sqlite

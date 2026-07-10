@@ -1,6 +1,6 @@
 use std::{
     env,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -55,10 +55,7 @@ impl Default for QuickTunnelConfig {
         Self {
             binary: choose_tunnel_binary(
                 env::var_os("CODEX_MOBILE_BRIDGE_TUNNEL_BIN").map(PathBuf::from),
-                &[
-                    PathBuf::from("/opt/homebrew/bin/cloudflared"),
-                    PathBuf::from("/usr/local/bin/cloudflared"),
-                ],
+                &default_tunnel_binary_candidates(),
             ),
             args_template: vec![
                 "tunnel".to_string(),
@@ -313,6 +310,27 @@ fn choose_tunnel_binary(env_path: Option<PathBuf>, common_paths: &[PathBuf]) -> 
         .unwrap_or_else(|| PathBuf::from("cloudflared"))
 }
 
+fn default_tunnel_binary_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(bundled) = bundled_tunnel_binary_from_exe(&current_exe)
+    {
+        candidates.push(bundled);
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin/cloudflared"));
+    candidates.push(PathBuf::from("/usr/local/bin/cloudflared"));
+    candidates
+}
+
+fn bundled_tunnel_binary_from_exe(current_exe: &Path) -> Option<PathBuf> {
+    Some(
+        current_exe
+            .parent()?
+            .parent()?
+            .join("Resources/bin/cloudflared"),
+    )
+}
+
 pub fn parse_quick_tunnel_url(line: &str) -> Option<String> {
     line.split(|character: char| {
         character.is_whitespace()
@@ -424,6 +442,20 @@ mod tests {
         assert_eq!(
             choose_tunnel_binary(None, &[missing, existing.clone()]),
             existing
+        );
+    }
+
+    #[test]
+    fn bundled_tunnel_binary_resolves_from_macos_app_executable() {
+        let executable = PathBuf::from(
+            "/Applications/Codex Mobile Bridge.app/Contents/MacOS/desktop-shell",
+        );
+
+        assert_eq!(
+            bundled_tunnel_binary_from_exe(&executable),
+            Some(PathBuf::from(
+                "/Applications/Codex Mobile Bridge.app/Contents/Resources/bin/cloudflared"
+            ))
         );
     }
 
