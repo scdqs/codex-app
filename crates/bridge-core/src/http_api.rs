@@ -179,6 +179,13 @@ impl AppState {
         }
     }
 
+    pub fn with_local_asset_registry(self, registry: LocalAssetRegistry) -> Self {
+        Self {
+            local_assets: Arc::new(Mutex::new(registry)),
+            ..self
+        }
+    }
+
     pub fn event_hub(&self) -> EventHub {
         self.event_hub.clone()
     }
@@ -211,13 +218,13 @@ impl AppState {
             return event;
         };
 
-        for index in 0..attachments.len() {
-            let Some(path) = local_image_attachment_path(&attachments[index]) else {
+        for attachment in attachments {
+            let Some(path) = local_image_attachment_path(attachment) else {
                 continue;
             };
             let token = self.local_assets.lock().await.register_image(path);
 
-            if let Some(object) = attachments[index].as_object_mut() {
+            if let Some(object) = attachment.as_object_mut() {
                 object.remove("path");
                 object.insert(
                     "src".to_string(),
@@ -445,12 +452,11 @@ async fn get_local_image_asset(
     State(state): State<AppState>,
     Path(asset_token): Path<String>,
 ) -> Result<Response, ApiError> {
-    let path = state
-        .local_assets
-        .lock()
-        .await
-        .path_for(&asset_token)
-        .ok_or(ApiError::NotFound("local image asset not found"))?;
+    let path = {
+        let mut local_assets = state.local_assets.lock().await;
+        local_assets.path_for(&asset_token)
+    }
+    .ok_or(ApiError::NotFound("local image asset not found"))?;
     let content_type = image_content_type(&path)
         .ok_or(ApiError::UnsupportedMediaType("unsupported media type"))?;
     let bytes = match tokio::fs::read(&path).await {
@@ -924,6 +930,7 @@ mod tests {
 
     use crate::{
         codex_rpc::{CodexAdapter, CodexRpcError, CodexThread, CodexTurn},
+        local_assets::LocalAssetRegistryConfig,
         pairing::PairingManager,
         protocol::{ApprovalDecision, SessionSnapshot, SessionStatus},
         storage::Storage,
@@ -1823,6 +1830,132 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn evicted_local_image_asset_returns_not_found_and_can_be_registered_again() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let first_path = PathBuf::from("/var/folders/first.png");
+        let second_path = PathBuf::from("/var/folders/second.png");
+        let adapter = Arc::new(RecordingAdapter::with_turns_by_thread(vec![
+            (
+                "thread-first",
+                vec![CodexTurn {
+                    id: Some("turn-first".to_string()),
+                    thread_id: Some("thread-first".to_string()),
+                    created_at: Some(1_725_000_000_000),
+                    updated_at: None,
+                    raw: json!({
+                        "items": [
+                            {
+                                "id": "item-first",
+                                "type": "userMessage",
+                                "content": [
+                                    {
+                                        "type": "localImage",
+                                        "path": first_path.to_string_lossy(),
+                                        "detail": null
+                                    }
+                                ]
+                            }
+                        ]
+                    }),
+                }],
+            ),
+            (
+                "thread-second",
+                vec![CodexTurn {
+                    id: Some("turn-second".to_string()),
+                    thread_id: Some("thread-second".to_string()),
+                    created_at: Some(1_725_000_000_001),
+                    updated_at: None,
+                    raw: json!({
+                        "items": [
+                            {
+                                "id": "item-second",
+                                "type": "userMessage",
+                                "content": [
+                                    {
+                                        "type": "localImage",
+                                        "path": second_path.to_string_lossy(),
+                                        "detail": null
+                                    }
+                                ]
+                            }
+                        ]
+                    }),
+                }],
+            ),
+        ]));
+        let registry = LocalAssetRegistry::with_config(LocalAssetRegistryConfig {
+            max_entries: 1,
+            ttl_ms: 60_000,
+        });
+        let app = build_router(
+            state
+                .with_local_asset_registry(registry)
+                .with_codex_adapter(adapter),
+        );
+
+        let first_src = first_asset_src(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/sessions/thread-first/events")
+                        .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("request succeeds"),
+        )
+        .await;
+        let second_src = first_asset_src(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/sessions/thread-second/events")
+                        .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("request succeeds"),
+        )
+        .await;
+        assert_ne!(first_src, second_src);
+
+        let evicted_asset_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&first_src)
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        assert_eq!(evicted_asset_response.status(), StatusCode::NOT_FOUND);
+
+        let first_src_after_eviction = first_asset_src(
+            app.oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-first/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds"),
+        )
+        .await;
+        assert_ne!(first_src, first_src_after_eviction);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn permission_denied_local_image_asset_returns_forbidden() {
@@ -2078,6 +2211,15 @@ mod tests {
         assert_eq!(body[0]["payload"]["text"], json!("published"));
     }
 
+    async fn first_asset_src(response: Response) -> String {
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        body[0]["payload"]["attachments"][0]["src"]
+            .as_str()
+            .expect("asset src is present")
+            .to_string()
+    }
+
     #[derive(Default)]
     struct RecordingAdapter {
         decisions: Arc<StdMutex<Vec<ApprovalDecision>>>,
@@ -2097,6 +2239,17 @@ mod tests {
         fn with_turns(thread_id: impl Into<String>, turns: Vec<CodexTurn>) -> Self {
             let mut turns_by_thread = StdHashMap::new();
             turns_by_thread.insert(thread_id.into(), turns);
+            Self {
+                turns: Arc::new(StdMutex::new(turns_by_thread)),
+                ..Self::default()
+            }
+        }
+
+        fn with_turns_by_thread(threads: Vec<(&'static str, Vec<CodexTurn>)>) -> Self {
+            let turns_by_thread = threads
+                .into_iter()
+                .map(|(thread_id, turns)| (thread_id.to_string(), turns))
+                .collect();
             Self {
                 turns: Arc::new(StdMutex::new(turns_by_thread)),
                 ..Self::default()
