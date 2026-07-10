@@ -33,7 +33,7 @@ npm run build
 npm run tauri:dev
 ```
 
-桌面壳当前是产品化 Mac App 的 scaffold：提供 ChatGPT/Codex 检测/启动、Bridge start/stop、手机配对链接、Quick Tunnel Beta、设备撤销和本地诊断入口。开发模式会自动向上定位仓库根目录，并默认读取：
+桌面壳当前是产品化 Mac App 的 scaffold：提供 ChatGPT/Codex 检测/启动、Bridge start/stop、手机配对二维码/链接、Quick Tunnel Beta、设备撤销和本地诊断入口。开发模式会自动向上定位仓库根目录，并默认读取：
 
 - `CODEX_MOBILE_BRIDGE_SIDECAR_BIN`，未设置时使用 `target/debug/bridge-sidecar`。
 - `CODEX_MOBILE_BRIDGE_PWA_DIR`，未设置时使用 `apps/mobile-pwa/dist`。

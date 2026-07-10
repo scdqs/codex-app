@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import QRCode from "qrcode";
 import "./styles.css";
 
 type BridgeSnapshot = {
@@ -57,6 +58,9 @@ let status: ShellStatus | null = null;
 let codexOutcome: CodexOutcome | null = null;
 let devices: Device[] = [];
 let diagnostics: Diagnostics | null = null;
+let pairingQrLink: string | null = null;
+let pairingQrDataUrl = "";
+let pairingQrError = "";
 let busy = false;
 let notice = "";
 let errorText = "";
@@ -108,6 +112,7 @@ async function refresh(showErrors = true) {
 }
 
 function render() {
+  syncPairingQr();
   const bridge = status?.bridge;
   const tunnel = status?.tunnel;
   app.innerHTML = `
@@ -227,9 +232,59 @@ function renderPairingLink() {
     return `<p class="muted">启动 Bridge 后生成手机配对链接。链接为一次性入口。</p>`;
   }
   return `
-    <p class="link-box">${escapeHtml(pairingLink)}</p>
-    <button data-action="copy-pairing">复制链接</button>
+    <div class="pairing-card">
+      <div class="qr-frame">
+        ${
+          pairingQrDataUrl
+            ? `<img class="qr-code" src="${escapeHtml(pairingQrDataUrl)}" alt="手机配对二维码" />`
+            : `<span class="qr-placeholder">${pairingQrError ? "二维码生成失败" : "生成中"}</span>`
+        }
+      </div>
+      <div class="pairing-details">
+        <p class="link-box">${escapeHtml(pairingLink)}</p>
+        <button data-action="copy-pairing">复制链接</button>
+      </div>
+    </div>
   `;
+}
+
+function syncPairingQr() {
+  const pairingLink = status?.lastPairingLink ?? null;
+  if (pairingLink === pairingQrLink) {
+    return;
+  }
+
+  pairingQrLink = pairingLink;
+  pairingQrDataUrl = "";
+  pairingQrError = "";
+
+  if (!pairingLink) {
+    return;
+  }
+
+  QRCode.toDataURL(pairingLink, {
+    errorCorrectionLevel: "M",
+    margin: 1,
+    width: 192,
+    color: {
+      dark: "#172026",
+      light: "#ffffff",
+    },
+  })
+    .then((dataUrl) => {
+      if (pairingQrLink !== pairingLink) {
+        return;
+      }
+      pairingQrDataUrl = dataUrl;
+      render();
+    })
+    .catch((error: unknown) => {
+      if (pairingQrLink !== pairingLink) {
+        return;
+      }
+      pairingQrError = error instanceof Error ? error.message : String(error);
+      render();
+    });
 }
 
 function renderTunnel(tunnel?: TunnelSnapshot) {

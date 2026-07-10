@@ -182,6 +182,42 @@ pre {
   padding: 10px;
 }
 
+.pairing-card {
+  align-items: start;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: 156px minmax(0, 1fr);
+}
+
+.qr-frame {
+  align-items: center;
+  aspect-ratio: 1;
+  background: #ffffff;
+  border: 1px solid #d7dfdc;
+  border-radius: 8px;
+  display: flex;
+  justify-content: center;
+  padding: 10px;
+  width: 156px;
+}
+
+.qr-code {
+  display: block;
+  height: 100%;
+  image-rendering: pixelated;
+  width: 100%;
+}
+
+.qr-placeholder {
+  color: #66736f;
+  font-size: 13px;
+  text-align: center;
+}
+
+.pairing-details {
+  min-width: 0;
+}
+
 pre {
   max-height: 220px;
   overflow: auto;
