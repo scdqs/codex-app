@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   isServerEnvelope,
+  isApiErrorCode,
   isSessionDataEnabled,
   isSessionEventType,
   isSessionStatus,
+  isWorkspaceOption,
   mapHealthToConnection,
   parseServerEnvelope,
   secondaryStatusText,
@@ -42,6 +44,15 @@ describe("shared bridge protocol", () => {
     expect(isSessionStatus("error")).toBe(true);
     expect(isSessionEventType("message_delta")).toBe(true);
     expect(isSessionEventType("approval_requested")).toBe(true);
+  });
+
+  it("accepts Rust-compatible workspace options and API error codes", () => {
+    expect(isWorkspaceOption({ cwd: "/Users/damon/Documents/my_ai/codex-app" })).toBe(true);
+    expect(isWorkspaceOption({ cwd: 42 })).toBe(false);
+    expect(isApiErrorCode("workspace_required")).toBe(true);
+    expect(isApiErrorCode("workspace_not_allowed")).toBe(true);
+    expect(isApiErrorCode("invalid_pairing_token")).toBe(true);
+    expect(isApiErrorCode("unknown_error")).toBe(false);
   });
 
   it("maps bridge health states to shared user-facing connection states", () => {

@@ -7,6 +7,7 @@ import {
   fetchAssetBlob,
   listApprovals,
   listSessionEvents,
+  listWorkspaces,
   readPairingPayloadFromUrl,
   sendTextMessage,
 } from "./api";
@@ -240,7 +241,12 @@ describe("pairing API helpers", () => {
       }),
     );
 
-    const snapshot = await createSession("http://bridge.local", "session-1", "Start from phone");
+    const snapshot = await createSession(
+      "http://bridge.local",
+      "session-1",
+      "Start from phone",
+      "/Users/damon/Documents/my_ai/codex-app",
+    );
 
     expect(snapshot).toEqual({
       threadId: "thread-new",
@@ -256,7 +262,74 @@ describe("pairing API helpers", () => {
         Authorization: "Bearer session-1",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ text: "Start from phone" }),
+      body: JSON.stringify({
+        text: "Start from phone",
+        cwd: "/Users/damon/Documents/my_ai/codex-app",
+      }),
+    });
+  });
+
+  it("listWorkspaces_fetches_and_validates_workspace_options", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse([
+        { cwd: "/Users/damon/Documents/my_ai/codex-app" },
+        { cwd: "/Users/damon/Documents/my_ai/other-project" },
+      ]),
+    );
+
+    await expect(listWorkspaces("http://bridge.local", "session-1")).resolves.toEqual([
+      { cwd: "/Users/damon/Documents/my_ai/codex-app" },
+      { cwd: "/Users/damon/Documents/my_ai/other-project" },
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith("http://bridge.local/api/workspaces", {
+      headers: { Authorization: "Bearer session-1" },
+    });
+  });
+
+  it("listWorkspaces_rejects_malformed_workspace_options", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse([{ cwd: 42 }]));
+
+    await expect(listWorkspaces("http://bridge.local", "session-1")).rejects.toBeInstanceOf(
+      ApiValidationError,
+    );
+  });
+
+  it("createSession_preserves_structured_workspace_error_code", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(
+        { code: "workspace_not_allowed", error: "workspace is not allowed" },
+        400,
+      ),
+    );
+
+    await expect(
+      createSession("http://bridge.local", "session-1", "Start from phone", "/tmp/tampered"),
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "workspace_not_allowed",
+      message: "workspace is not allowed",
+    });
+  });
+
+  it("completePairing_preserves_structured_pairing_error_code", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse(
+        { code: "invalid_pairing_token", error: "invalid pairing token" },
+        400,
+      ),
+    );
+
+    await expect(
+      completePairing("http://bridge.local", {
+        pairingToken: "pair-1",
+        deviceId: "device-1",
+        displayName: "Damon Phone",
+        deviceSecret: "secret-1",
+      }),
+    ).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_pairing_token",
+      message: "invalid pairing token",
     });
   });
 

@@ -1028,7 +1028,64 @@ h3 {
 .new-session-form {
   display: grid;
   gap: 10px;
+  overflow-y: auto;
   padding: 12px 12px calc(12px + var(--safe-bottom));
+}
+
+.new-session-workspace-field {
+  display: grid;
+  gap: 6px;
+}
+
+.new-session-workspace-field > label {
+  color: var(--text-soft);
+  font-size: 0.76rem;
+  font-weight: 700;
+}
+
+.new-session-workspace-field select {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  outline: none;
+  padding: 0 36px 0 10px;
+  background: var(--surface-subtle);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.84rem;
+}
+
+.new-session-workspace-field select:focus {
+  border-color: rgb(66 184 155 / 55%);
+  box-shadow: 0 0 0 3px rgb(47 143 123 / 18%);
+}
+
+.new-session-workspace-field select:disabled {
+  cursor: wait;
+  color: var(--text-soft);
+}
+
+.workspace-empty-state,
+.workspace-loading-state {
+  min-height: 42px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 10px;
+  background: var(--surface-subtle);
+  color: var(--text-soft);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.workspace-loading-state {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.workspace-loading-state svg {
+  animation: workspace-loading-spin 0.9s linear infinite;
 }
 
 .new-session-form textarea {
@@ -1051,6 +1108,13 @@ h3 {
   box-shadow: 0 0 0 3px rgb(47 143 123 / 18%);
 }
 
+.new-session-message-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: end;
+  gap: 10px;
+}
+
 .sheet-error {
   display: flex;
   align-items: flex-start;
@@ -1062,6 +1126,41 @@ h3 {
   color: #f0aaa5;
   font-size: 0.8rem;
   line-height: 1.35;
+}
+
+.workspace-error {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.workspace-error > span,
+.workspace-error > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.workspace-error > button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  border: 1px solid rgb(211 93 85 / 36%);
+  border-radius: 6px;
+  padding: 0 9px;
+  background: rgb(12 17 20 / 28%);
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+}
+
+.workspace-error > button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+@keyframes workspace-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .create-session-button {
@@ -1219,6 +1318,13 @@ h3 {
     color: #bcebdd;
     font-size: 0.78rem;
     font-weight: 740;
+  }
+
+  .drawer-new-button:disabled {
+    cursor: not-allowed;
+    border-color: var(--border-strong);
+    background: var(--surface-strong);
+    color: #69747d;
   }
 
   .drawer-heading-actions > span {

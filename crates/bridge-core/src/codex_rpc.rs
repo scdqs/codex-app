@@ -15,6 +15,7 @@ pub trait CodexAdapter: Send + Sync {
     async fn list_threads(&self) -> Result<Vec<CodexThread>, CodexRpcError>;
     async fn start_thread(
         &self,
+        cwd: &str,
         text: &str,
         attachments: &[UserImageAttachment],
     ) -> Result<CodexThread, CodexRpcError>;
@@ -288,6 +289,7 @@ where
 
     async fn start_thread(
         &self,
+        cwd: &str,
         text: &str,
         attachments: &[UserImageAttachment],
     ) -> Result<CodexThread, CodexRpcError> {
@@ -296,8 +298,8 @@ where
                 "codex-mobile/start-conversation",
                 json!({
                     "input": host_conversation_input(text, attachments),
-                    "cwd": "/",
-                    "workspaceRoots": ["/"],
+                    "cwd": cwd,
+                    "workspaceRoots": [cwd],
                     "workspaceKind": "project",
                     "collaborationMode": null,
                     "serviceTier": null,
@@ -743,7 +745,7 @@ mod tests {
             "thread": {
                 "id": "thread-new",
                 "title": "New mobile task",
-                "cwd": "/",
+                "cwd": "/repo/mobile",
                 "updatedAt": 1_725_000_000_000_u64
             }
         })]);
@@ -752,6 +754,7 @@ mod tests {
 
         let thread = client
             .start_thread(
+                "/repo/mobile",
                 "start this from phone",
                 &[UserImageAttachment {
                     path: "/tmp/codex-mobile/image-1.png".to_string(),
@@ -772,8 +775,8 @@ mod tests {
                     { "type": "text", "text": "start this from phone", "text_elements": [] },
                     { "type": "localImage", "path": "/tmp/codex-mobile/image-1.png" }
                 ],
-                "cwd": "/",
-                "workspaceRoots": ["/"],
+                "cwd": "/repo/mobile",
+                "workspaceRoots": ["/repo/mobile"],
                 "workspaceKind": "project",
                 "collaborationMode": null,
                 "serviceTier": null,
@@ -793,7 +796,7 @@ mod tests {
         let client = AppServerJsonRpcClient::new(transport);
 
         let thread = client
-            .start_thread("phone task", &[])
+            .start_thread("/repo", "phone task", &[])
             .await
             .expect("thread starts");
 
@@ -813,7 +816,7 @@ mod tests {
         let client = AppServerJsonRpcClient::new(transport);
 
         let thread = client
-            .start_thread("phone task", &[])
+            .start_thread("/repo", "phone task", &[])
             .await
             .expect("thread starts");
 

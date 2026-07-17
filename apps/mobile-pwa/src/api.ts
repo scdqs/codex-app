@@ -1,14 +1,18 @@
 import type { DeviceSession } from "./storage";
 import {
   isApprovalRequest,
+  isApiErrorCode,
   isJsonValue,
   isSessionEventType,
   isSessionStatus,
+  isWorkspaceOption,
+  type ApiErrorCode,
   type BridgeHealth,
   type ApprovalRequest,
   type DecisionKind,
   type SessionEvent,
   type SessionSnapshot,
+  type WorkspaceOption,
 } from "@codex/bridge-protocol";
 
 export interface PairingPayload {
@@ -92,7 +96,7 @@ export async function getHealth(bridgeUrl: string, sessionToken?: string): Promi
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status, `Health request failed with ${response.status}`);
+    throw await apiErrorFromResponse(response, `Health request failed with ${response.status}`);
   }
 
   return (await response.json()) as HealthResponse;
@@ -107,10 +111,25 @@ export async function listSessions(
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status, `Sessions request failed with ${response.status}`);
+    throw await apiErrorFromResponse(response, `Sessions request failed with ${response.status}`);
   }
 
   return parseSessionSnapshots(await response.json());
+}
+
+export async function listWorkspaces(
+  bridgeUrl: string,
+  sessionToken: string,
+): Promise<WorkspaceOption[]> {
+  const response = await fetch(apiUrl(bridgeUrl, "/api/workspaces"), {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+  });
+
+  if (!response.ok) {
+    throw await apiErrorFromResponse(response, `Workspaces request failed with ${response.status}`);
+  }
+
+  return parseWorkspaceOptions(await response.json());
 }
 
 export async function listApprovals(
@@ -122,7 +141,7 @@ export async function listApprovals(
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status, `Approvals request failed with ${response.status}`);
+    throw await apiErrorFromResponse(response, `Approvals request failed with ${response.status}`);
   }
 
   return parseApprovalRequests(await response.json());
@@ -149,7 +168,7 @@ export async function listSessionEvents(
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status, `Session events request failed with ${response.status}`);
+    throw await apiErrorFromResponse(response, `Session events request failed with ${response.status}`);
   }
 
   return parseSessionEventPage(await response.json());
@@ -159,6 +178,7 @@ export async function createSession(
   bridgeUrl: string,
   sessionToken: string,
   text: string,
+  cwd: string,
   attachments: OutgoingImageAttachment[] = [],
 ): Promise<SessionSnapshot> {
   const response = await fetch(apiUrl(bridgeUrl, "/api/sessions"), {
@@ -167,11 +187,11 @@ export async function createSession(
       Authorization: `Bearer ${sessionToken}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(messageBody(text, attachments)),
+    body: JSON.stringify({ ...messageBody(text, attachments), cwd }),
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status, `Create session request failed with ${response.status}`);
+    throw await apiErrorFromResponse(response, `Create session request failed with ${response.status}`);
   }
 
   return parseSessionSnapshot(await response.json());
@@ -192,7 +212,7 @@ export async function fetchAssetBlob(
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status, `Asset request failed with ${response.status}`);
+    throw await apiErrorFromResponse(response, `Asset request failed with ${response.status}`);
   }
 
   const contentType = response.headers.get("Content-Type") || "";
@@ -267,9 +287,8 @@ export async function sendTextMessage(
       return;
     }
 
-    const apiError = new ApiError(response.status, `Send message request failed with ${response.status}`);
     if (attempt === SEND_MESSAGE_RETRY_DELAYS_MS.length || !isTransientSendStatus(response.status)) {
-      throw apiError;
+      throw await apiErrorFromResponse(response, `Send message request failed with ${response.status}`);
     }
     await waitForRetry(SEND_MESSAGE_RETRY_DELAYS_MS[attempt]);
   }
@@ -308,7 +327,7 @@ export async function decideApproval(
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status, `Approval decision request failed with ${response.status}`);
+    throw await apiErrorFromResponse(response, `Approval decision request failed with ${response.status}`);
   }
 }
 
@@ -323,10 +342,33 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly code?: ApiErrorCode,
   ) {
     super(message);
     this.name = "ApiError";
   }
+}
+
+async function apiErrorFromResponse(response: Response, fallbackMessage: string): Promise<ApiError> {
+  let message = fallbackMessage;
+  let code: ApiErrorCode | undefined;
+
+  try {
+    const payload = (await response.json()) as unknown;
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+      const errorPayload = payload as Record<string, unknown>;
+      if (typeof errorPayload.error === "string" && errorPayload.error.trim()) {
+        message = errorPayload.error;
+      }
+      if (isApiErrorCode(errorPayload.code)) {
+        code = errorPayload.code;
+      }
+    }
+  } catch {
+    // Older bridge builds may return an empty or non-JSON error body.
+  }
+
+  return new ApiError(response.status, message, code);
 }
 
 export class ApiValidationError extends Error {
@@ -349,7 +391,7 @@ async function postJson<T>(
   });
 
   if (!response.ok) {
-    throw new ApiError(response.status, `Request failed with ${response.status}`);
+    throw await apiErrorFromResponse(response, `Request failed with ${response.status}`);
   }
 
   return parse(await response.json());
@@ -386,6 +428,18 @@ function parseSessionSnapshots(value: unknown): SessionSnapshot[] {
     throw new ApiValidationError("Sessions response must be an array");
   }
   return value.map(parseSessionSnapshot);
+}
+
+function parseWorkspaceOptions(value: unknown): WorkspaceOption[] {
+  if (!Array.isArray(value)) {
+    throw new ApiValidationError("Workspaces response must be an array");
+  }
+  return value.map((workspace) => {
+    if (!isWorkspaceOption(workspace)) {
+      throw new ApiValidationError("Workspace response is missing required fields");
+    }
+    return workspace;
+  });
 }
 
 function parseApprovalRequests(value: unknown): ApprovalRequest[] {

@@ -23,6 +23,7 @@ import {
   ImagePlus,
   Menu,
   Plus,
+  RefreshCw,
   Send,
   ShieldAlert,
   TerminalSquare,
@@ -44,6 +45,7 @@ import {
   type ServerEnvelope,
   type SessionEvent,
   type SessionSnapshot,
+  type WorkspaceOption,
 } from "@codex/bridge-protocol";
 import {
   ApiError,
@@ -56,6 +58,7 @@ import {
   listApprovals,
   listSessionEvents,
   listSessions,
+  listWorkspaces,
   readPairingPayloadFromUrl,
   refreshSession,
   sendTextMessage,
@@ -96,6 +99,11 @@ interface SessionEventSyncState {
   loadingOlder: boolean;
 }
 
+interface RefreshedDeviceSession {
+  session: DeviceSession;
+  health: HealthResponse;
+}
+
 function App() {
   const [selectedThreadId, setSelectedThreadId] = useState("");
   const [draft, setDraft] = useState("");
@@ -105,7 +113,13 @@ function App() {
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false);
   const [isNewSessionSheetOpen, setIsNewSessionSheetOpen] = useState(false);
   const [newSessionDraft, setNewSessionDraft] = useState("");
+  const [newSessionImages, setNewSessionImages] = useState<DraftImageAttachment[]>([]);
+  const [newSessionAttachmentError, setNewSessionAttachmentError] = useState("");
   const [newSessionError, setNewSessionError] = useState("");
+  const [newSessionWorkspaces, setNewSessionWorkspaces] = useState<WorkspaceOption[] | null>(null);
+  const [newSessionWorkspaceCwd, setNewSessionWorkspaceCwd] = useState("");
+  const [newSessionWorkspaceError, setNewSessionWorkspaceError] = useState("");
+  const [newSessionWorkspacesLoading, setNewSessionWorkspacesLoading] = useState(false);
   const [connection, setConnection] = useState<ConnectionViewState>({ label: "Unpaired" });
   const [bridgeVersion, setBridgeVersion] = useState<string | null>(null);
   const [deviceSession, setDeviceSession] = useState<DeviceSession | null>(null);
@@ -117,11 +131,14 @@ function App() {
   const [sending, setSending] = useState(false);
   const [decidingApprovalIds, setDecidingApprovalIds] = useState<Record<string, DecisionKind>>({});
   const sessionMenuButtonRef = useRef<HTMLButtonElement | null>(null);
-  const sessionRefreshPromiseRef = useRef<Promise<DeviceSession> | null>(null);
+  const sessionRefreshPromiseRef = useRef<Promise<RefreshedDeviceSession> | null>(null);
+  const workspaceLoadRequestRef = useRef(0);
+  const createSessionRequestRef = useRef(false);
   const sessionListFailureCountRef = useRef(0);
   const sessionEventsFailureCountRef = useRef(0);
   const eventSyncByThreadRef = useRef<Record<string, SessionEventSyncState>>({});
   const draftImagesRef = useRef<DraftImageAttachment[]>([]);
+  const newSessionImagesRef = useRef<DraftImageAttachment[]>([]);
   const canSyncSessionData =
     Boolean(deviceSession) && (isSessionDataEnabled(connection.label) || connection.label === "Connection error");
   const sessionDataLoaded = liveSessions !== null;
@@ -135,7 +152,10 @@ function App() {
   const selectedEventSync = selectedSession ? eventSyncByThread[selectedSession.threadId] : undefined;
   const pendingCount = approvals.length;
   const canSend = (connection.label === "Connected" || connection.label === "Writable") && Boolean(deviceSession) && Boolean(selectedSession);
-  const canCreateSession = (connection.label === "Connected" || connection.label === "Writable") && Boolean(deviceSession);
+  const canCreateSession =
+    (connection.label === "Connected" || connection.label === "Writable") &&
+    Boolean(deviceSession) &&
+    sessionDataLoaded;
 
   const statusText = useMemo(() => {
     if (pendingCount > 0) {
@@ -149,7 +169,7 @@ function App() {
     setConnection(mapHealthToConnection(health));
   }
 
-  async function refreshActiveSession(activeSession: DeviceSession): Promise<DeviceSession> {
+  async function refreshActiveSession(activeSession: DeviceSession): Promise<RefreshedDeviceSession> {
     if (!sessionRefreshPromiseRef.current) {
       setConnection({ label: "Pairing", detail: "Refreshing session" });
       sessionRefreshPromiseRef.current = (async () => {
@@ -170,13 +190,42 @@ function App() {
           return nextSession;
         });
         applyHealth(health);
-        return nextSession;
-      })().finally(() => {
-        sessionRefreshPromiseRef.current = null;
-      });
+        return { session: nextSession, health };
+      })()
+        .catch((error) => {
+          setConnection(connectionStateForError(error, 1));
+          throw error;
+        })
+        .finally(() => {
+          sessionRefreshPromiseRef.current = null;
+        });
     }
 
     return sessionRefreshPromiseRef.current;
+  }
+
+  async function withSessionRefresh<T>(
+    session: DeviceSession,
+    request: (activeSession: DeviceSession) => Promise<T>,
+    options: { requireWritable?: boolean } = {},
+  ): Promise<T> {
+    try {
+      return await request(session);
+    } catch (error) {
+      if (!isAuthError(error)) {
+        throw error;
+      }
+      const refreshed = await refreshActiveSession(session);
+      const refreshedConnection = mapHealthToConnection(refreshed.health);
+      if (
+        options.requireWritable &&
+        refreshedConnection.label !== "Connected" &&
+        refreshedConnection.label !== "Writable"
+      ) {
+        throw new ApiError(409, "Bridge is not writable after session refresh");
+      }
+      return request(refreshed.session);
+    }
   }
 
   function markSessionDataRecovered() {
@@ -209,25 +258,14 @@ function App() {
     activeThreadId: string,
     options: SessionEventPageOptions,
   ): Promise<SessionEventPage> {
-    try {
-      return await listSessionEvents(
-        session.bridgeUrl,
-        session.sessionToken,
+    return withSessionRefresh(session, (activeSession) =>
+      listSessionEvents(
+        activeSession.bridgeUrl,
+        activeSession.sessionToken,
         activeThreadId,
         options,
-      );
-    } catch (error) {
-      if (!isAuthError(error)) {
-        throw error;
-      }
-      const refreshedSession = await refreshActiveSession(session);
-      return listSessionEvents(
-        refreshedSession.bridgeUrl,
-        refreshedSession.sessionToken,
-        activeThreadId,
-        options,
-      );
-    }
+      ),
+    );
   }
 
   useEffect(() => {
@@ -251,8 +289,9 @@ function App() {
             }
             return;
           } catch (error) {
-            if (!savedSession || !isPairingTokenError(error)) {
-              throw error;
+            const pairingError = normalizePairingFlowError(error);
+            if (!savedSession || !isPairingTokenError(pairingError)) {
+              throw pairingError;
             }
             clearPairingParamsFromUrl();
           }
@@ -329,8 +368,12 @@ function App() {
       loading = true;
       try {
         const [items, polledApprovals] = await Promise.all([
-          listSessionsWithRefresh(activeSession),
-          listApprovalsWithRefresh(activeSession).catch(() => null),
+          withSessionRefresh(activeSession, (session) =>
+            listSessions(session.bridgeUrl, session.sessionToken),
+          ),
+          withSessionRefresh(activeSession, (session) =>
+            listApprovals(session.bridgeUrl, session.sessionToken),
+          ).catch(() => null),
         ]);
         if (cancelled) {
           return;
@@ -357,30 +400,6 @@ function App() {
       } finally {
         loading = false;
         scheduleNextSessionListLoad();
-      }
-    }
-
-    async function listSessionsWithRefresh(session: DeviceSession): Promise<SessionSnapshot[]> {
-      try {
-        return await listSessions(session.bridgeUrl, session.sessionToken);
-      } catch (error) {
-        if (!isAuthError(error)) {
-          throw error;
-        }
-        const refreshedSession = await refreshActiveSession(session);
-        return listSessions(refreshedSession.bridgeUrl, refreshedSession.sessionToken);
-      }
-    }
-
-    async function listApprovalsWithRefresh(session: DeviceSession): Promise<ApprovalRequest[]> {
-      try {
-        return await listApprovals(session.bridgeUrl, session.sessionToken);
-      } catch (error) {
-        if (!isAuthError(error)) {
-          throw error;
-        }
-        const refreshedSession = await refreshActiveSession(session);
-        return listApprovals(refreshedSession.bridgeUrl, refreshedSession.sessionToken);
       }
     }
 
@@ -560,8 +579,12 @@ function App() {
   }, [draftImages]);
 
   useEffect(() => {
+    newSessionImagesRef.current = newSessionImages;
+  }, [newSessionImages]);
+
+  useEffect(() => {
     return () => {
-      for (const image of draftImagesRef.current) {
+      for (const image of [...draftImagesRef.current, ...newSessionImagesRef.current]) {
         URL.revokeObjectURL(image.previewUrl);
       }
     };
@@ -626,15 +649,36 @@ function App() {
     }
   }
 
-  async function createSessionWithRefresh(session: DeviceSession, text: string): Promise<SessionSnapshot> {
+  async function loadNewSessionWorkspaces(
+    session: DeviceSession,
+    preferredCwd = selectedSession?.cwd,
+  ): Promise<void> {
+    const requestId = workspaceLoadRequestRef.current + 1;
+    workspaceLoadRequestRef.current = requestId;
+    setNewSessionWorkspaceError("");
+    setNewSessionWorkspacesLoading(true);
+
     try {
-      return await createSession(session.bridgeUrl, session.sessionToken, text);
-    } catch (error) {
-      if (!isAuthError(error)) {
-        throw error;
+      const workspaces = await withSessionRefresh(session, (activeSession) =>
+        listWorkspaces(activeSession.bridgeUrl, activeSession.sessionToken),
+      );
+      if (workspaceLoadRequestRef.current !== requestId) {
+        return;
       }
-      const refreshedSession = await refreshActiveSession(session);
-      return createSession(refreshedSession.bridgeUrl, refreshedSession.sessionToken, text);
+      setNewSessionError("");
+      setNewSessionWorkspaces(workspaces);
+      setNewSessionWorkspaceCwd((current) =>
+        selectNewSessionWorkspace(workspaces, current, preferredCwd),
+      );
+    } catch (error) {
+      if (workspaceLoadRequestRef.current === requestId) {
+        setNewSessionWorkspaces(null);
+        setNewSessionWorkspaceError(connectionErrorText(error));
+      }
+    } finally {
+      if (workspaceLoadRequestRef.current === requestId) {
+        setNewSessionWorkspacesLoading(false);
+      }
     }
   }
 
@@ -642,14 +686,48 @@ function App() {
     event.preventDefault();
     const activeSession = deviceSession;
     const text = newSessionDraft.trim();
-    if (!activeSession || !canCreateSession || sending || !text) {
+    const images = newSessionImages;
+    const cwd = newSessionWorkspaceCwd;
+    if (
+      !activeSession ||
+      !canCreateSession ||
+      sending ||
+      createSessionRequestRef.current ||
+      (!text && images.length === 0) ||
+      !cwd ||
+      newSessionWorkspacesLoading ||
+      newSessionWorkspaceError
+    ) {
       return;
     }
 
+    createSessionRequestRef.current = true;
     setSending(true);
+    setNewSessionAttachmentError("");
     setNewSessionError("");
+    let outgoingAttachments: OutgoingImageAttachment[];
     try {
-      const snapshot = await createSessionWithRefresh(activeSession, text);
+      outgoingAttachments = await draftImagesToOutgoingAttachments(images);
+    } catch (error) {
+      setNewSessionAttachmentError(
+        error instanceof Error ? error.message : "Unable to read image attachment",
+      );
+      createSessionRequestRef.current = false;
+      setSending(false);
+      return;
+    }
+
+    try {
+      const snapshot = await withSessionRefresh(activeSession, (session) =>
+        createSession(
+          session.bridgeUrl,
+          session.sessionToken,
+          text,
+          cwd,
+          outgoingAttachments,
+        ),
+        { requireWritable: true },
+      );
       setLiveSessions((current) => sortSessions(upsertSession(current ?? [], snapshot)));
       setSelectedThreadId(snapshot.threadId);
       setEventsByThread((current) => {
@@ -668,11 +746,16 @@ function App() {
         };
       });
       setNewSessionDraft("");
+      clearNewSessionImages();
       setIsNewSessionSheetOpen(false);
       markSessionDataRecovered();
     } catch (error) {
       setNewSessionError(connectionErrorText(error));
+      if (isWorkspaceError(error)) {
+        void loadNewSessionWorkspaces(activeSession);
+      }
     } finally {
+      createSessionRequestRef.current = false;
       setSending(false);
     }
   }
@@ -724,14 +807,35 @@ function App() {
   }
 
   function handleOpenNewSession() {
+    if (!canCreateSession) {
+      return;
+    }
     setNewSessionError("");
+    setNewSessionWorkspaces(null);
+    setNewSessionWorkspaceCwd("");
+    setNewSessionWorkspaceError("");
     setIsSessionDrawerOpen(false);
     setIsNewSessionSheetOpen(true);
+    if (deviceSession) {
+      void loadNewSessionWorkspaces(deviceSession, selectedSession?.cwd);
+    }
   }
 
   function handleCloseNewSession() {
     if (!sending) {
+      workspaceLoadRequestRef.current += 1;
       setIsNewSessionSheetOpen(false);
+    }
+  }
+
+  function handleNewSessionWorkspaceChange(cwd: string) {
+    setNewSessionWorkspaceCwd(cwd);
+    setNewSessionError("");
+  }
+
+  function handleRetryNewSessionWorkspaces() {
+    if (deviceSession && !newSessionWorkspacesLoading) {
+      void loadNewSessionWorkspaces(deviceSession, selectedSession?.cwd);
     }
   }
 
@@ -746,50 +850,25 @@ function App() {
   }
 
   function handleAttachDraftImages(files: FileList) {
-    const incoming = Array.from(files);
-    if (incoming.length === 0) {
-      return;
-    }
-
-    const next = [...draftImages];
-    let rejected = "";
-
-    for (const file of incoming) {
-      if (next.length >= MAX_DRAFT_IMAGE_ATTACHMENTS) {
-        rejected = `Up to ${MAX_DRAFT_IMAGE_ATTACHMENTS} images per message`;
-        break;
-      }
-      if (!SUPPORTED_DRAFT_IMAGE_TYPES.has(file.type)) {
-        rejected = "Only PNG, JPEG, GIF, or WebP images are supported";
-        continue;
-      }
-      if (file.size > MAX_DRAFT_IMAGE_BYTES) {
-        rejected = "Image must be 8 MB or smaller";
-        continue;
-      }
-      next.push({
-        id: draftImageId(),
-        file,
-        name: file.name || "image",
-        mimeType: file.type,
-        previewUrl: URL.createObjectURL(file),
-        size: file.size,
-      });
-    }
-
-    setDraftAttachmentError(rejected);
-    setDraftImages(next);
+    const next = appendDraftImageFiles(draftImages, files);
+    setDraftAttachmentError(next.error);
+    setDraftImages(next.images);
   }
 
   function handleRemoveDraftImage(id: string) {
-    setDraftImages((current) => {
-      const removed = current.find((image) => image.id === id);
-      if (removed) {
-        URL.revokeObjectURL(removed.previewUrl);
-      }
-      return current.filter((image) => image.id !== id);
-    });
+    setDraftImages((current) => removeDraftImage(current, id));
     setDraftAttachmentError("");
+  }
+
+  function handleAttachNewSessionImages(files: FileList) {
+    const next = appendDraftImageFiles(newSessionImages, files);
+    setNewSessionAttachmentError(next.error);
+    setNewSessionImages(next.images);
+  }
+
+  function handleRemoveNewSessionImage(id: string) {
+    setNewSessionImages((current) => removeDraftImage(current, id));
+    setNewSessionAttachmentError("");
   }
 
   async function handleLoadOlderEvents(threadId: string): Promise<boolean> {
@@ -848,6 +927,16 @@ function App() {
     });
   }
 
+  function clearNewSessionImages() {
+    setNewSessionImages((current) => {
+      for (const image of current) {
+        URL.revokeObjectURL(image.previewUrl);
+      }
+      return [];
+    });
+    setNewSessionAttachmentError("");
+  }
+
   return (
     <main className="app-shell" aria-label="Codex mobile workbench">
       <ConnectionBar
@@ -895,6 +984,7 @@ function App() {
 
       <SessionDrawer
         isOpen={isSessionDrawerOpen}
+        newSessionDisabled={!canCreateSession || sending}
         onCreateSession={handleOpenNewSession}
         sessions={sessions}
         selectedThreadId={selectedSession?.threadId ?? ""}
@@ -903,14 +993,24 @@ function App() {
       />
 
       <NewSessionSheet
+        attachments={newSessionImages}
+        attachmentError={newSessionAttachmentError}
         disabled={!canCreateSession || sending}
         draft={newSessionDraft}
         error={newSessionError}
         isOpen={isNewSessionSheetOpen}
         onClose={handleCloseNewSession}
+        onAttachFiles={handleAttachNewSessionImages}
         onDraftChange={setNewSessionDraft}
+        onRemoveAttachment={handleRemoveNewSessionImage}
+        onRetryWorkspaces={handleRetryNewSessionWorkspaces}
         onSubmit={handleCreateSession}
+        onWorkspaceChange={handleNewSessionWorkspaceChange}
         submitting={sending}
+        workspaceCwd={newSessionWorkspaceCwd}
+        workspaceError={newSessionWorkspaceError}
+        workspaces={newSessionWorkspaces}
+        workspacesLoading={newSessionWorkspacesLoading}
       />
 
       <Composer
@@ -1062,6 +1162,7 @@ function ApprovalQueue({
 
 function SessionDrawer({
   isOpen,
+  newSessionDisabled,
   onClose,
   onCreateSession,
   onSelect,
@@ -1069,6 +1170,7 @@ function SessionDrawer({
   sessions,
 }: {
   isOpen: boolean;
+  newSessionDisabled: boolean;
   onClose: () => void;
   onCreateSession: () => void;
   onSelect: (threadId: string) => void;
@@ -1113,7 +1215,12 @@ function SessionDrawer({
         <div className="drawer-heading">
           <h2>Sessions</h2>
           <div className="drawer-heading-actions">
-            <button className="drawer-new-button" onClick={onCreateSession} type="button">
+            <button
+              className="drawer-new-button"
+              disabled={newSessionDisabled}
+              onClick={onCreateSession}
+              type="button"
+            >
               <Plus size={14} aria-hidden="true" />
               New
             </button>
@@ -1130,23 +1237,43 @@ function SessionDrawer({
 }
 
 function NewSessionSheet({
+  attachments,
+  attachmentError,
   disabled,
   draft,
   error,
   isOpen,
   onClose,
+  onAttachFiles,
   onDraftChange,
+  onRemoveAttachment,
+  onRetryWorkspaces,
   onSubmit,
+  onWorkspaceChange,
   submitting,
+  workspaceCwd,
+  workspaceError,
+  workspaces,
+  workspacesLoading,
 }: {
+  attachments: DraftImageAttachment[];
+  attachmentError: string;
   disabled: boolean;
   draft: string;
   error: string;
   isOpen: boolean;
   onClose: () => void;
+  onAttachFiles: (files: FileList) => void;
   onDraftChange: (value: string) => void;
+  onRemoveAttachment: (id: string) => void;
+  onRetryWorkspaces: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onWorkspaceChange: (cwd: string) => void;
   submitting: boolean;
+  workspaceCwd: string;
+  workspaceError: string;
+  workspaces: WorkspaceOption[] | null;
+  workspacesLoading: boolean;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -1193,24 +1320,90 @@ function NewSessionSheet({
           </button>
         </div>
         <form className="new-session-form" onSubmit={onSubmit}>
+          <div className="new-session-workspace-field">
+            <label htmlFor="new-session-workspace">Workspace</label>
+            {workspaces ? (
+              workspaces.length > 0 ? (
+                <select
+                  disabled={workspacesLoading || submitting}
+                  id="new-session-workspace"
+                  onChange={(event) => onWorkspaceChange(event.target.value)}
+                  value={workspaceCwd}
+                >
+                  <option value="">Select a workspace</option>
+                  {workspaces.map((workspace) => (
+                    <option key={workspace.cwd} value={workspace.cwd}>
+                      {workspace.cwd}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <div className="workspace-empty-state" role="status">
+                  No safe workspaces are available from existing Codex sessions.
+                </div>
+              )
+            ) : workspacesLoading ? (
+              <div className="workspace-loading-state" role="status">
+                <RefreshCw size={15} aria-hidden="true" />
+                Loading workspaces...
+              </div>
+            ) : null}
+            {workspaceError ? (
+              <div className="sheet-error workspace-error" role="alert">
+                <span>
+                  <AlertTriangle size={15} aria-hidden="true" />
+                  {workspaceError}
+                </span>
+                <button disabled={workspacesLoading} onClick={onRetryWorkspaces} type="button">
+                  <RefreshCw size={14} aria-hidden="true" />
+                  Retry workspaces
+                </button>
+              </div>
+            ) : null}
+          </div>
           <label className="sr-only" htmlFor="new-session-message">
             First message for new session
           </label>
-          <textarea
-            id="new-session-message"
-            onChange={(event) => onDraftChange(event.target.value)}
-            placeholder="Describe the task Codex should start"
-            ref={textareaRef}
-            rows={4}
-            value={draft}
+          <DraftImagePreviews
+            attachments={attachments}
+            attachmentError={attachmentError}
+            disabled={disabled}
+            onRemoveAttachment={onRemoveAttachment}
           />
+          <div className="new-session-message-row">
+            <ImageAttachmentButton
+              buttonLabel="Attach image to new session"
+              disabled={disabled}
+              inputLabel="Choose new session image attachment"
+              onAttachFiles={onAttachFiles}
+            />
+            <textarea
+              disabled={disabled}
+              id="new-session-message"
+              onChange={(event) => onDraftChange(event.target.value)}
+              placeholder="Describe the task Codex should start"
+              ref={textareaRef}
+              rows={4}
+              value={draft}
+            />
+          </div>
           {error ? (
             <div className="sheet-error" role="alert">
               <AlertTriangle size={15} aria-hidden="true" />
               {error}
             </div>
           ) : null}
-          <button className="create-session-button" disabled={disabled || !draft.trim()} type="submit">
+          <button
+            className="create-session-button"
+            disabled={
+              disabled ||
+              (!draft.trim() && attachments.length === 0) ||
+              !workspaceCwd ||
+              workspacesLoading ||
+              Boolean(workspaceError)
+            }
+            type="submit"
+          >
             {submitting ? "Creating..." : "Create & send"}
           </button>
         </form>
@@ -1620,6 +1813,93 @@ function AttachmentImage({
   );
 }
 
+function DraftImagePreviews({
+  attachments,
+  attachmentError,
+  disabled,
+  onRemoveAttachment,
+}: {
+  attachments: DraftImageAttachment[];
+  attachmentError: string;
+  disabled: boolean;
+  onRemoveAttachment: (id: string) => void;
+}) {
+  return (
+    <>
+      {attachments.length > 0 ? (
+        <div className="composer-attachments" aria-label="Selected image attachments">
+          {attachments.map((attachment) => (
+            <span className="composer-attachment" key={attachment.id}>
+              <img src={attachment.previewUrl} alt={attachment.name} />
+              <button
+                className="composer-attachment-remove"
+                disabled={disabled}
+                onClick={() => onRemoveAttachment(attachment.id)}
+                type="button"
+                aria-label={`Remove ${attachment.name}`}
+                title={`Remove ${attachment.name}`}
+              >
+                <X size={12} aria-hidden="true" />
+              </button>
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {attachmentError ? (
+        <div className="composer-error" role="alert">
+          <AlertTriangle size={14} aria-hidden="true" />
+          {attachmentError}
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function ImageAttachmentButton({
+  buttonLabel,
+  disabled,
+  inputLabel,
+  onAttachFiles,
+}: {
+  buttonLabel: string;
+  disabled: boolean;
+  inputLabel: string;
+  onAttachFiles: (files: FileList) => void;
+}) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  return (
+    <>
+      <input
+        accept="image/png,image/jpeg,image/gif,image/webp"
+        aria-label={inputLabel}
+        className="sr-only"
+        disabled={disabled}
+        multiple
+        onChange={(event) => {
+          const files = event.currentTarget.files;
+          if (files) {
+            onAttachFiles(files);
+          }
+          event.currentTarget.value = "";
+        }}
+        ref={fileInputRef}
+        type="file"
+      />
+      <button
+        className="attach-button"
+        disabled={disabled}
+        onClick={() => fileInputRef.current?.click()}
+        type="button"
+        aria-label={buttonLabel}
+        title={buttonLabel}
+      >
+        <ImagePlus size={17} aria-hidden="true" />
+      </button>
+    </>
+  );
+}
+
 function Composer({
   attachments,
   attachmentError,
@@ -1643,35 +1923,16 @@ function Composer({
   sendError: string;
   selectedTitle: string;
 }) {
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const canSubmit = !disabled && (draft.trim().length > 0 || attachments.length > 0);
 
   return (
     <form className="composer" aria-label="Message composer" onSubmit={onSubmit}>
-      {attachments.length > 0 ? (
-        <div className="composer-attachments" aria-label="Selected image attachments">
-          {attachments.map((attachment) => (
-            <span className="composer-attachment" key={attachment.id}>
-              <img src={attachment.previewUrl} alt={attachment.name} />
-              <button
-                className="composer-attachment-remove"
-                disabled={disabled}
-                onClick={() => onRemoveAttachment(attachment.id)}
-                type="button"
-                aria-label={`Remove ${attachment.name}`}
-              >
-                <X size={12} aria-hidden="true" />
-              </button>
-            </span>
-          ))}
-        </div>
-      ) : null}
-      {attachmentError ? (
-        <div className="composer-error" role="alert">
-          <AlertTriangle size={14} aria-hidden="true" />
-          {attachmentError}
-        </div>
-      ) : null}
+      <DraftImagePreviews
+        attachments={attachments}
+        attachmentError={attachmentError}
+        disabled={disabled}
+        onRemoveAttachment={onRemoveAttachment}
+      />
       {sendError ? (
         <div className="composer-error" role="alert">
           <AlertTriangle size={14} aria-hidden="true" />
@@ -1681,31 +1942,12 @@ function Composer({
       <label className="sr-only" htmlFor="codex-message">
         Message selected Codex session
       </label>
-      <input
-        accept="image/png,image/jpeg,image/gif,image/webp"
-        aria-label="Choose image attachment"
-        className="sr-only"
+      <ImageAttachmentButton
+        buttonLabel="Attach image"
         disabled={disabled}
-        multiple
-        onChange={(event) => {
-          const files = event.currentTarget.files;
-          if (files) {
-            onAttachFiles(files);
-          }
-          event.currentTarget.value = "";
-        }}
-        ref={fileInputRef}
-        type="file"
+        inputLabel="Choose image attachment"
+        onAttachFiles={onAttachFiles}
       />
-      <button
-        className="attach-button"
-        disabled={disabled}
-        onClick={() => fileInputRef.current?.click()}
-        type="button"
-        aria-label="Attach image"
-      >
-        <ImagePlus size={17} aria-hidden="true" />
-      </button>
       <textarea
         id="codex-message"
         name="message"
@@ -1731,6 +1973,51 @@ function ApprovalIcon({ kind }: { kind: ApprovalKind }) {
 
 function StatusBadge({ status }: { status: SessionSnapshot["status"] }) {
   return <span className={`status-badge ${status}`}>{status.replaceAll("_", " ")}</span>;
+}
+
+function appendDraftImageFiles(
+  current: DraftImageAttachment[],
+  files: FileList,
+): { images: DraftImageAttachment[]; error: string } {
+  const incoming = Array.from(files);
+  if (incoming.length === 0) {
+    return { images: current, error: "" };
+  }
+
+  const images = [...current];
+  let error = "";
+  for (const file of incoming) {
+    if (images.length >= MAX_DRAFT_IMAGE_ATTACHMENTS) {
+      error = `Up to ${MAX_DRAFT_IMAGE_ATTACHMENTS} images per message`;
+      break;
+    }
+    if (!SUPPORTED_DRAFT_IMAGE_TYPES.has(file.type)) {
+      error = "Only PNG, JPEG, GIF, or WebP images are supported";
+      continue;
+    }
+    if (file.size > MAX_DRAFT_IMAGE_BYTES) {
+      error = "Image must be 8 MB or smaller";
+      continue;
+    }
+    images.push({
+      id: draftImageId(),
+      file,
+      name: file.name || "image",
+      mimeType: file.type,
+      previewUrl: URL.createObjectURL(file),
+      size: file.size,
+    });
+  }
+
+  return { images, error };
+}
+
+function removeDraftImage(images: DraftImageAttachment[], id: string): DraftImageAttachment[] {
+  const removed = images.find((image) => image.id === id);
+  if (removed) {
+    URL.revokeObjectURL(removed.previewUrl);
+  }
+  return images.filter((image) => image.id !== id);
 }
 
 async function draftImagesToOutgoingAttachments(images: DraftImageAttachment[]): Promise<OutgoingImageAttachment[]> {
@@ -2387,7 +2674,11 @@ function connectionErrorText(error: unknown): string {
   if (isAuthError(error)) {
     return "Session revoked or expired";
   }
-  if (error instanceof ApiError && error.status === 400) {
+  if (
+    error instanceof ApiError &&
+    error.status === 400 &&
+    (error.code === "invalid_pairing_token" || error.code === "expired_pairing_token")
+  ) {
     return "Pairing link expired or already used. Restart the bridge and open the newest pairing URL.";
   }
   if (error instanceof Error) {
@@ -2422,7 +2713,27 @@ function isAuthError(error: unknown): boolean {
 }
 
 function isPairingTokenError(error: unknown): boolean {
-  return error instanceof ApiError && error.status === 400;
+  return (
+    error instanceof ApiError &&
+    error.status === 400 &&
+    (error.code === "invalid_pairing_token" || error.code === "expired_pairing_token")
+  );
+}
+
+function normalizePairingFlowError(error: unknown): unknown {
+  if (error instanceof ApiError && error.status === 400 && !error.code) {
+    return new ApiError(error.status, error.message, "invalid_pairing_token");
+  }
+  return error;
+}
+
+function isWorkspaceError(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    (error.code === "workspace_required" ||
+      error.code === "workspace_not_allowed" ||
+      error.code === "workspace_unavailable")
+  );
 }
 
 export function nextPollDelay(
@@ -2437,6 +2748,20 @@ export function nextPollDelay(
 
 function sortSessions(items: SessionSnapshot[]): SessionSnapshot[] {
   return [...items].sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function selectNewSessionWorkspace(
+  workspaces: WorkspaceOption[],
+  currentCwd: string,
+  preferredCwd?: string,
+): string {
+  if (currentCwd && workspaces.some((workspace) => workspace.cwd === currentCwd)) {
+    return currentCwd;
+  }
+  if (preferredCwd && workspaces.some((workspace) => workspace.cwd === preferredCwd)) {
+    return preferredCwd;
+  }
+  return workspaces.length === 1 ? workspaces[0].cwd : "";
 }
 
 function handleServerEnvelope(

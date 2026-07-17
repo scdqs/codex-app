@@ -37,9 +37,10 @@ use crate::{
     normalizer::Normalizer,
     pairing::{DEFAULT_PAIRING_TOKEN_TTL_MS, PairingError, PairingManager},
     protocol::{
-        ApprovalDecision, ApprovalKind, ApprovalRequest, DecisionKind, ServerEnvelope,
-        SessionEvent, SessionEventType, SessionSnapshot, SessionStatus,
+        ApiErrorCode, ApprovalDecision, ApprovalKind, ApprovalRequest, DecisionKind,
+        ServerEnvelope, SessionEvent, SessionEventType, SessionSnapshot, SessionStatus,
     },
+    workspace::{WorkspaceValidationError, validate_workspace, workspace_options},
 };
 
 #[derive(Clone)]
@@ -171,6 +172,8 @@ pub struct SendMessageRequest {
 pub struct CreateSessionRequest {
     text: String,
     #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
     attachments: Vec<IncomingImageAttachment>,
 }
 
@@ -233,6 +236,7 @@ pub struct DevApprovalRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ErrorResponse {
+    code: ApiErrorCode,
     error: String,
 }
 
@@ -357,6 +361,7 @@ fn phone_routes(state: AppState) -> Router<AppState> {
             get(get_local_image_asset),
         )
         .route("/api/sessions", get(list_sessions).post(create_session))
+        .route("/api/workspaces", get(list_workspaces))
         .route("/api/sessions/:thread_id/events", get(list_session_events))
         .route("/api/sessions/:thread_id/messages", post(send_message))
         .route("/api/approvals", get(list_approvals))
@@ -530,6 +535,18 @@ async fn list_sessions(
     Ok(Json(state.event_hub.all_snapshots().await))
 }
 
+async fn list_workspaces(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::protocol::WorkspaceOption>>, ApiError> {
+    let adapter = state
+        .codex_adapter
+        .as_ref()
+        .ok_or(ApiError::AdapterUnavailable)?;
+    let threads = adapter.list_threads().await?;
+
+    Ok(Json(workspace_options(&threads)))
+}
+
 async fn list_approvals(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ApprovalRequest>>, ApiError> {
@@ -569,16 +586,20 @@ async fn create_session(
             "session text or attachment is required",
         ));
     }
+    let adapter = state
+        .codex_adapter
+        .as_ref()
+        .ok_or(ApiError::AdapterUnavailable)?;
+    let threads = adapter.list_threads().await?;
+    let workspace = validate_workspace(&threads, request.cwd.as_deref())?;
     let attachments = store_incoming_image_attachments(&request.attachments).await?;
     let adapter_attachments = codex_image_attachments(&attachments);
     let display_text = preview_text(&text, &attachments);
 
     let now = current_time_ms();
-    let thread = if let Some(adapter) = state.codex_adapter.as_ref() {
-        adapter.start_thread(&text, &adapter_attachments).await?
-    } else {
-        local_thread_for_created_session(&display_text, now)
-    };
+    let thread = adapter
+        .start_thread(&workspace.cwd, &text, &adapter_attachments)
+        .await?;
     let mut snapshot = Normalizer::snapshot_from_thread(&thread);
     if snapshot.updated_at == 0 {
         snapshot.updated_at = now;
@@ -992,26 +1013,6 @@ fn image_content_type(path: &FsPath) -> Option<&'static str> {
         Some("image/webp")
     } else {
         None
-    }
-}
-
-fn local_thread_for_created_session(text: &str, now: u64) -> crate::codex_rpc::CodexThread {
-    let id = format!("local-{}", Uuid::new_v4());
-    crate::codex_rpc::CodexThread {
-        id: id.clone(),
-        title: Some(session_title_from_text(text)),
-        cwd: None,
-        model_provider: None,
-        preview: Some(text.to_string()),
-        created_at: Some(now),
-        updated_at: Some(now),
-        raw: json!({
-            "id": id,
-            "title": session_title_from_text(text),
-            "preview": text,
-            "updatedAt": now,
-            "status": "running",
-        }),
     }
 }
 
@@ -1617,6 +1618,8 @@ enum ApiError {
     NotFound(&'static str),
     UnsupportedMediaType(&'static str),
     Internal(&'static str),
+    AdapterUnavailable,
+    Workspace(ApiErrorCode, &'static str),
     Pairing(PairingError),
     Adapter(CodexRpcError),
 }
@@ -1633,33 +1636,98 @@ impl From<CodexRpcError> for ApiError {
     }
 }
 
+impl From<WorkspaceValidationError> for ApiError {
+    fn from(error: WorkspaceValidationError) -> Self {
+        match error {
+            WorkspaceValidationError::Required => {
+                Self::Workspace(ApiErrorCode::WorkspaceRequired, "workspace is required")
+            }
+            WorkspaceValidationError::NotAllowed => Self::Workspace(
+                ApiErrorCode::WorkspaceNotAllowed,
+                "workspace is not allowed",
+            ),
+            WorkspaceValidationError::Unavailable => Self::Workspace(
+                ApiErrorCode::WorkspaceUnavailable,
+                "workspace is unavailable",
+            ),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
-            Self::BadRequest(message) => (StatusCode::BAD_REQUEST, message.to_string()),
-            Self::Forbidden(message) => (StatusCode::FORBIDDEN, message.to_string()),
-            Self::NotFound(message) => (StatusCode::NOT_FOUND, message.to_string()),
-            Self::UnsupportedMediaType(message) => {
-                (StatusCode::UNSUPPORTED_MEDIA_TYPE, message.to_string())
-            }
-            Self::Internal(message) => (StatusCode::INTERNAL_SERVER_ERROR, message.to_string()),
-            Self::Pairing(PairingError::InvalidToken | PairingError::TokenAlreadyUsed) => {
-                (StatusCode::BAD_REQUEST, "invalid pairing token".to_string())
-            }
-            Self::Pairing(PairingError::ExpiredToken) => {
-                (StatusCode::BAD_REQUEST, "expired token".to_string())
-            }
-            Self::Pairing(PairingError::DeviceRevoked) => {
-                (StatusCode::FORBIDDEN, "device revoked".to_string())
-            }
-            Self::Pairing(PairingError::DeviceNotFound) => {
-                (StatusCode::NOT_FOUND, "device not found".to_string())
-            }
-            Self::Adapter(error) => (StatusCode::BAD_GATEWAY, error.to_string()),
+        let (status, code, message) = match self {
+            Self::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                ApiErrorCode::Unauthorized,
+                "unauthorized".to_string(),
+            ),
+            Self::BadRequest(message) => (
+                StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidRequest,
+                message.to_string(),
+            ),
+            Self::Forbidden(message) => (
+                StatusCode::FORBIDDEN,
+                ApiErrorCode::Forbidden,
+                message.to_string(),
+            ),
+            Self::NotFound(message) => (
+                StatusCode::NOT_FOUND,
+                ApiErrorCode::NotFound,
+                message.to_string(),
+            ),
+            Self::UnsupportedMediaType(message) => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                ApiErrorCode::UnsupportedMediaType,
+                message.to_string(),
+            ),
+            Self::Internal(message) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiErrorCode::InternalError,
+                message.to_string(),
+            ),
+            Self::AdapterUnavailable => (
+                StatusCode::BAD_GATEWAY,
+                ApiErrorCode::AdapterError,
+                "desktop adapter is unavailable".to_string(),
+            ),
+            Self::Workspace(code, message) => (StatusCode::BAD_REQUEST, code, message.to_string()),
+            Self::Pairing(PairingError::InvalidToken | PairingError::TokenAlreadyUsed) => (
+                StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidPairingToken,
+                "invalid pairing token".to_string(),
+            ),
+            Self::Pairing(PairingError::ExpiredToken) => (
+                StatusCode::BAD_REQUEST,
+                ApiErrorCode::ExpiredPairingToken,
+                "expired token".to_string(),
+            ),
+            Self::Pairing(PairingError::DeviceRevoked) => (
+                StatusCode::FORBIDDEN,
+                ApiErrorCode::DeviceRevoked,
+                "device revoked".to_string(),
+            ),
+            Self::Pairing(PairingError::DeviceNotFound) => (
+                StatusCode::NOT_FOUND,
+                ApiErrorCode::DeviceNotFound,
+                "device not found".to_string(),
+            ),
+            Self::Adapter(error) => (
+                StatusCode::BAD_GATEWAY,
+                ApiErrorCode::AdapterError,
+                error.to_string(),
+            ),
         };
 
-        (status, Json(ErrorResponse { error: message })).into_response()
+        (
+            status,
+            Json(ErrorResponse {
+                code,
+                error: message,
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -1817,6 +1885,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpaired_request_cannot_read_workspaces() {
+        let (_dir, state) = test_state();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(request(Method::GET, "/api/workspaces", Body::empty()))
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn unpaired_request_cannot_create_session() {
         let (_dir, state) = test_state();
         let app = build_router(state);
@@ -1831,6 +1912,32 @@ mod tests {
             .expect("request succeeds");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn invalid_pairing_token_returns_structured_pairing_error() {
+        let (_dir, state) = test_state();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/api/pairing/complete",
+                json!({
+                    "pairingToken": "invalid-token",
+                    "deviceId": "phone-1",
+                    "displayName": "Phone",
+                    "deviceSecret": "secret",
+                }),
+            ))
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            json!({ "code": "invalid_pairing_token", "error": "invalid pairing token" })
+        );
     }
 
     #[tokio::test]
@@ -1983,7 +2090,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
             response_json(response).await,
-            json!({ "error": "unauthorized" })
+            json!({ "code": "unauthorized", "error": "unauthorized" })
         );
     }
 
@@ -2051,7 +2158,10 @@ mod tests {
                 "attempt {attempt}"
             );
             let body = response_json(response).await;
-            assert_eq!(body, json!({ "error": "unauthorized" }));
+            assert_eq!(
+                body,
+                json!({ "code": "unauthorized", "error": "unauthorized" })
+            );
             assert!(body.get("sessionToken").is_none());
         }
 
@@ -2637,6 +2747,78 @@ mod tests {
                     "pendingApprovalIds": [],
                 }
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_device_can_list_safe_deduplicated_workspaces() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let workspaces = tempdir().expect("workspace tempdir");
+        let alpha = workspaces.path().join("alpha");
+        let zeta = workspaces.path().join("zeta");
+        std::fs::create_dir(&alpha).expect("alpha workspace");
+        std::fs::create_dir(&zeta).expect("zeta workspace");
+        let adapter = Arc::new(RecordingAdapter::with_threads(vec![
+            codex_thread("zeta", Some(zeta.to_string_lossy().into_owned())),
+            codex_thread("alpha", Some(alpha.to_string_lossy().into_owned())),
+            codex_thread("duplicate", Some(alpha.to_string_lossy().into_owned())),
+            codex_thread("root", Some("/".to_string())),
+        ]));
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/workspaces")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let canonical_alpha = std::fs::canonicalize(&alpha).expect("canonical alpha workspace");
+        let canonical_zeta = std::fs::canonicalize(&zeta).expect("canonical zeta workspace");
+        assert_eq!(
+            response_json(response).await,
+            json!([
+                { "cwd": canonical_alpha.to_string_lossy() },
+                { "cwd": canonical_zeta.to_string_lossy() },
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_list_surfaces_desktop_adapter_failure() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::with_thread_list_error(
+            "thread list failed",
+        ));
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/workspaces")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response_json(response).await,
+            json!({
+                "code": "adapter_error",
+                "error": "json-rpc transport failed: thread list failed",
+            })
         );
     }
 
@@ -3717,8 +3899,15 @@ mod tests {
     async fn paired_device_create_session_routes_to_codex_adapter_and_records_first_message() {
         let (_dir, state) = test_state();
         let session_token = pair_device(&state).await;
-        let adapter = Arc::new(RecordingAdapter::default());
+        let workspace_dir = tempdir().expect("workspace tempdir");
+        let workspace = workspace_dir.path().join("project");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        let adapter = Arc::new(RecordingAdapter::with_threads(vec![codex_thread(
+            "thread-workspace",
+            Some(workspace.to_string_lossy().into_owned()),
+        )]));
         let started_threads = adapter.started_threads();
+        let started_workspaces = adapter.started_workspaces();
         let app = build_router(state.with_codex_adapter(adapter));
 
         let response = app
@@ -3730,7 +3919,11 @@ mod tests {
                     .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        json!({ "text": "start a fresh task from phone" }).to_string(),
+                        json!({
+                            "text": "start a fresh task from phone",
+                            "cwd": workspace.to_string_lossy(),
+                        })
+                        .to_string(),
                     ))
                     .expect("request builds"),
             )
@@ -3743,12 +3936,23 @@ mod tests {
         assert_eq!(body["title"], json!("start a fresh task from phone"));
         assert_eq!(body["preview"], json!("start a fresh task from phone"));
         assert_eq!(body["status"], json!("running"));
+        let canonical_workspace = std::fs::canonicalize(&workspace)
+            .expect("canonical workspace")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             started_threads
                 .lock()
                 .expect("started threads lock")
                 .as_slice(),
             &["start a fresh task from phone".to_string()]
+        );
+        assert_eq!(
+            started_workspaces
+                .lock()
+                .expect("started workspaces lock")
+                .as_slice(),
+            &[canonical_workspace]
         );
 
         let response = app
@@ -3769,6 +3973,143 @@ mod tests {
         assert_eq!(
             body[0]["payload"]["text"],
             json!("start a fresh task from phone")
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_device_create_session_requires_workspace() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let workspace_dir = tempdir().expect("workspace tempdir");
+        let workspace = workspace_dir.path().join("project");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        let adapter = Arc::new(RecordingAdapter::with_threads(vec![codex_thread(
+            "thread-workspace",
+            Some(workspace.to_string_lossy().into_owned()),
+        )]));
+        let started_threads = adapter.started_threads();
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({ "text": "missing workspace" }).to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            json!({ "code": "workspace_required", "error": "workspace is required" })
+        );
+        assert!(
+            started_threads
+                .lock()
+                .expect("started threads lock")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_device_create_session_rejects_workspace_not_in_latest_threads() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let workspace_dir = tempdir().expect("workspace tempdir");
+        let allowed = workspace_dir.path().join("allowed");
+        let tampered = workspace_dir.path().join("tampered");
+        std::fs::create_dir(&allowed).expect("allowed workspace");
+        std::fs::create_dir(&tampered).expect("tampered workspace");
+        let adapter = Arc::new(RecordingAdapter::with_threads(vec![codex_thread(
+            "thread-workspace",
+            Some(allowed.to_string_lossy().into_owned()),
+        )]));
+        let started_threads = adapter.started_threads();
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "text": "tampered workspace",
+                            "cwd": tampered.to_string_lossy(),
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            json!({ "code": "workspace_not_allowed", "error": "workspace is not allowed" })
+        );
+        assert!(
+            started_threads
+                .lock()
+                .expect("started threads lock")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_device_create_session_rejects_workspace_that_disappeared() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let workspace_dir = tempdir().expect("workspace tempdir");
+        let workspace = workspace_dir.path().join("disappearing");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        let adapter = Arc::new(RecordingAdapter::with_threads(vec![codex_thread(
+            "thread-workspace",
+            Some(workspace.to_string_lossy().into_owned()),
+        )]));
+        let started_threads = adapter.started_threads();
+        std::fs::remove_dir(&workspace).expect("remove workspace directory");
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "text": "stale workspace",
+                            "cwd": workspace.to_string_lossy(),
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await,
+            json!({ "code": "workspace_unavailable", "error": "workspace is unavailable" })
+        );
+        assert!(
+            started_threads
+                .lock()
+                .expect("started threads lock")
+                .is_empty()
         );
     }
 
@@ -3867,6 +4208,19 @@ mod tests {
         }
     }
 
+    fn codex_thread(id: &str, cwd: Option<String>) -> CodexThread {
+        CodexThread {
+            id: id.to_string(),
+            title: Some(id.to_string()),
+            cwd,
+            model_provider: Some("OpenAI".to_string()),
+            preview: None,
+            created_at: None,
+            updated_at: None,
+            raw: json!({ "id": id }),
+        }
+    }
+
     #[derive(Default)]
     struct RecordingAdapter {
         decisions: Arc<StdMutex<Vec<ApprovalDecision>>>,
@@ -3875,6 +4229,8 @@ mod tests {
         send_release: Option<Arc<tokio::sync::Semaphore>>,
         send_started: Option<Arc<tokio::sync::Semaphore>>,
         started_threads: Arc<StdMutex<Vec<String>>>,
+        started_workspaces: Arc<StdMutex<Vec<String>>>,
+        thread_list_error: Option<String>,
         threads: Arc<StdMutex<Vec<CodexThread>>>,
         turns: Arc<StdMutex<StdHashMap<String, Vec<CodexTurn>>>>,
         turn_pages: Arc<StdMutex<StdHashMap<String, CodexTurnPage>>>,
@@ -3885,6 +4241,13 @@ mod tests {
         fn with_threads(threads: Vec<CodexThread>) -> Self {
             Self {
                 threads: Arc::new(StdMutex::new(threads)),
+                ..Self::default()
+            }
+        }
+
+        fn with_thread_list_error(message: &str) -> Self {
+            Self {
+                thread_list_error: Some(message.to_string()),
                 ..Self::default()
             }
         }
@@ -3955,6 +4318,10 @@ mod tests {
             self.started_threads.clone()
         }
 
+        fn started_workspaces(&self) -> Arc<StdMutex<Vec<String>>> {
+            self.started_workspaces.clone()
+        }
+
         fn turn_page_cursors(&self) -> Arc<StdMutex<Vec<Option<String>>>> {
             self.turn_page_cursors.clone()
         }
@@ -3963,11 +4330,15 @@ mod tests {
     #[async_trait]
     impl CodexAdapter for RecordingAdapter {
         async fn list_threads(&self) -> Result<Vec<CodexThread>, CodexRpcError> {
+            if let Some(message) = &self.thread_list_error {
+                return Err(CodexRpcError::Transport(message.clone()));
+            }
             Ok(self.threads.lock().expect("threads lock").clone())
         }
 
         async fn start_thread(
             &self,
+            cwd: &str,
             text: &str,
             _attachments: &[UserImageAttachment],
         ) -> Result<CodexThread, CodexRpcError> {
@@ -3975,6 +4346,10 @@ mod tests {
                 let mut started_threads =
                     self.started_threads.lock().expect("started threads lock");
                 started_threads.push(text.to_string());
+                self.started_workspaces
+                    .lock()
+                    .expect("started workspaces lock")
+                    .push(cwd.to_string());
                 format!("thread-created-{}", started_threads.len())
             };
             self.turns.lock().expect("turns lock").insert(
@@ -3998,7 +4373,7 @@ mod tests {
             Ok(CodexThread {
                 id: id.clone(),
                 title: None,
-                cwd: Some("/repo".to_string()),
+                cwd: Some(cwd.to_string()),
                 model_provider: Some("OpenAI".to_string()),
                 preview: None,
                 created_at: None,

@@ -27,6 +27,29 @@ export interface SessionSnapshot {
   pendingApprovalIds: string[];
 }
 
+export interface WorkspaceOption {
+  cwd: string;
+}
+
+export const API_ERROR_CODES = [
+  "unauthorized",
+  "invalid_request",
+  "forbidden",
+  "not_found",
+  "unsupported_media_type",
+  "internal_error",
+  "invalid_pairing_token",
+  "expired_pairing_token",
+  "device_revoked",
+  "device_not_found",
+  "adapter_error",
+  "workspace_required",
+  "workspace_not_allowed",
+  "workspace_unavailable",
+] as const;
+
+export type ApiErrorCode = (typeof API_ERROR_CODES)[number];
+
 export const SESSION_EVENT_TYPES = [
   "message",
   "message_delta",
@@ -153,6 +176,19 @@ export function isSessionSnapshot(value: unknown): value is SessionSnapshot {
     Array.isArray(session.pendingApprovalIds) &&
     session.pendingApprovalIds.every((id) => typeof id === "string")
   );
+}
+
+export function isWorkspaceOption(value: unknown): value is WorkspaceOption {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      typeof (value as Record<string, unknown>).cwd === "string",
+  );
+}
+
+export function isApiErrorCode(value: unknown): value is ApiErrorCode {
+  return typeof value === "string" && API_ERROR_CODES.includes(value as ApiErrorCode);
 }
 
 export function isSessionEvent(value: unknown): value is SessionEvent {

@@ -17,6 +17,31 @@ pub struct SessionSnapshot {
     pub pending_approval_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceOption {
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiErrorCode {
+    Unauthorized,
+    InvalidRequest,
+    Forbidden,
+    NotFound,
+    UnsupportedMediaType,
+    InternalError,
+    InvalidPairingToken,
+    ExpiredPairingToken,
+    DeviceRevoked,
+    DeviceNotFound,
+    AdapterError,
+    WorkspaceRequired,
+    WorkspaceNotAllowed,
+    WorkspaceUnavailable,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
@@ -168,5 +193,31 @@ mod tests {
             serde_json::from_str(&serialized).expect("envelope deserializes");
 
         assert_eq!(deserialized, envelope);
+    }
+
+    #[test]
+    fn workspace_option_serializes_with_camel_case_fields() {
+        let workspace = WorkspaceOption {
+            cwd: "/Users/damon/Documents/my_ai/codex-app".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(workspace).expect("workspace option serializes"),
+            json!({ "cwd": "/Users/damon/Documents/my_ai/codex-app" })
+        );
+    }
+
+    #[test]
+    fn api_error_code_serializes_as_stable_snake_case_value() {
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::WorkspaceNotAllowed)
+                .expect("api error code serializes"),
+            json!("workspace_not_allowed")
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::InvalidPairingToken)
+                .expect("pairing error code serializes"),
+            json!("invalid_pairing_token")
+        );
     }
 }

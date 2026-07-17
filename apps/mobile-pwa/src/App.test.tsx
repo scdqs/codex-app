@@ -260,7 +260,9 @@ describe("App", () => {
       "",
       "/?pairingToken=used-token&bridgeUrl=http%3A%2F%2Fbridge.local",
     );
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(jsonResponse({ error: "invalid pairing token" }, 400));
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse({ code: "invalid_pairing_token", error: "invalid pairing token" }, 400),
+    );
 
     render(<App />);
 
@@ -1153,7 +1155,7 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
     expect(await screen.findByRole("alert", undefined, { timeout: 3_000 })).toHaveTextContent(
-      "Message not sent. Send message request failed with 502",
+      "Message not sent. temporary tunnel failure",
     );
     expect(input).toHaveValue("retry from phone");
     expect(
@@ -1246,6 +1248,9 @@ describe("App", () => {
       if (url === "http://bridge.local/api/sessions") {
         return jsonResponse([]);
       }
+      if (url === "http://bridge.local/api/workspaces") {
+        return jsonResponse([{ cwd: "/repo/mobile" }]);
+      }
       if (url === "http://bridge.local/api/sessions/thread-created/events") {
         return jsonResponse([]);
       }
@@ -1271,7 +1276,7 @@ describe("App", () => {
             Authorization: "Bearer session-1",
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ text: "Start from phone" }),
+          body: JSON.stringify({ text: "Start from phone", cwd: "/repo/mobile" }),
         }),
       );
     });
@@ -1281,21 +1286,568 @@ describe("App", () => {
     expect(screen.getByPlaceholderText("Message Start from phone")).toBeInTheDocument();
   });
 
-  it("keeps_new_session_failure_inside_sheet_without_replacing_current_thread", async () => {
+  it("creates_a_new_session_with_an_image_attachment", async () => {
+    const user = userEvent.setup();
+    stubObjectUrls();
+    saveActiveSession();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions" && init?.method === "POST") {
+        return jsonResponse(
+          sessionSnapshot({
+            threadId: "thread-image-created",
+            title: "Image task",
+            preview: "Image task",
+            status: "running",
+            cwd: "/repo/mobile",
+          }),
+          201,
+        );
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/workspaces") {
+        return jsonResponse([{ cwd: "/repo/mobile" }]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-image-created/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const newSessionButton = await screen.findByRole("button", { name: "New session" });
+    await waitFor(() => expect(newSessionButton).toBeEnabled());
+    await user.click(newSessionButton);
+    const image = new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      "phone.png",
+      { type: "image/png" },
+    );
+    await user.upload(screen.getByLabelText("Choose new session image attachment"), image);
+    expect(screen.getByRole("img", { name: "phone.png" })).toHaveAttribute("src", "blob:codex-image");
+    expect(screen.getByRole("button", { name: "Create & send" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Create & send" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "http://bridge.local/api/sessions",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            text: "",
+            attachments: [
+              {
+                name: "phone.png",
+                mimeType: "image/png",
+                dataBase64: "iVBORw0KGgo=",
+              },
+            ],
+            cwd: "/repo/mobile",
+          }),
+        }),
+      );
+    });
+    expect(await screen.findByRole("heading", { name: "Image task" })).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: "phone.png" })).not.toBeInTheDocument();
+  });
+
+  it("defaults_new_session_workspace_to_the_current_session_cwd", async () => {
     const user = userEvent.setup();
     saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-current",
+            title: "Current thread",
+            cwd: "/repo/current",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/workspaces") {
+        return jsonResponse([{ cwd: "/repo/other" }, { cwd: "/repo/current" }]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-current/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Current thread" });
+    await user.click(screen.getByRole("button", { name: "New session" }));
+
+    expect(await screen.findByLabelText("Workspace")).toHaveValue("/repo/current");
+  });
+
+  it("waits_for_session_data_before_enabling_new_session_creation", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    let resolveSessions: ((response: Response) => void) | undefined;
+    const sessionsResponse = new Promise<Response>((resolve) => {
+      resolveSessions = resolve;
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return sessionsResponse;
+      }
+      if (url === "http://bridge.local/api/approvals") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/workspaces") {
+        return jsonResponse([{ cwd: "/repo/other" }, { cwd: "/repo/current" }]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-current/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const newSessionButton = screen.getByRole("button", { name: "New session" });
+    expect(newSessionButton).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Open sessions" }));
+    expect(within(screen.getByRole("dialog", { name: "Sessions" })).getByRole("button", { name: "New" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Close sessions" }));
+
+    await act(async () => {
+      resolveSessions?.(
+        jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-current",
+            title: "Current thread",
+            cwd: "/repo/current",
+          }),
+        ]),
+      );
+      await sessionsResponse;
+    });
+
+    await screen.findByRole("heading", { name: "Current thread" });
+    expect(newSessionButton).toBeEnabled();
+    await user.click(newSessionButton);
+    expect(await screen.findByLabelText("Workspace")).toHaveValue("/repo/current");
+  });
+
+  it("requires_an_explicit_workspace_when_multiple_options_have_no_current_context", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/workspaces") {
+        return jsonResponse([{ cwd: "/repo/alpha" }, { cwd: "/repo/beta" }]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const newSessionButton = await screen.findByRole("button", { name: "New session" });
+    await waitFor(() => expect(newSessionButton).toBeEnabled());
+    await user.click(newSessionButton);
+    await user.type(screen.getByLabelText("First message for new session"), "Choose carefully");
+    const workspace = await screen.findByLabelText("Workspace");
+
+    expect(workspace).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Create & send" })).toBeDisabled();
+    await user.selectOptions(workspace, "/repo/beta");
+    expect(screen.getByRole("button", { name: "Create & send" })).toBeEnabled();
+  });
+
+  it("shows_an_empty_workspace_state_and_disables_new_session_creation", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions" || url === "http://bridge.local/api/workspaces") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const newSessionButton = await screen.findByRole("button", { name: "New session" });
+    await waitFor(() => expect(newSessionButton).toBeEnabled());
+    await user.click(newSessionButton);
+
+    expect(await screen.findByText("No safe workspaces are available from existing Codex sessions.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Create & send" })).toBeDisabled();
+  });
+
+  it("retries_workspace_loading_without_clearing_the_new_session_draft", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    let workspaceRequests = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/workspaces") {
+        workspaceRequests += 1;
+        return workspaceRequests === 1
+          ? jsonResponse({ code: "adapter_error", error: "thread list failed" }, 502)
+          : jsonResponse([{ cwd: "/repo/recovered" }]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const newSessionButton = await screen.findByRole("button", { name: "New session" });
+    await waitFor(() => expect(newSessionButton).toBeEnabled());
+    await user.click(newSessionButton);
+    const textarea = screen.getByLabelText("First message for new session");
+    await user.type(textarea, "Keep this draft");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("thread list failed");
+    await user.click(screen.getByRole("button", { name: "Retry workspaces" }));
+
+    expect(await screen.findByLabelText("Workspace")).toHaveValue("/repo/recovered");
+    expect(textarea).toHaveValue("Keep this draft");
+  });
+
+  it("refreshes_session_once_when_workspace_list_rejects_the_saved_token", async () => {
+    const user = userEvent.setup();
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "old-token",
+      sessionExpiresAt: Date.now() + 60_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const authorization = new Headers(init?.headers).get("Authorization");
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions" || url === "http://bridge.local/api/approvals") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/workspaces" && authorization === "Bearer old-token") {
+        return jsonResponse({ code: "unauthorized", error: "expired" }, 401);
+      }
+      if (url === "http://bridge.local/api/session/refresh" && init?.method === "POST") {
+        return jsonResponse({
+          deviceId: "device-1",
+          sessionToken: "new-token",
+          sessionExpiresAt: Date.now() + 120_000,
+        });
+      }
+      if (url === "http://bridge.local/api/workspaces" && authorization === "Bearer new-token") {
+        return jsonResponse([{ cwd: "/repo/refreshed" }]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const newSessionButton = await screen.findByRole("button", { name: "New session" });
+    await waitFor(() => expect(newSessionButton).toBeEnabled());
+    await user.click(newSessionButton);
+
+    expect(await screen.findByLabelText("Workspace")).toHaveValue("/repo/refreshed");
+    expect(loadSession()?.sessionToken).toBe("new-token");
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          String(input) === "http://bridge.local/api/session/refresh" && init?.method === "POST",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("leaves_pairing_state_when_session_refresh_fails", async () => {
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "old-token",
+      sessionExpiresAt: Date.now() + 60_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse({ code: "unauthorized", error: "expired" }, 401);
+      }
+      if (url === "http://bridge.local/api/approvals") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/session/refresh" && init?.method === "POST") {
+        return jsonResponse({ code: "adapter_error", error: "refresh unavailable" }, 502);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Reconnecting");
+    });
+    expect(screen.getByLabelText("Connection status")).not.toHaveTextContent("Refreshing session");
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("refresh unavailable");
+  });
+
+  it("refreshes_session_once_when_new_session_creation_rejects_the_saved_token", async () => {
+    const user = userEvent.setup();
+    let created = false;
+    const createdSession = sessionSnapshot({
+      threadId: "thread-refreshed-create",
+      title: "Created after refresh",
+      cwd: "/repo/mobile",
+    });
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "old-token",
+      sessionExpiresAt: Date.now() + 60_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      const authorization = new Headers(init?.headers).get("Authorization");
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions" && init?.method === "POST") {
+        if (authorization === "Bearer old-token") {
+          return jsonResponse({ code: "unauthorized", error: "expired" }, 401);
+        }
+        created = true;
+        return jsonResponse(createdSession, 201);
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse(created ? [createdSession] : []);
+      }
+      if (url === "http://bridge.local/api/approvals") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/workspaces") {
+        return jsonResponse([{ cwd: "/repo/mobile" }]);
+      }
+      if (url === "http://bridge.local/api/session/refresh" && init?.method === "POST") {
+        return jsonResponse({
+          deviceId: "device-1",
+          sessionToken: "new-token",
+          sessionExpiresAt: Date.now() + 120_000,
+        });
+      }
+      if (url === "http://bridge.local/api/sessions/thread-refreshed-create/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const newSessionButton = await screen.findByRole("button", { name: "New session" });
+    await waitFor(() => expect(newSessionButton).toBeEnabled());
+    await user.click(newSessionButton);
+    await screen.findByLabelText("Workspace");
+    await user.type(screen.getByLabelText("First message for new session"), "Create after refresh");
+    await user.click(screen.getByRole("button", { name: "Create & send" }));
+
+    expect(await screen.findByRole("heading", { name: "Created after refresh" })).toBeInTheDocument();
+    expect(loadSession()?.sessionToken).toBe("new-token");
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          String(input) === "http://bridge.local/api/session/refresh" && init?.method === "POST",
+      ),
+    ).toHaveLength(1);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          String(input) === "http://bridge.local/api/sessions" && init?.method === "POST",
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("does_not_replay_new_session_creation_when_refreshed_health_is_not_writable", async () => {
+    const user = userEvent.setup();
+    let healthRequests = 0;
+    let createRequests = 0;
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "old-token",
+      sessionExpiresAt: Date.now() + 60_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        healthRequests += 1;
+        return healthRequests === 1
+          ? jsonResponse({ status: "ok", connectionState: "writable" })
+          : jsonResponse({ status: "degraded", connectionState: "read_only" });
+      }
+      if (url === "http://bridge.local/api/sessions" && init?.method === "POST") {
+        createRequests += 1;
+        return jsonResponse({ code: "unauthorized", error: "expired" }, 401);
+      }
+      if (url === "http://bridge.local/api/sessions" || url === "http://bridge.local/api/approvals") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/workspaces") {
+        return jsonResponse([{ cwd: "/repo/mobile" }]);
+      }
+      if (url === "http://bridge.local/api/session/refresh" && init?.method === "POST") {
+        return jsonResponse({
+          deviceId: "device-1",
+          sessionToken: "new-token",
+          sessionExpiresAt: Date.now() + 120_000,
+        });
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const newSessionButton = await screen.findByRole("button", { name: "New session" });
+    await waitFor(() => expect(newSessionButton).toBeEnabled());
+    await user.click(newSessionButton);
+    await screen.findByLabelText("Workspace");
+    await user.type(screen.getByLabelText("First message for new session"), "Do not replay");
+    await user.click(screen.getByRole("button", { name: "Create & send" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Bridge is not writable after session refresh",
+    );
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("Read-only");
+    expect(createRequests).toBe(1);
+  });
+
+  it("creates_only_one_session_when_the_new_session_form_is_submitted_twice_synchronously", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    let createRequests = 0;
+    let resolveCreate: ((response: Response) => void) | undefined;
+    const createResponse = new Promise<Response>((resolve) => {
+      resolveCreate = resolve;
+    });
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
       if (url === "http://bridge.local/api/health") {
         return jsonResponse({ status: "ok", connectionState: "writable" });
       }
       if (url === "http://bridge.local/api/sessions" && init?.method === "POST") {
-        return jsonResponse({ error: "thread/start failed" }, 500);
+        createRequests += 1;
+        return createResponse;
+      }
+      if (url === "http://bridge.local/api/sessions" || url === "http://bridge.local/api/approvals") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/workspaces") {
+        return jsonResponse([{ cwd: "/repo/mobile" }]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-single-create/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const newSessionButton = await screen.findByRole("button", { name: "New session" });
+    await waitFor(() => expect(newSessionButton).toBeEnabled());
+    await user.click(newSessionButton);
+    await screen.findByLabelText("Workspace");
+    await user.type(screen.getByLabelText("First message for new session"), "Submit once");
+    const form = screen.getByRole("button", { name: "Create & send" }).closest("form");
+    expect(form).not.toBeNull();
+
+    act(() => {
+      fireEvent.submit(form!);
+      fireEvent.submit(form!);
+    });
+
+    await waitFor(() => expect(createRequests).toBe(1));
+    resolveCreate?.(
+      jsonResponse(
+        sessionSnapshot({
+          threadId: "thread-single-create",
+          title: "Single create",
+          cwd: "/repo/mobile",
+        }),
+        201,
+      ),
+    );
+    expect(await screen.findByRole("heading", { name: "Single create" })).toBeInTheDocument();
+    expect(createRequests).toBe(1);
+  });
+
+  it("keeps_new_session_failure_inside_sheet_without_replacing_current_thread", async () => {
+    const user = userEvent.setup();
+    stubObjectUrls();
+    saveActiveSession();
+    let workspaceRequests = 0;
+    let resolveWorkspaceReload: ((response: Response) => void) | undefined;
+    const workspaceReload = new Promise<Response>((resolve) => {
+      resolveWorkspaceReload = resolve;
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions" && init?.method === "POST") {
+        return jsonResponse(
+          { code: "workspace_unavailable", error: "workspace is unavailable" },
+          400,
+        );
       }
       if (url === "http://bridge.local/api/sessions") {
         return jsonResponse([
-          sessionSnapshot({ threadId: "thread-existing", title: "Existing thread", preview: "Keep me selected" }),
+          sessionSnapshot({
+            threadId: "thread-existing",
+            title: "Existing thread",
+            preview: "Keep me selected",
+            cwd: "/repo/existing",
+          }),
         ]);
+      }
+      if (url === "http://bridge.local/api/workspaces") {
+        workspaceRequests += 1;
+        return workspaceRequests === 1
+          ? jsonResponse([{ cwd: "/repo/existing" }])
+          : workspaceReload;
       }
       if (url === "http://bridge.local/api/sessions/thread-existing/events") {
         return jsonResponse([]);
@@ -1308,13 +1860,72 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "Existing thread" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "New session" }));
     const textarea = screen.getByLabelText("First message for new session");
+    const image = new File(
+      [new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])],
+      "phone.png",
+      { type: "image/png" },
+    );
+    await user.upload(screen.getByLabelText("Choose new session image attachment"), image);
     await user.type(textarea, "This should stay in the sheet");
     await user.click(screen.getByRole("button", { name: "Create & send" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Create session request failed with 500");
+    expect(await screen.findByRole("alert")).toHaveTextContent("workspace is unavailable");
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Pairing link expired");
     expect(textarea).toHaveValue("This should stay in the sheet");
+    expect(screen.getByRole("img", { name: "phone.png" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Workspace")).toHaveValue("/repo/existing");
     expect(screen.getByRole("heading", { name: "Existing thread" })).toBeInTheDocument();
     expect(screen.getByLabelText("Connection status")).toHaveTextContent("Writable");
+
+    await act(async () => {
+      resolveWorkspaceReload?.(jsonResponse([{ cwd: "/repo/existing" }]));
+      await workspaceReload;
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("workspace is unavailable")).not.toBeInTheDocument();
+    });
+    expect(textarea).toHaveValue("This should stay in the sheet");
+    expect(screen.getByRole("img", { name: "phone.png" })).toBeInTheDocument();
+  });
+
+  it("does_not_treat_a_code_less_create_error_as_an_expired_pairing_link", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions" && init?.method === "POST") {
+        return jsonResponse({ error: "invalid create request" }, 400);
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-existing",
+            title: "Existing thread",
+            cwd: "/repo/existing",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/workspaces") {
+        return jsonResponse([{ cwd: "/repo/existing" }]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-existing/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Existing thread" });
+    await user.click(screen.getByRole("button", { name: "New session" }));
+    await user.type(screen.getByLabelText("First message for new session"), "Invalid request");
+    await user.click(screen.getByRole("button", { name: "Create & send" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("invalid create request");
+    expect(screen.getByRole("alert")).not.toHaveTextContent("Pairing link expired");
   });
 
   it("polls_selected_thread_events_after_initial_load", async () => {
