@@ -3,8 +3,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import App, { appendOrMergeSessionEvent, mergePolledSessionEvents, nextPollDelay } from "./App";
+import App, {
+  appendOrMergeSessionEvent,
+  connectionStateForError,
+  mergeIncrementalSessionEvents,
+  mergePolledSessionEvents,
+  nextPollDelay,
+} from "./App";
 import type { SessionEvent, SessionSnapshot } from "@codex/bridge-protocol";
+import { ApiError } from "./api";
 import { clearSession, loadSession, saveSession } from "./storage";
 
 const originalScrollTo = (HTMLElement.prototype as Partial<HTMLElement>).scrollTo;
@@ -42,6 +49,24 @@ describe("App", () => {
     expect(screen.getByText("No live sessions yet. Use the newest pairing URL from the bridge terminal.")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "No sessions available" })).toBeInTheDocument();
     expect(screen.getByPlaceholderText("Message No session selected")).toBeDisabled();
+  });
+
+  it("shows_the_running_bridge_version_from_health", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable", version: "9.9.9" });
+      }
+      if (url === "http://bridge.local/api/sessions" || url === "http://bridge.local/api/approvals") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("v9.9.9")).toBeInTheDocument();
   });
 
   it("opens_and_closes_the_mobile_session_drawer", async () => {
@@ -451,7 +476,7 @@ describe("App", () => {
     });
     expect(replaceState).toHaveBeenCalledWith(null, "", "/?keep=1");
     expect(loadSession()?.sessionToken).toBe("new-token");
-    expect(globalThis.fetch).toHaveBeenCalledTimes(4);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(5);
     expect(globalThis.fetch).toHaveBeenCalledWith(
       "http://stale.local/api/pairing/complete",
       expect.objectContaining({ method: "POST" }),
@@ -460,6 +485,9 @@ describe("App", () => {
       "http://bridge.local/api/session/refresh",
       expect.objectContaining({ method: "POST" }),
     );
+    expect(globalThis.fetch).toHaveBeenCalledWith("http://bridge.local/api/approvals", {
+      headers: { Authorization: "Bearer new-token" },
+    });
   });
 
   it("shares_in_flight_pairing_request_under_strict_mode", async () => {
@@ -865,6 +893,75 @@ describe("App", () => {
     });
   });
 
+  it("defers_attachment_download_until_the_image_placeholder_is_visible", async () => {
+    stubObjectUrls();
+    saveActiveSession();
+    let revealAttachment: (() => void) | null = null;
+    vi.stubGlobal(
+      "IntersectionObserver",
+      class {
+        constructor(callback: IntersectionObserverCallback) {
+          revealAttachment = () => {
+            callback(
+              [{ isIntersecting: true } as IntersectionObserverEntry],
+              this as unknown as IntersectionObserver,
+            );
+          };
+        }
+
+        observe() {}
+        disconnect() {}
+      },
+    );
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-image", title: "Image thread", preview: "Attachment" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-image/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-image",
+            threadId: "thread-image",
+            payload: {
+              role: "user",
+              text: "lazy attachment",
+              attachments: [
+                { type: "image", src: "/api/assets/local-image/asset-lazy", name: "lazy.png" },
+              ],
+            },
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/assets/local-image/asset-lazy") {
+        return new Response(new Blob(["png"], { type: "image/png" }), {
+          status: 200,
+          headers: { "Content-Type": "image/png" },
+        });
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("lazy attachment")).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "http://bridge.local/api/assets/local-image/asset-lazy",
+      expect.anything(),
+    );
+
+    act(() => {
+      revealAttachment?.();
+    });
+
+    expect(await screen.findByRole("img", { name: "lazy.png" })).toHaveAttribute("src", "blob:codex-image");
+  });
+
   it("shows_attachment_failure_when_image_proxy_rejects_asset", async () => {
     stubObjectUrls();
     saveActiveSession();
@@ -1015,15 +1112,53 @@ describe("App", () => {
         "http://bridge.local/api/sessions/thread-send/messages",
         expect.objectContaining({
           method: "POST",
-          headers: {
+          headers: expect.objectContaining({
             Authorization: "Bearer session-1",
             "Content-Type": "application/json",
-          },
+            "X-Codex-Client-Message-Id": expect.any(String),
+          }),
           body: JSON.stringify({ text: "continue from phone" }),
         }),
       );
     });
     expect(input).toHaveValue("");
+  });
+
+  it("removes_optimistic_message_and_keeps_draft_when_send_fails", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-send", title: "Reply target", preview: "Waiting" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-send/events") {
+        return jsonResponse([]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-send/messages" && init?.method === "POST") {
+        return jsonResponse({ error: "temporary tunnel failure" }, 502);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const input = await screen.findByPlaceholderText("Message Reply target");
+    await user.type(input, "retry from phone");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(await screen.findByRole("alert", undefined, { timeout: 3_000 })).toHaveTextContent(
+      "Message not sent. Send message request failed with 502",
+    );
+    expect(input).toHaveValue("retry from phone");
+    expect(
+      within(screen.getByLabelText("Session event stream")).queryByText("retry from phone"),
+    ).not.toBeInTheDocument();
   });
 
   it("send_message_can_include_image_attachment", async () => {
@@ -1066,10 +1201,11 @@ describe("App", () => {
         "http://bridge.local/api/sessions/thread-send/messages",
         expect.objectContaining({
           method: "POST",
-          headers: {
+          headers: expect.objectContaining({
             Authorization: "Bearer session-1",
             "Content-Type": "application/json",
-          },
+            "X-Codex-Client-Message-Id": expect.any(String),
+          }),
           body: JSON.stringify({
             text: "look at this",
             attachments: [
@@ -1184,7 +1320,8 @@ describe("App", () => {
   it("polls_selected_thread_events_after_initial_load", async () => {
     saveActiveSession();
     let eventFetches = 0;
-    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const eventRequestHeaders: Headers[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
       if (url === "http://bridge.local/api/health") {
         return jsonResponse({ status: "ok", connectionState: "writable" });
@@ -1196,16 +1333,30 @@ describe("App", () => {
       }
       if (url === "http://bridge.local/api/sessions/thread-poll/events") {
         eventFetches += 1;
-        return jsonResponse([
-          sessionEvent({
-            id: eventFetches === 1 ? "event-initial" : "event-polled",
-            threadId: "thread-poll",
-            payload: {
-              role: "assistant",
-              text: eventFetches === 1 ? "Initial load" : "Polled reply",
-            },
-          }),
-        ]);
+        eventRequestHeaders.push(new Headers(init?.headers));
+        const initial = sessionEvent({
+          id: "event-initial",
+          threadId: "thread-poll",
+          payload: { role: "assistant", text: "Initial load" },
+        });
+        return jsonResponse({
+          events: eventFetches === 1
+            ? [initial]
+            : [
+                initial,
+                sessionEvent({
+                  id: "event-polled",
+                  threadId: "thread-poll",
+                  payload: { role: "assistant", text: "Polled reply" },
+                  createdAt: 1_783_515_390_000,
+                }),
+              ],
+          beforeCursor: "event-initial",
+          afterCursor: eventFetches === 1 ? "event-initial" : "event-polled",
+          hasMoreBefore: false,
+          hasMoreAfter: false,
+          reset: false,
+        });
       }
       return jsonResponse({});
     });
@@ -1221,7 +1372,71 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByText("Polled reply")).toBeInTheDocument();
     });
+    expect(screen.getByText("Initial load")).toBeInTheDocument();
     expect(eventFetches).toBeGreaterThanOrEqual(2);
+    expect(eventRequestHeaders[0].get("X-Codex-Events-Limit")).toBe("50");
+    expect(eventRequestHeaders[0].get("X-Codex-Events-Since")).toBeNull();
+    expect(eventRequestHeaders[1].get("X-Codex-Events-Limit")).toBe("100");
+    expect(eventRequestHeaders[1].get("X-Codex-Events-Since")).toBe("event-initial");
+  });
+
+  it("loads_earlier_messages_from_the_before_cursor", async () => {
+    const user = userEvent.setup();
+    saveActiveSession();
+    const eventRequestHeaders: Headers[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({ threadId: "thread-history", title: "History target", preview: "Latest" }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-history/events") {
+        const headers = new Headers(init?.headers);
+        eventRequestHeaders.push(headers);
+        if (headers.get("X-Codex-Events-Before") === "event-3") {
+          return jsonResponse({
+            events: [
+              sessionEvent({ id: "event-1", threadId: "thread-history", payload: { role: "user", text: "Old one" }, createdAt: 1 }),
+              sessionEvent({ id: "event-2", threadId: "thread-history", payload: { role: "assistant", text: "Old two" }, createdAt: 2 }),
+            ],
+            beforeCursor: "event-1",
+            afterCursor: "event-2",
+            hasMoreBefore: false,
+            hasMoreAfter: true,
+            reset: false,
+          });
+        }
+        return jsonResponse({
+          events: [
+            sessionEvent({ id: "event-3", threadId: "thread-history", payload: { role: "user", text: "Recent three" }, createdAt: 3 }),
+            sessionEvent({ id: "event-4", threadId: "thread-history", payload: { role: "assistant", text: "Recent four" }, createdAt: 4 }),
+          ],
+          beforeCursor: "event-3",
+          afterCursor: "event-4",
+          hasMoreBefore: true,
+          hasMoreAfter: false,
+          reset: false,
+        });
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("Recent four")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load earlier messages" }));
+
+    expect(await screen.findByText("Old one")).toBeInTheDocument();
+    expect(screen.getByText("Old two")).toBeInTheDocument();
+    expect(screen.getByText("Recent three")).toBeInTheDocument();
+    expect(screen.getByText("Recent four")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Load earlier messages" })).not.toBeInTheDocument();
+    expect(eventRequestHeaders[1].get("X-Codex-Events-Limit")).toBe("50");
+    expect(eventRequestHeaders[1].get("X-Codex-Events-Before")).toBe("event-3");
   });
 
   it("recovers_connection_status_after_visible_session_poll_succeeds", async () => {
@@ -1250,8 +1465,10 @@ describe("App", () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Connection error");
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Reconnecting");
     });
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("Retrying automatically");
+    expect(screen.getByLabelText("Connection status")).not.toHaveTextContent("Needs new link");
 
     act(() => {
       document.dispatchEvent(new Event("visibilitychange"));
@@ -1299,6 +1516,18 @@ describe("App", () => {
     expect(nextPollDelay(2_000, 2, "visible")).toBe(8_000);
     expect(nextPollDelay(2_000, 0, "hidden")).toBe(12_000);
     expect(nextPollDelay(5_000, 5, "hidden")).toBe(30_000);
+  });
+
+  it("only_suggests_a_new_link_after_three_transient_failures", () => {
+    const error = new ApiError(502, "Sessions request failed with 502");
+
+    expect(connectionStateForError(error, 1).label).toBe("Reconnecting");
+    expect(connectionStateForError(error, 2).label).toBe("Reconnecting");
+    expect(connectionStateForError(error, 3)).toEqual({
+      label: "Connection error",
+      detail:
+        "Sessions request failed with 502. The public link has failed repeatedly; open the newest link from the Mac.",
+    });
   });
 
   it("renders_empty_state_and_disables_composer_when_sessions_are_empty", async () => {
@@ -1368,6 +1597,50 @@ describe("App", () => {
 
     expect(await screen.findByRole("heading", { name: "Pending approvals" })).toBeInTheDocument();
     expect(await screen.findByText("Run real check")).toBeInTheDocument();
+  });
+
+  it("renders_real_desktop_approval_from_authenticated_polling", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-approval",
+            title: "Phone-created task",
+            preview: "Waiting for MCP approval",
+            status: "waiting_for_approval",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/approvals") {
+        return jsonResponse([
+          {
+            id: "thread-approval:7",
+            threadId: "thread-approval",
+            kind: "mcp",
+            title: "Allow read_memory",
+            detail: "uri: system://boot",
+            riskHint: "MCP server: mcpServers",
+            createdAt: 1_783_584_000_000,
+          },
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-approval/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Pending approvals" })).toBeInTheDocument();
+    expect(await screen.findByText("Allow read_memory")).toBeInTheDocument();
+    expect(screen.getByText("uri: system://boot")).toBeInTheDocument();
+    expect(screen.getByText("MCP server: mcpServers")).toBeInTheDocument();
   });
 
   it("replaces_non_pending_ws_events_when_http_snapshot_resolves_later", async () => {
@@ -1630,6 +1903,71 @@ describe("App", () => {
     });
   });
 
+  it("reconciles_bridge_echo_that_arrives_before_new_session_optimistic_message", () => {
+    const bridgeEcho = sessionEvent({
+      id: "550e8400-e29b-41d4-a716-446655440000",
+      threadId: "thread-new",
+      payload: { role: "user", text: "same new task" },
+      createdAt: 1_783_515_390_000,
+    });
+    const optimistic = sessionEvent({
+      id: "local-new-session-1",
+      threadId: "thread-new",
+      payload: { role: "user", text: "same new task", pending: true },
+      createdAt: 1_783_515_390_100,
+    });
+
+    const merged = appendOrMergeSessionEvent([bridgeEcho], optimistic);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].id).toBe(bridgeEcho.id);
+  });
+
+  it("replaces_pending_and_uuid_bridge_echo_when_incremental_codex_turn_arrives", () => {
+    const current = [
+      sessionEvent({
+        id: "local-1",
+        threadId: "thread-send",
+        payload: { role: "user", text: "今年世界杯什么时候结束", pending: true },
+        createdAt: 1_783_515_390_000,
+      }),
+      sessionEvent({
+        id: "550e8400-e29b-41d4-a716-446655440001",
+        threadId: "thread-send",
+        payload: { role: "user", text: "今年世界杯什么时候结束" },
+        createdAt: 1_783_515_390_100,
+      }),
+    ];
+    const incremental = [
+      sessionEvent({
+        id: "turn-new:item-1",
+        threadId: "thread-send",
+        payload: { role: "user", text: "今年世界杯什么时候结束" },
+        createdAt: 1_783_515_389_000,
+      }),
+      sessionEvent({
+        id: "turn-new:item-6",
+        threadId: "thread-send",
+        payload: { role: "assistant", text: "比赛将在 7 月结束。" },
+        createdAt: 1_783_515_389_000,
+      }),
+    ];
+
+    const merged = mergeIncrementalSessionEvents(current, incremental);
+
+    expect(merged.map((event) => event.id)).toEqual(["turn-new:item-1", "turn-new:item-6"]);
+    expect(
+      merged.filter(
+        (event) =>
+          event.payload &&
+          typeof event.payload === "object" &&
+          !Array.isArray(event.payload) &&
+          event.payload.role === "user" &&
+          event.payload.text === "今年世界杯什么时候结束",
+      ),
+    ).toHaveLength(1);
+  });
+
   it("keeps_polled_events_oldest_first_and_reconciles_pending_echo_with_newline", () => {
     const current = [
       sessionEvent({
@@ -1669,6 +2007,38 @@ describe("App", () => {
       "turn-new:item-2",
     ]);
     expect(merged.map((event) => event.payload).filter((payload) => payload && typeof payload === "object" && "text" in payload && payload.text === "continue")).toHaveLength(0);
+  });
+
+  it("merges_incremental_event_pages_without_dropping_loaded_history", () => {
+    const current = [
+      sessionEvent({
+        id: "event-1",
+        payload: { role: "assistant", text: "Older history" },
+        createdAt: 1_783_515_380_000,
+      }),
+      sessionEvent({
+        id: "event-2",
+        payload: { role: "assistant", text: "Working" },
+        createdAt: 1_783_515_390_000,
+      }),
+    ];
+    const incremental = [
+      sessionEvent({
+        id: "event-2",
+        payload: { role: "assistant", text: "Finished" },
+        createdAt: 1_783_515_390_000,
+      }),
+      sessionEvent({
+        id: "event-3",
+        payload: { role: "assistant", text: "New reply" },
+        createdAt: 1_783_515_400_000,
+      }),
+    ];
+
+    const merged = mergeIncrementalSessionEvents(current, incremental);
+
+    expect(merged.map((event) => event.id)).toEqual(["event-1", "event-2", "event-3"]);
+    expect(merged[1].payload).toMatchObject({ text: "Finished" });
   });
 
   it("treats_polled_events_as_authoritative_and_drops_stale_carried_ws_events", () => {

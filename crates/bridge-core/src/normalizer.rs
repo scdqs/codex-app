@@ -232,20 +232,54 @@ fn role_from_item(item: &Value) -> &'static str {
 }
 
 fn status_from_value(value: &Value) -> Option<SessionStatus> {
-    let raw = string_field(
-        value,
-        &["status", "state", "connectionState", "connection_state"],
-    )?
-    .to_ascii_lowercase();
+    let status = ["status", "state", "connectionState", "connection_state"]
+        .iter()
+        .find_map(|key| value.get(*key))?;
+
+    if let Some(raw) = status.as_str() {
+        return status_from_str(raw);
+    }
+
+    let status = status.as_object()?;
+    let active_flags = status
+        .get("activeFlags")
+        .or_else(|| status.get("active_flags"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|flag| flag.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    if active_flags.iter().any(|flag| flag == "waitingonapproval") {
+        return Some(SessionStatus::WaitingForApproval);
+    }
+    if active_flags.iter().any(|flag| flag == "waitingonuserinput") {
+        return Some(SessionStatus::WaitingForInput);
+    }
+
+    status
+        .get("type")
+        .or_else(|| status.get("status"))
+        .and_then(Value::as_str)
+        .and_then(status_from_str)
+}
+
+fn status_from_str(raw: &str) -> Option<SessionStatus> {
+    let raw = raw.to_ascii_lowercase();
     match raw.as_str() {
         "idle" | "completed" | "complete" | "done" => Some(SessionStatus::Idle),
-        "running" | "in_progress" | "streaming" | "working" => Some(SessionStatus::Running),
+        "active" | "running" | "in_progress" | "streaming" | "working" => {
+            Some(SessionStatus::Running)
+        }
         "waiting_for_input" | "needs_input" | "input_required" | "awaiting_input"
         | "requires_input" => Some(SessionStatus::WaitingForInput),
         "waiting_for_approval" | "approval_required" | "waiting_approval" | "needs_approval" => {
             Some(SessionStatus::WaitingForApproval)
         }
-        "error" | "failed" | "failure" => Some(SessionStatus::Error),
+        "error" | "failed" | "failure" | "systemerror" | "system_error" => {
+            Some(SessionStatus::Error)
+        }
         _ => None,
     }
 }
@@ -494,6 +528,29 @@ mod tests {
         assert_eq!(snapshot.updated_at, 1_725_000_000_000);
         assert_eq!(snapshot.status, SessionStatus::Running);
         assert_eq!(snapshot.pending_approval_ids, vec!["approval-1"]);
+    }
+
+    #[test]
+    fn maps_active_waiting_on_approval_status_object() {
+        let thread = CodexThread {
+            id: "thread-approval".to_string(),
+            title: Some("Approval needed".to_string()),
+            cwd: Some("/repo".to_string()),
+            model_provider: Some("custom".to_string()),
+            preview: None,
+            created_at: Some(1_725_000_000),
+            updated_at: Some(1_725_000_001),
+            raw: json!({
+                "status": {
+                    "type": "active",
+                    "activeFlags": ["waitingOnApproval"]
+                }
+            }),
+        };
+
+        let snapshot = Normalizer::snapshot_from_thread(&thread);
+
+        assert_eq!(snapshot.status, SessionStatus::WaitingForApproval);
     }
 
     #[test]

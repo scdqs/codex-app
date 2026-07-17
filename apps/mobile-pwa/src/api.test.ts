@@ -5,7 +5,10 @@ import {
   connectWebSocket,
   createSession,
   fetchAssetBlob,
+  listApprovals,
+  listSessionEvents,
   readPairingPayloadFromUrl,
+  sendTextMessage,
 } from "./api";
 import { clearSession, loadSession, saveSession } from "./storage";
 
@@ -13,6 +16,7 @@ describe("pairing API helpers", () => {
   const expiresAt = 1_783_584_000_000;
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     clearSession();
@@ -253,6 +257,119 @@ describe("pairing API helpers", () => {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ text: "Start from phone" }),
+    });
+  });
+
+  it("sendTextMessage_retries_transient_502_with_the_same_client_message_id", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse({ error: "temporary tunnel failure" }, 502))
+      .mockResolvedValueOnce(jsonResponse({ accepted: true }, 202));
+
+    const sendPromise = sendTextMessage(
+      "https://bridge.example",
+      "session-1",
+      "thread-1",
+      "retry safely",
+      [],
+      "client-message-1",
+    );
+    await vi.runAllTimersAsync();
+    await sendPromise;
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "https://bridge.example/api/sessions/thread-1/messages",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "X-Codex-Client-Message-Id": "client-message-1",
+        }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "https://bridge.example/api/sessions/thread-1/messages",
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          "X-Codex-Client-Message-Id": "client-message-1",
+        }),
+      }),
+    );
+  });
+
+  it("listApprovals_fetches_and_validates_pending_desktop_approvals", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse([
+        {
+          id: "thread-approval:7",
+          threadId: "thread-approval",
+          kind: "mcp",
+          title: "Allow read_memory",
+          detail: "uri: system://boot",
+          riskHint: "MCP server: mcpServers",
+          createdAt: 1_783_584_000_000,
+        },
+      ]),
+    );
+
+    const approvals = await listApprovals("http://bridge.local", "session-1");
+
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]).toMatchObject({
+      id: "thread-approval:7",
+      threadId: "thread-approval",
+      kind: "mcp",
+      title: "Allow read_memory",
+    });
+    expect(fetchMock).toHaveBeenCalledWith("http://bridge.local/api/approvals", {
+      headers: { Authorization: "Bearer session-1" },
+    });
+  });
+
+  it("listSessionEvents_requests_and_parses_a_bounded_incremental_page", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse({
+        events: [
+          {
+            id: "event-2",
+            threadId: "thread-1",
+            type: "message",
+            payload: { role: "assistant", text: "Latest reply" },
+            createdAt: 1_783_584_000_000,
+          },
+        ],
+        beforeCursor: "event-2",
+        afterCursor: "event-2",
+        hasMoreBefore: true,
+        hasMoreAfter: false,
+        reset: false,
+      }),
+    );
+
+    const page = await listSessionEvents(
+      "http://bridge.local",
+      "session-1",
+      "thread-1",
+      { limit: 50, since: "event-1" },
+    );
+
+    expect(page).toMatchObject({
+      beforeCursor: "event-2",
+      afterCursor: "event-2",
+      hasMoreBefore: true,
+      hasMoreAfter: false,
+      reset: false,
+      legacySnapshot: false,
+    });
+    expect(page.events.map((event) => event.id)).toEqual(["event-2"]);
+    expect(fetchMock).toHaveBeenCalledWith("http://bridge.local/api/sessions/thread-1/events", {
+      headers: {
+        Authorization: "Bearer session-1",
+        "X-Codex-Events-Limit": "50",
+        "X-Codex-Events-Since": "event-1",
+      },
     });
   });
 });

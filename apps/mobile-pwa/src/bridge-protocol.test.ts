@@ -63,9 +63,11 @@ describe("shared bridge protocol", () => {
     expect(secondaryStatusText("Writable")).toBe("Writable");
     expect(secondaryStatusText("Inject failed")).toBe("Desktop bridge unavailable");
     expect(secondaryStatusText("ChatGPT/Codex not running")).toBe("Start desktop app");
+    expect(secondaryStatusText("Reconnecting")).toBe("Retrying automatically");
     expect(secondaryStatusText("Connection error")).toBe("Needs new link");
     expect(isSessionDataEnabled("Writable")).toBe(true);
     expect(isSessionDataEnabled("Read-only")).toBe(true);
+    expect(isSessionDataEnabled("Reconnecting")).toBe(true);
     expect(isSessionDataEnabled("Connection error")).toBe(false);
   });
 });

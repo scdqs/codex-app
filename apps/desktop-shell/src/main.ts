@@ -26,6 +26,7 @@ type TunnelSnapshot = {
 };
 
 type ShellStatus = {
+  appVersion: string;
   bridge: BridgeSnapshot;
   tunnel: TunnelSnapshot;
   lastPairingLink: string | null;
@@ -70,7 +71,7 @@ function bridgeRunning() {
 }
 
 function tunnelRunning() {
-  return status?.tunnel.status === "ready";
+  return status?.tunnel.status === "ready" || status?.tunnel.status === "reconnecting";
 }
 
 function setBusy(nextBusy: boolean) {
@@ -115,6 +116,15 @@ async function refresh(showErrors = true) {
   render();
 }
 
+async function refreshShellStatus() {
+  try {
+    status = await invoke<ShellStatus>("get_app_status");
+  } catch {
+    return;
+  }
+  render();
+}
+
 function render() {
   syncPairingQr();
   const bridge = status?.bridge;
@@ -123,7 +133,7 @@ function render() {
     <section class="shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">Codex Mobile Bridge</p>
+          <p class="eyebrow">Codex Mobile Bridge <span class="app-version">v${escapeHtml(status?.appVersion ?? "-")}</span></p>
           <h1>Mac 控制台</h1>
         </div>
         <div class="top-actions">
@@ -402,3 +412,4 @@ function escapeHtml(value: string) {
 }
 
 void refresh(false);
+window.setInterval(() => void refreshShellStatus(), 5_000);

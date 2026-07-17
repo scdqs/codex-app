@@ -114,6 +114,13 @@ button {
   gap: 10px;
 }
 
+.app-version {
+  margin-left: 7px;
+  color: #9ba8b1;
+  font-variant-numeric: tabular-nums;
+  text-transform: none;
+}
+
 .status-dot {
   width: 10px;
   height: 10px;
@@ -406,6 +413,25 @@ h3 {
 .event-stream {
   flex: 1;
   align-content: start;
+}
+
+.event-history-loader {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 8px;
+}
+
+.event-history-loader button {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-strong);
+  color: var(--text-soft);
+  font-size: 0.74rem;
 }
 
 .session-row {

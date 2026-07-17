@@ -53,6 +53,7 @@ import {
   decideApproval,
   fetchAssetBlob,
   getHealth,
+  listApprovals,
   listSessionEvents,
   listSessions,
   readPairingPayloadFromUrl,
@@ -61,14 +62,19 @@ import {
   type HealthResponse,
   type OutgoingImageAttachment,
   type PairingPayload,
+  type SessionEventPage,
+  type SessionEventPageOptions,
 } from "./api";
 import { createDeviceSession, loadSession, saveSession, type DeviceSession } from "./storage";
 
 const pairingAttempts = new Map<string, Promise<DeviceSession>>();
 const SESSION_LIST_REFRESH_MS = 5_000;
 const SESSION_EVENTS_REFRESH_MS = 2_000;
+const INITIAL_EVENT_PAGE_LIMIT = 50;
+const INCREMENTAL_EVENT_PAGE_LIMIT = 100;
 const HIDDEN_PAGE_POLL_MULTIPLIER = 6;
 const MAX_POLL_BACKOFF_MS = 30_000;
+const TRANSIENT_FAILURES_BEFORE_NEW_LINK = 3;
 const MAX_DRAFT_IMAGE_ATTACHMENTS = 4;
 const MAX_DRAFT_IMAGE_BYTES = 8 * 1024 * 1024;
 const SUPPORTED_DRAFT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
@@ -82,19 +88,30 @@ interface DraftImageAttachment {
   size: number;
 }
 
+interface SessionEventSyncState {
+  initialized: boolean;
+  beforeCursor?: string;
+  afterCursor?: string;
+  hasMoreBefore: boolean;
+  loadingOlder: boolean;
+}
+
 function App() {
   const [selectedThreadId, setSelectedThreadId] = useState("");
   const [draft, setDraft] = useState("");
   const [draftImages, setDraftImages] = useState<DraftImageAttachment[]>([]);
   const [draftAttachmentError, setDraftAttachmentError] = useState("");
+  const [messageSendError, setMessageSendError] = useState("");
   const [isSessionDrawerOpen, setIsSessionDrawerOpen] = useState(false);
   const [isNewSessionSheetOpen, setIsNewSessionSheetOpen] = useState(false);
   const [newSessionDraft, setNewSessionDraft] = useState("");
   const [newSessionError, setNewSessionError] = useState("");
   const [connection, setConnection] = useState<ConnectionViewState>({ label: "Unpaired" });
+  const [bridgeVersion, setBridgeVersion] = useState<string | null>(null);
   const [deviceSession, setDeviceSession] = useState<DeviceSession | null>(null);
   const [liveSessions, setLiveSessions] = useState<SessionSnapshot[] | null>(null);
   const [eventsByThread, setEventsByThread] = useState<Record<string, SessionEvent[]>>({});
+  const [eventSyncByThread, setEventSyncByThread] = useState<Record<string, SessionEventSyncState>>({});
   const [liveApprovals, setLiveApprovals] = useState<ApprovalRequest[]>([]);
   const [socketReconnectNonce, setSocketReconnectNonce] = useState(0);
   const [sending, setSending] = useState(false);
@@ -103,9 +120,11 @@ function App() {
   const sessionRefreshPromiseRef = useRef<Promise<DeviceSession> | null>(null);
   const sessionListFailureCountRef = useRef(0);
   const sessionEventsFailureCountRef = useRef(0);
+  const eventSyncByThreadRef = useRef<Record<string, SessionEventSyncState>>({});
   const draftImagesRef = useRef<DraftImageAttachment[]>([]);
   const canSyncSessionData =
     Boolean(deviceSession) && (isSessionDataEnabled(connection.label) || connection.label === "Connection error");
+  const sessionDataLoaded = liveSessions !== null;
   const sessions = liveSessions ?? [];
   const approvals = liveApprovals;
   const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? null;
@@ -113,6 +132,7 @@ function App() {
     ? approvals.filter((approval) => approval.threadId === selectedSession.threadId)
     : [];
   const selectedEvents = selectedSession ? eventsByThread[selectedSession.threadId] ?? [] : [];
+  const selectedEventSync = selectedSession ? eventSyncByThread[selectedSession.threadId] : undefined;
   const pendingCount = approvals.length;
   const canSend = (connection.label === "Connected" || connection.label === "Writable") && Boolean(deviceSession) && Boolean(selectedSession);
   const canCreateSession = (connection.label === "Connected" || connection.label === "Writable") && Boolean(deviceSession);
@@ -123,6 +143,11 @@ function App() {
     }
     return secondaryStatusText(connection.label);
   }, [connection.label, pendingCount]);
+
+  function applyHealth(health: HealthResponse) {
+    setBridgeVersion(health.version ?? null);
+    setConnection(mapHealthToConnection(health));
+  }
 
   async function refreshActiveSession(activeSession: DeviceSession): Promise<DeviceSession> {
     if (!sessionRefreshPromiseRef.current) {
@@ -144,7 +169,7 @@ function App() {
           }
           return nextSession;
         });
-        setConnection(mapHealthToConnection(health));
+        applyHealth(health);
         return nextSession;
       })().finally(() => {
         sessionRefreshPromiseRef.current = null;
@@ -155,7 +180,54 @@ function App() {
   }
 
   function markSessionDataRecovered() {
-    setConnection((current) => (current.label === "Connection error" ? { label: "Writable" } : current));
+    setConnection((current) =>
+      current.label === "Connection error" || current.label === "Reconnecting" ? { label: "Writable" } : current,
+    );
+  }
+
+  function updateEventSyncState(
+    threadId: string,
+    update: (current: SessionEventSyncState) => SessionEventSyncState,
+  ): SessionEventSyncState {
+    const current = eventSyncByThreadRef.current[threadId] ?? {
+      initialized: false,
+      hasMoreBefore: false,
+      loadingOlder: false,
+    };
+    const nextState = update(current);
+    const nextByThread = {
+      ...eventSyncByThreadRef.current,
+      [threadId]: nextState,
+    };
+    eventSyncByThreadRef.current = nextByThread;
+    setEventSyncByThread(nextByThread);
+    return nextState;
+  }
+
+  async function listSessionEventPageWithRefresh(
+    session: DeviceSession,
+    activeThreadId: string,
+    options: SessionEventPageOptions,
+  ): Promise<SessionEventPage> {
+    try {
+      return await listSessionEvents(
+        session.bridgeUrl,
+        session.sessionToken,
+        activeThreadId,
+        options,
+      );
+    } catch (error) {
+      if (!isAuthError(error)) {
+        throw error;
+      }
+      const refreshedSession = await refreshActiveSession(session);
+      return listSessionEvents(
+        refreshedSession.bridgeUrl,
+        refreshedSession.sessionToken,
+        activeThreadId,
+        options,
+      );
+    }
   }
 
   useEffect(() => {
@@ -174,7 +246,7 @@ function App() {
             clearPairingParamsFromUrl();
             const health = await getHealth(pairingBridgeUrl, pairedSession.sessionToken);
             if (!cancelled) {
-              setConnection(mapHealthToConnection(health));
+              applyHealth(health);
               setDeviceSession(pairedSession);
             }
             return;
@@ -207,7 +279,7 @@ function App() {
           saveSession(nextSession);
           const health = await getHealth(bridgeUrl, nextSession.sessionToken);
           if (!cancelled) {
-            setConnection(mapHealthToConnection(health));
+            applyHealth(health);
             setDeviceSession(nextSession);
           }
           return;
@@ -216,17 +288,20 @@ function App() {
         setConnection({ label: "Connected" });
         const { health, session } = await getHealthWithRefresh(bridgeUrl, savedSession);
         if (!cancelled) {
-          setConnection(mapHealthToConnection(health));
+          applyHealth(health);
           setDeviceSession(session);
         }
       } catch (error) {
         if (cancelled) {
           return;
         }
-        setConnection({
-          label: "Connection error",
-          detail: connectionErrorText(error),
-        });
+        const failureState = savedSession
+          ? connectionStateForError(error, 1)
+          : { label: "Connection error" as const, detail: connectionErrorText(error) };
+        if (savedSession && failureState.label === "Reconnecting") {
+          setDeviceSession(savedSession);
+        }
+        setConnection(failureState);
       }
     }
 
@@ -253,7 +328,10 @@ function App() {
       }
       loading = true;
       try {
-        const items = await listSessionsWithRefresh(activeSession);
+        const [items, polledApprovals] = await Promise.all([
+          listSessionsWithRefresh(activeSession),
+          listApprovalsWithRefresh(activeSession).catch(() => null),
+        ]);
         if (cancelled) {
           return;
         }
@@ -261,6 +339,9 @@ function App() {
         markSessionDataRecovered();
         const sorted = sortSessions(items);
         setLiveSessions(sorted);
+        if (polledApprovals) {
+          setLiveApprovals(polledApprovals);
+        }
         setSelectedThreadId((current) => {
           if (sorted.some((session) => session.threadId === current)) {
             return current;
@@ -269,11 +350,9 @@ function App() {
         });
       } catch (error) {
         if (!cancelled) {
-          sessionListFailureCountRef.current += 1;
-          setConnection({
-            label: "Connection error",
-            detail: connectionErrorText(error),
-          });
+          const failureCount = sessionListFailureCountRef.current + 1;
+          sessionListFailureCountRef.current = failureCount;
+          setConnection(connectionStateForError(error, failureCount));
         }
       } finally {
         loading = false;
@@ -290,6 +369,18 @@ function App() {
         }
         const refreshedSession = await refreshActiveSession(session);
         return listSessions(refreshedSession.bridgeUrl, refreshedSession.sessionToken);
+      }
+    }
+
+    async function listApprovalsWithRefresh(session: DeviceSession): Promise<ApprovalRequest[]> {
+      try {
+        return await listApprovals(session.bridgeUrl, session.sessionToken);
+      } catch (error) {
+        if (!isAuthError(error)) {
+          throw error;
+        }
+        const refreshedSession = await refreshActiveSession(session);
+        return listApprovals(refreshedSession.bridgeUrl, refreshedSession.sessionToken);
       }
     }
 
@@ -327,7 +418,7 @@ function App() {
   }, [canSyncSessionData, deviceSession]);
 
   useEffect(() => {
-    if (!deviceSession || !liveSessions || !selectedSession) {
+    if (!deviceSession || !sessionDataLoaded || !selectedThreadId) {
       return;
     }
 
@@ -335,56 +426,65 @@ function App() {
     let loading = false;
     let timeoutId: number | null = null;
     const activeSession = deviceSession;
-    const threadId = selectedSession.threadId;
+    const threadId = selectedThreadId;
 
     async function loadEvents() {
       if (loading) {
         return;
       }
       loading = true;
+      let catchUpImmediately = false;
       try {
-        const items = await listSessionEventsWithRefresh(activeSession, threadId);
+        const syncState = eventSyncByThreadRef.current[threadId];
+        const page = await listSessionEventPageWithRefresh(
+          activeSession,
+          threadId,
+          syncState?.initialized && syncState.afterCursor
+            ? { limit: INCREMENTAL_EVENT_PAGE_LIMIT, since: syncState.afterCursor }
+            : { limit: INITIAL_EVENT_PAGE_LIMIT },
+        );
         if (!cancelled) {
           sessionEventsFailureCountRef.current = 0;
           markSessionDataRecovered();
           setEventsByThread((current) => ({
             ...current,
-            [threadId]: mergePolledSessionEvents(current[threadId] ?? [], items),
+            [threadId]: page.legacySnapshot || !syncState?.initialized || page.reset
+              ? mergePolledSessionEvents(current[threadId] ?? [], page.events)
+              : mergeIncrementalSessionEvents(current[threadId] ?? [], page.events),
           }));
+          const canonicalPage = page.legacySnapshot || !syncState?.initialized || page.reset;
+          updateEventSyncState(threadId, (currentSync) => ({
+            initialized: true,
+            beforeCursor: canonicalPage
+              ? page.beforeCursor
+              : currentSync.beforeCursor ?? page.beforeCursor,
+            afterCursor: page.afterCursor ?? currentSync.afterCursor,
+            hasMoreBefore: canonicalPage
+              ? page.hasMoreBefore
+              : currentSync.hasMoreBefore,
+            loadingOlder: currentSync.loadingOlder,
+          }));
+          catchUpImmediately = !page.legacySnapshot && page.hasMoreAfter;
         }
       } catch (error) {
         if (!cancelled) {
-          sessionEventsFailureCountRef.current += 1;
-          setConnection({
-            label: "Connection error",
-            detail: connectionErrorText(error),
-          });
+          const failureCount = sessionEventsFailureCountRef.current + 1;
+          sessionEventsFailureCountRef.current = failureCount;
+          setConnection(connectionStateForError(error, failureCount));
         }
       } finally {
         loading = false;
-        scheduleNextEventsLoad();
+        scheduleNextEventsLoad(catchUpImmediately ? 0 : undefined);
       }
     }
 
-    async function listSessionEventsWithRefresh(session: DeviceSession, activeThreadId: string): Promise<SessionEvent[]> {
-      try {
-        return await listSessionEvents(session.bridgeUrl, session.sessionToken, activeThreadId);
-      } catch (error) {
-        if (!isAuthError(error)) {
-          throw error;
-        }
-        const refreshedSession = await refreshActiveSession(session);
-        return listSessionEvents(refreshedSession.bridgeUrl, refreshedSession.sessionToken, activeThreadId);
-      }
-    }
-
-    function scheduleNextEventsLoad() {
+    function scheduleNextEventsLoad(delayOverride?: number) {
       if (cancelled) {
         return;
       }
       timeoutId = window.setTimeout(() => {
         void loadEvents();
-      }, nextPollDelay(SESSION_EVENTS_REFRESH_MS, sessionEventsFailureCountRef.current));
+      }, delayOverride ?? nextPollDelay(SESSION_EVENTS_REFRESH_MS, sessionEventsFailureCountRef.current));
     }
 
     function refreshWhenVisible() {
@@ -409,7 +509,7 @@ function App() {
         window.clearTimeout(timeoutId);
       }
     };
-  }, [deviceSession, liveSessions, selectedSession]);
+  }, [deviceSession, selectedThreadId, sessionDataLoaded]);
 
   useEffect(() => {
     if (!deviceSession) {
@@ -477,8 +577,10 @@ function App() {
     }
 
     const threadId = selectedSession.threadId;
+    const localEventId = messageRequestId();
     setSending(true);
     setDraftAttachmentError("");
+    setMessageSendError("");
     let outgoingAttachments: OutgoingImageAttachment[];
     try {
       outgoingAttachments = await draftImagesToOutgoingAttachments(images);
@@ -490,7 +592,7 @@ function App() {
 
     setEventsByThread((current) => {
       const localEvent: SessionEvent = {
-        id: `local-${Date.now()}`,
+        id: localEventId,
         threadId,
         type: "message",
         payload: { role: "user", text, pending: true },
@@ -502,11 +604,23 @@ function App() {
       };
     });
     try {
-      await sendTextMessage(activeSession.bridgeUrl, activeSession.sessionToken, threadId, text, outgoingAttachments);
+      await sendTextMessage(
+        activeSession.bridgeUrl,
+        activeSession.sessionToken,
+        threadId,
+        text,
+        outgoingAttachments,
+        localEventId,
+      );
       setDraft("");
       clearDraftImages();
     } catch (error) {
-      setConnection({ label: "Connection error", detail: connectionErrorText(error) });
+      setEventsByThread((current) => ({
+        ...current,
+        [threadId]: (current[threadId] ?? []).filter((sessionEvent) => sessionEvent.id !== localEventId),
+      }));
+      setMessageSendError(`Message not sent. ${connectionErrorText(error)}`);
+      setConnection(connectionStateForError(error, 1));
     } finally {
       setSending(false);
     }
@@ -595,7 +709,7 @@ function App() {
         }),
       }));
     } catch (error) {
-      setConnection({ label: "Connection error", detail: connectionErrorText(error) });
+      setConnection(connectionStateForError(error, 1));
     } finally {
       setDecidingApprovalIds((current) => {
         const next = { ...current };
@@ -678,6 +792,53 @@ function App() {
     setDraftAttachmentError("");
   }
 
+  async function handleLoadOlderEvents(threadId: string): Promise<boolean> {
+    const activeSession = deviceSession;
+    const syncState = eventSyncByThreadRef.current[threadId];
+    if (
+      !activeSession ||
+      !syncState?.initialized ||
+      !syncState.hasMoreBefore ||
+      !syncState.beforeCursor ||
+      syncState.loadingOlder
+    ) {
+      return false;
+    }
+
+    updateEventSyncState(threadId, (current) => ({ ...current, loadingOlder: true }));
+    try {
+      const page = await listSessionEventPageWithRefresh(activeSession, threadId, {
+        limit: INITIAL_EVENT_PAGE_LIMIT,
+        before: syncState.beforeCursor,
+      });
+      const canonicalPage = page.legacySnapshot || page.reset;
+      setEventsByThread((current) => ({
+        ...current,
+        [threadId]: canonicalPage
+          ? mergePolledSessionEvents(current[threadId] ?? [], page.events)
+          : mergeIncrementalSessionEvents(current[threadId] ?? [], page.events),
+      }));
+      updateEventSyncState(threadId, (current) => ({
+        initialized: true,
+        beforeCursor: canonicalPage
+          ? page.beforeCursor
+          : page.beforeCursor ?? current.beforeCursor,
+        afterCursor: canonicalPage
+          ? page.afterCursor
+          : current.afterCursor,
+        hasMoreBefore: page.hasMoreBefore,
+        loadingOlder: false,
+      }));
+      markSessionDataRecovered();
+      return !canonicalPage && page.events.length > 0;
+    } catch (error) {
+      setConnection(connectionStateForError(error, 1));
+      return false;
+    } finally {
+      updateEventSyncState(threadId, (current) => ({ ...current, loadingOlder: false }));
+    }
+  }
+
   function clearDraftImages() {
     setDraftImages((current) => {
       for (const image of current) {
@@ -690,6 +851,7 @@ function App() {
   return (
     <main className="app-shell" aria-label="Codex mobile workbench">
       <ConnectionBar
+        bridgeVersion={bridgeVersion}
         connection={connection}
         newSessionDisabled={!canCreateSession || sending}
         statusText={statusText}
@@ -721,6 +883,11 @@ function App() {
             assetSession={deviceSession}
             approvals={selectedApprovals}
             events={selectedEvents}
+            hasMoreBefore={selectedEventSync?.hasMoreBefore ?? false}
+            loadingOlder={selectedEventSync?.loadingOlder ?? false}
+            onLoadOlder={selectedSession
+              ? () => handleLoadOlderEvents(selectedSession.threadId)
+              : async () => false}
             session={selectedSession}
           />
         </section>
@@ -750,6 +917,7 @@ function App() {
         attachments={draftImages}
         attachmentError={draftAttachmentError}
         draft={draft}
+        sendError={messageSendError}
         selectedTitle={selectedSession?.title ?? "No session selected"}
         disabled={!canSend || sending}
         onAttachFiles={handleAttachDraftImages}
@@ -762,6 +930,7 @@ function App() {
 }
 
 function ConnectionBar({
+  bridgeVersion,
   connection,
   newSessionDisabled = false,
   onCreateSession,
@@ -771,6 +940,7 @@ function ConnectionBar({
   showSessionMenuButton = false,
   statusText,
 }: {
+  bridgeVersion?: string | null;
   connection: ConnectionViewState;
   newSessionDisabled?: boolean;
   onCreateSession?: () => void;
@@ -809,7 +979,10 @@ function ConnectionBar({
       <div className="connection-primary">
         <span className={`status-dot ${connectionClass(connection.label)}`} aria-hidden="true" />
         <div>
-          <p className="eyebrow">LAN bridge</p>
+          <p className="eyebrow">
+            LAN bridge
+            {bridgeVersion ? <span className="app-version">v{bridgeVersion}</span> : null}
+          </p>
           <h1>Codex Mobile</h1>
           {connection.detail ? <p className="connection-detail">{connection.detail}</p> : null}
         </div>
@@ -1104,17 +1277,31 @@ function SessionDetail({
   assetSession,
   approvals: sessionApprovals,
   events: sessionEvents,
+  hasMoreBefore,
+  loadingOlder,
+  onLoadOlder,
   session,
 }: {
   assetSession: DeviceSession | null;
   approvals: ApprovalRequest[];
   events: SessionEvent[];
+  hasMoreBefore: boolean;
+  loadingOlder: boolean;
+  onLoadOlder: () => Promise<boolean>;
   session: SessionSnapshot | null;
 }) {
   const eventStreamRef = useRef<HTMLDivElement | null>(null);
   const shouldStickToBottomRef = useRef(true);
+  const loadingOlderRequestRef = useRef(false);
+  const prependScrollRef = useRef<{
+    firstEventId?: string;
+    scrollHeight: number;
+    scrollTop: number;
+  } | null>(null);
   const previousThreadIdRef = useRef<string | null>(null);
   const threadId = session ? session.threadId : "";
+  const eventHead = sessionEvents[0];
+  const eventHeadKey = eventHead?.id ?? "";
   const eventTail = sessionEvents.at(-1);
   const eventTailKey = eventTail
     ? `${eventTail.id}:${eventTail.createdAt}:${payloadText(eventTail.payload).length}`
@@ -1129,6 +1316,15 @@ function SessionDetail({
       return;
     }
 
+    const pendingPrepend = prependScrollRef.current;
+    if (pendingPrepend && pendingPrepend.firstEventId !== eventHeadKey) {
+      stream.scrollTop = pendingPrepend.scrollTop + (stream.scrollHeight - pendingPrepend.scrollHeight);
+      prependScrollRef.current = null;
+      shouldStickToBottomRef.current = false;
+      previousThreadIdRef.current = threadId;
+      return;
+    }
+
     const threadChanged = previousThreadIdRef.current !== threadId;
     if (threadChanged || shouldStickToBottomRef.current) {
       if (typeof stream.scrollTo === "function") {
@@ -1139,7 +1335,28 @@ function SessionDetail({
       shouldStickToBottomRef.current = true;
     }
     previousThreadIdRef.current = threadId;
-  }, [eventTailKey, sessionEvents.length, threadId]);
+  }, [eventHeadKey, eventTailKey, sessionEvents.length, threadId]);
+
+  async function requestOlderEvents() {
+    const stream = eventStreamRef.current;
+    if (!stream || !hasMoreBefore || loadingOlder || loadingOlderRequestRef.current) {
+      return;
+    }
+    loadingOlderRequestRef.current = true;
+    prependScrollRef.current = {
+      firstEventId: eventHeadKey || undefined,
+      scrollHeight: stream.scrollHeight,
+      scrollTop: stream.scrollTop,
+    };
+    try {
+      const added = await onLoadOlder();
+      if (!added) {
+        prependScrollRef.current = null;
+      }
+    } finally {
+      loadingOlderRequestRef.current = false;
+    }
+  }
 
   function handleEventStreamScroll() {
     const stream = eventStreamRef.current;
@@ -1148,6 +1365,9 @@ function SessionDetail({
     }
     shouldStickToBottomRef.current =
       stream.scrollHeight - stream.scrollTop - stream.clientHeight < 80;
+    if (stream.scrollTop < 48 && hasMoreBefore && !loadingOlder) {
+      void requestOlderEvents();
+    }
   }
 
   if (!session) {
@@ -1193,6 +1413,18 @@ function SessionDetail({
         ref={eventStreamRef}
         onScroll={handleEventStreamScroll}
       >
+        {hasMoreBefore ? (
+          <div className="event-history-loader">
+            <button
+              disabled={loadingOlder}
+              onClick={() => void requestOlderEvents()}
+              type="button"
+            >
+              <Clock3 size={14} aria-hidden="true" />
+              {loadingOlder ? "Loading earlier messages" : "Load earlier messages"}
+            </button>
+          </div>
+        ) : null}
         {sessionEvents.map((event) => (
           <EventRow assetSession={assetSession} event={event} key={event.id} />
         ))}
@@ -1298,8 +1530,31 @@ function AttachmentImage({
 }) {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [shouldLoad, setShouldLoad] = useState(() => typeof IntersectionObserver === "undefined");
+  const placeholderRef = useRef<HTMLSpanElement | null>(null);
   const bridgeUrl = assetSession?.bridgeUrl ?? "";
   const sessionToken = assetSession?.sessionToken ?? "";
+
+  useEffect(() => {
+    if (shouldLoad || typeof IntersectionObserver === "undefined") {
+      return;
+    }
+    const placeholder = placeholderRef.current;
+    if (!placeholder) {
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setShouldLoad(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: "240px 0px" },
+    );
+    observer.observe(placeholder);
+    return () => observer.disconnect();
+  }, [shouldLoad]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1307,6 +1562,10 @@ function AttachmentImage({
 
     setObjectUrl(null);
     setFailed(false);
+
+    if (!shouldLoad) {
+      return;
+    }
 
     if (!bridgeUrl || !sessionToken) {
       setFailed(true);
@@ -1336,17 +1595,29 @@ function AttachmentImage({
         URL.revokeObjectURL(createdObjectUrl);
       }
     };
-  }, [bridgeUrl, sessionToken, attachment.src]);
+  }, [bridgeUrl, sessionToken, attachment.src, shouldLoad]);
 
   if (failed) {
     return <span className="attachment-error" role="status">Image unavailable: {attachment.name}</span>;
   }
 
   if (!objectUrl) {
-    return <span className="attachment-loading" role="status">Loading image: {attachment.name}</span>;
+    return (
+      <span className="attachment-loading" ref={placeholderRef} role="status">
+        {shouldLoad ? "Loading image" : "Image queued"}: {attachment.name}
+      </span>
+    );
   }
 
-  return <img className="attachment-image" src={objectUrl} alt={attachment.name} />;
+  return (
+    <img
+      className="attachment-image"
+      decoding="async"
+      loading="lazy"
+      src={objectUrl}
+      alt={attachment.name}
+    />
+  );
 }
 
 function Composer({
@@ -1358,6 +1629,7 @@ function Composer({
   onDraftChange,
   onRemoveAttachment,
   onSubmit,
+  sendError,
   selectedTitle,
 }: {
   attachments: DraftImageAttachment[];
@@ -1368,6 +1640,7 @@ function Composer({
   onDraftChange: (value: string) => void;
   onRemoveAttachment: (id: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  sendError: string;
   selectedTitle: string;
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1397,6 +1670,12 @@ function Composer({
         <div className="composer-error" role="alert">
           <AlertTriangle size={14} aria-hidden="true" />
           {attachmentError}
+        </div>
+      ) : null}
+      {sendError ? (
+        <div className="composer-error" role="alert">
+          <AlertTriangle size={14} aria-hidden="true" />
+          {sendError}
         </div>
       ) : null}
       <label className="sr-only" htmlFor="codex-message">
@@ -1485,6 +1764,13 @@ function draftImageId() {
     return crypto.randomUUID();
   }
   return `draft-image-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function messageRequestId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `message-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 type MarkdownBlock =
@@ -1753,10 +2039,15 @@ export function appendOrMergeSessionEvent(events: SessionEvent[], event: Session
   }
 
   if (isUserMessage(event)) {
-    const pendingIndex = events.findIndex((existing) => isMatchingPendingUserMessage(existing, event));
-    if (pendingIndex !== -1) {
+    const transientIndex = events.findIndex((existing) =>
+      shouldReconcileUserMessages(existing, event),
+    );
+    if (transientIndex !== -1) {
+      if (isPendingPayload(event.payload) && isBridgeUserEcho(events[transientIndex])) {
+        return events;
+      }
       const nextEvents = [...events];
-      nextEvents[pendingIndex] = event;
+      nextEvents[transientIndex] = event;
       return nextEvents;
     }
   }
@@ -1861,6 +2152,26 @@ export function mergePolledSessionEvents(current: SessionEvent[], polled: Sessio
   return sortSessionEvents(mergeSessionEvents([...polled, ...carried]));
 }
 
+export function mergeIncrementalSessionEvents(
+  current: SessionEvent[],
+  incremental: SessionEvent[],
+): SessionEvent[] {
+  const incrementalUserTexts = new Set(
+    incremental
+      .map(normalizedUserMessageText)
+      .filter((text): text is string => text !== null),
+  );
+  const retained = current.filter((event) => {
+    if (!isPendingPayload(event.payload)) {
+      return true;
+    }
+    const text = normalizedUserMessageText(event);
+    return text === null || !incrementalUserTexts.has(text);
+  });
+
+  return sortSessionEvents(mergeSessionEvents([...retained, ...incremental]));
+}
+
 function sortSessionEvents(events: SessionEvent[]): SessionEvent[] {
   return [...events].sort(compareSessionEvents);
 }
@@ -1928,15 +2239,45 @@ function isUserMessage(event: SessionEvent): boolean {
   );
 }
 
-function isMatchingPendingUserMessage(existing: SessionEvent, next: SessionEvent): boolean {
+function shouldReconcileUserMessages(existing: SessionEvent, next: SessionEvent): boolean {
+  if (!isUserMessage(existing) || !isUserMessage(next)) {
+    return false;
+  }
   const nextText = normalizedUserMessageText(next);
   if (existing.threadId !== next.threadId || nextText === null) {
     return false;
   }
-  if (!isPendingPayload(existing.payload) || isPendingPayload(next.payload)) {
+  if (normalizedUserMessageText(existing) !== nextText) {
     return false;
   }
-  return existing.payload.text.trim() === nextText;
+
+  const existingPending = isPendingPayload(existing.payload);
+  const nextPending = isPendingPayload(next.payload);
+  const existingBridgeEcho = isBridgeUserEcho(existing);
+
+  if (existingPending) {
+    return !nextPending;
+  }
+  if (!existingBridgeEcho) {
+    return false;
+  }
+  return Math.abs(existing.createdAt - next.createdAt) <= USER_MESSAGE_RECONCILIATION_WINDOW_MS;
+}
+
+function isBridgeUserEcho(event: SessionEvent): boolean {
+  if (!isUserMessage(event)) {
+    return false;
+  }
+  const payload = event.payload;
+  if (
+    payload !== null &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    payload.bridgeEcho === true
+  ) {
+    return true;
+  }
+  return BRIDGE_EVENT_ID_PATTERN.test(event.id);
 }
 
 function userMessageText(event: SessionEvent): string | null {
@@ -1964,6 +2305,10 @@ function isPendingPayload(payload: SessionEvent["payload"]): payload is { role: 
     payload.pending === true
   );
 }
+
+const BRIDGE_EVENT_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const USER_MESSAGE_RECONCILIATION_WINDOW_MS = 5 * 60 * 1_000;
 
 function isExpired(expiresAt: number): boolean {
   return expiresAt <= Date.now();
@@ -2049,6 +2394,27 @@ function connectionErrorText(error: unknown): string {
     return error.message;
   }
   return "Unable to reach bridge";
+}
+
+export function connectionStateForError(error: unknown, failureCount: number): ConnectionViewState {
+  const detail = connectionErrorText(error);
+  if (!isTransientConnectionError(error)) {
+    return { label: "Connection error", detail };
+  }
+  if (failureCount < TRANSIENT_FAILURES_BEFORE_NEW_LINK) {
+    return { label: "Reconnecting", detail };
+  }
+  return {
+    label: "Connection error",
+    detail: `${detail}. The public link has failed repeatedly; open the newest link from the Mac.`,
+  };
+}
+
+function isTransientConnectionError(error: unknown): boolean {
+  if (error instanceof ApiError) {
+    return error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  return error instanceof TypeError;
 }
 
 function isAuthError(error: unknown): boolean {
@@ -2148,6 +2514,7 @@ function connectionClass(label: ConnectionLabel): string {
       return "ok";
     case "Pairing":
     case "Read-only":
+    case "Reconnecting":
       return "warn";
     case "Unpaired":
       return "muted";

@@ -4,6 +4,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, UdpSocket},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use desktop_core::{
@@ -26,6 +27,7 @@ struct ShellState {
     tunnel: Mutex<QuickTunnelManager>,
     last_pairing_link: Mutex<Option<String>>,
     last_pairing_source: Mutex<Option<PairingLinkSource>>,
+    exit_cleanup_started: AtomicBool,
 }
 
 impl Default for ShellState {
@@ -35,6 +37,7 @@ impl Default for ShellState {
             tunnel: Mutex::new(QuickTunnelManager::new(QuickTunnelConfig::default())),
             last_pairing_link: Mutex::new(None),
             last_pairing_source: Mutex::new(None),
+            exit_cleanup_started: AtomicBool::new(false),
         }
     }
 }
@@ -48,6 +51,7 @@ enum PairingLinkSource {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShellStatusDto {
+    app_version: String,
     bridge: BridgeProcessSnapshotDto,
     tunnel: TunnelSnapshotDto,
     last_pairing_link: Option<String>,
@@ -118,12 +122,13 @@ async fn get_app_status(state: State<'_, ShellState>) -> Result<ShellStatusDto, 
     };
     let tunnel = {
         let mut tunnel = state.tunnel.lock().await;
-        tunnel.status()
+        tunnel.refresh_status().await
     };
     clear_stale_tunnel_pairing_link(&state, &tunnel).await;
     let last_pairing_link = state.last_pairing_link.lock().await.clone();
 
     Ok(ShellStatusDto {
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         bridge: BridgeProcessSnapshotDto::from(bridge),
         tunnel: TunnelSnapshotDto::from(tunnel),
         last_pairing_link,
@@ -248,7 +253,10 @@ async fn stop_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnapsho
 }
 
 async fn clear_stale_tunnel_pairing_link(state: &ShellState, tunnel: &TunnelSnapshot) {
-    if tunnel.status == TunnelStatus::Ready {
+    if matches!(
+        tunnel.status,
+        TunnelStatus::Ready | TunnelStatus::Reconnecting
+    ) {
         return;
     }
     let mut source = state.last_pairing_source.lock().await;
@@ -307,7 +315,7 @@ async fn get_diagnostics_bundle(
             .and_then(|value| serde_json::from_value::<ControlDiagnosticsDto>(value).ok()),
         None => None,
     };
-    let tunnel_snapshot = state.tunnel.lock().await.status();
+    let tunnel_snapshot = state.tunnel.lock().await.refresh_status().await;
     let logs = diagnostic_logs(&app).await;
     let recent_connection_states = recent_connection_states(
         &bridge_snapshot,
@@ -491,6 +499,13 @@ fn tunnel_check(snapshot: &TunnelSnapshot) -> DiagnosticCheck {
                 .as_ref()
                 .map(|session| format!("tunnel ready {}", session.public_url))
                 .unwrap_or_else(|| "tunnel ready".to_string()),
+        ),
+        TunnelStatus::Reconnecting => DiagnosticCheck::degraded(
+            "tunnel reconnecting",
+            snapshot
+                .detail
+                .clone()
+                .unwrap_or_else(|| "Tunnel is retrying the public connection".to_string()),
         ),
         TunnelStatus::Failed => DiagnosticCheck::failed(
             "tunnel failed",
@@ -698,7 +713,10 @@ impl From<BridgeProcessSnapshot> for BridgeProcessSnapshotDto {
 
 impl From<TunnelSnapshot> for TunnelSnapshotDto {
     fn from(snapshot: TunnelSnapshot) -> Self {
-        let (public_url, local_url) = if snapshot.status == TunnelStatus::Ready {
+        let (public_url, local_url) = if matches!(
+            snapshot.status,
+            TunnelStatus::Ready | TunnelStatus::Reconnecting
+        ) {
             snapshot
                 .session
                 .map(|session| (Some(session.public_url), Some(session.local_url)))
@@ -753,13 +771,42 @@ fn tunnel_status(status: TunnelStatus) -> &'static str {
         TunnelStatus::Stopped => "stopped",
         TunnelStatus::Starting => "starting",
         TunnelStatus::Ready => "ready",
+        TunnelStatus::Reconnecting => "reconnecting",
         TunnelStatus::Failed => "failed",
         TunnelStatus::Stopping => "stopping",
     }
 }
 
+fn begin_exit_cleanup(state: &ShellState) -> bool {
+    !state.exit_cleanup_started.swap(true, Ordering::SeqCst)
+}
+
+async fn shutdown_managed_processes(state: &ShellState) {
+    {
+        let mut tunnel = state.tunnel.lock().await;
+        let _ = tunnel.stop().await;
+    }
+    {
+        let mut bridge = state.bridge.lock().await;
+        if let Some(manager) = bridge.as_mut() {
+            let _ = manager.stop().await;
+        }
+    }
+}
+
+fn terminate_managed_processes_now(state: &ShellState) {
+    if let Ok(mut tunnel) = state.tunnel.try_lock() {
+        tunnel.terminate_now();
+    }
+    if let Ok(mut bridge) = state.bridge.try_lock()
+        && let Some(manager) = bridge.as_mut()
+    {
+        manager.terminate_now();
+    }
+}
+
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(ShellState::default())
         .invoke_handler(tauri::generate_handler![
             get_app_status,
@@ -776,8 +823,34 @@ fn main() {
             list_devices,
             revoke_device,
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Codex Mobile Bridge desktop shell");
+        .build(tauri::generate_context!())
+        .expect("failed to build Codex Mobile Bridge desktop shell");
+    let exit_code = app.run_return(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { code, api, .. } => {
+            let should_cleanup = {
+                let state = app_handle.state::<ShellState>();
+                begin_exit_cleanup(&state)
+            };
+            if should_cleanup {
+                api.prevent_exit();
+                let app_handle = app_handle.clone();
+                let exit_code = code.unwrap_or(0);
+                tauri::async_runtime::spawn(async move {
+                    {
+                        let state = app_handle.state::<ShellState>();
+                        shutdown_managed_processes(&state).await;
+                    }
+                    app_handle.exit(exit_code);
+                });
+            }
+        }
+        tauri::RunEvent::Exit => {
+            let state = app_handle.state::<ShellState>();
+            terminate_managed_processes_now(&state);
+        }
+        _ => {}
+    });
+    std::process::exit(exit_code);
 }
 
 #[cfg(test)]
@@ -887,10 +960,39 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_dto_keeps_urls_while_tunnel_reconnects() {
+        let dto = TunnelSnapshotDto::from(TunnelSnapshot {
+            status: TunnelStatus::Reconnecting,
+            session: Some(desktop_core::TunnelSession {
+                id: "tunnel-1".to_string(),
+                local_url: "http://127.0.0.1:57324".to_string(),
+                public_url: "https://active.trycloudflare.com".to_string(),
+                started_at: 1,
+            }),
+            detail: Some("Retrying automatically".to_string()),
+        });
+
+        assert_eq!(dto.status, "reconnecting");
+        assert_eq!(
+            dto.public_url.as_deref(),
+            Some("https://active.trycloudflare.com")
+        );
+        assert_eq!(dto.local_url.as_deref(), Some("http://127.0.0.1:57324"));
+    }
+
+    #[test]
     fn tail_text_truncates_from_end_on_large_logs() {
         let text = "0123456789abcdef";
 
         assert_eq!(tail_text(text, 6), "[truncated]\nabcdef");
         assert_eq!(tail_text(text, 64), text);
+    }
+
+    #[test]
+    fn exit_cleanup_only_starts_once() {
+        let state = ShellState::default();
+
+        assert!(begin_exit_cleanup(&state));
+        assert!(!begin_exit_cleanup(&state));
     }
 }

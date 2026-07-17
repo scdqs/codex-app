@@ -1,9 +1,11 @@
 import type { DeviceSession } from "./storage";
 import {
+  isApprovalRequest,
   isJsonValue,
   isSessionEventType,
   isSessionStatus,
   type BridgeHealth,
+  type ApprovalRequest,
   type DecisionKind,
   type SessionEvent,
   type SessionSnapshot,
@@ -34,6 +36,22 @@ export interface OutgoingImageAttachment {
   name: string;
   mimeType: string;
   dataBase64: string;
+}
+
+export interface SessionEventPageOptions {
+  limit?: number;
+  before?: string;
+  since?: string;
+}
+
+export interface SessionEventPage {
+  events: SessionEvent[];
+  beforeCursor?: string;
+  afterCursor?: string;
+  hasMoreBefore: boolean;
+  hasMoreAfter: boolean;
+  reset: boolean;
+  legacySnapshot: boolean;
 }
 
 export function readPairingPayloadFromUrl(url: string): PairingPayload | null {
@@ -95,20 +113,46 @@ export async function listSessions(
   return parseSessionSnapshots(await response.json());
 }
 
+export async function listApprovals(
+  bridgeUrl: string,
+  sessionToken: string,
+): Promise<ApprovalRequest[]> {
+  const response = await fetch(apiUrl(bridgeUrl, "/api/approvals"), {
+    headers: { Authorization: `Bearer ${sessionToken}` },
+  });
+
+  if (!response.ok) {
+    throw new ApiError(response.status, `Approvals request failed with ${response.status}`);
+  }
+
+  return parseApprovalRequests(await response.json());
+}
+
 export async function listSessionEvents(
   bridgeUrl: string,
   sessionToken: string,
   threadId: string,
-): Promise<SessionEvent[]> {
+  options: SessionEventPageOptions = {},
+): Promise<SessionEventPage> {
+  const headers: Record<string, string> = { Authorization: `Bearer ${sessionToken}` };
+  if (options.limit !== undefined) {
+    headers["X-Codex-Events-Limit"] = String(options.limit);
+  }
+  if (options.before) {
+    headers["X-Codex-Events-Before"] = options.before;
+  }
+  if (options.since) {
+    headers["X-Codex-Events-Since"] = options.since;
+  }
   const response = await fetch(apiUrl(bridgeUrl, `/api/sessions/${encodeURIComponent(threadId)}/events`), {
-    headers: { Authorization: `Bearer ${sessionToken}` },
+    headers,
   });
 
   if (!response.ok) {
     throw new ApiError(response.status, `Session events request failed with ${response.status}`);
   }
 
-  return parseSessionEvents(await response.json());
+  return parseSessionEventPage(await response.json());
 }
 
 export async function createSession(
@@ -194,19 +238,51 @@ export async function sendTextMessage(
   threadId: string,
   text: string,
   attachments: OutgoingImageAttachment[] = [],
+  clientMessageId: string,
 ): Promise<void> {
-  const response = await fetch(apiUrl(bridgeUrl, `/api/sessions/${encodeURIComponent(threadId)}/messages`), {
+  const url = apiUrl(bridgeUrl, `/api/sessions/${encodeURIComponent(threadId)}/messages`);
+  const request = {
     method: "POST",
     headers: {
       Authorization: `Bearer ${sessionToken}`,
       "Content-Type": "application/json",
+      "X-Codex-Client-Message-Id": clientMessageId,
     },
     body: JSON.stringify(messageBody(text, attachments)),
-  });
+  };
 
-  if (!response.ok) {
-    throw new ApiError(response.status, `Send message request failed with ${response.status}`);
+  for (let attempt = 0; attempt <= SEND_MESSAGE_RETRY_DELAYS_MS.length; attempt += 1) {
+    let response: Response;
+    try {
+      response = await fetch(url, request);
+    } catch (error) {
+      if (attempt === SEND_MESSAGE_RETRY_DELAYS_MS.length || !(error instanceof TypeError)) {
+        throw error;
+      }
+      await waitForRetry(SEND_MESSAGE_RETRY_DELAYS_MS[attempt]);
+      continue;
+    }
+
+    if (response.ok) {
+      return;
+    }
+
+    const apiError = new ApiError(response.status, `Send message request failed with ${response.status}`);
+    if (attempt === SEND_MESSAGE_RETRY_DELAYS_MS.length || !isTransientSendStatus(response.status)) {
+      throw apiError;
+    }
+    await waitForRetry(SEND_MESSAGE_RETRY_DELAYS_MS[attempt]);
   }
+}
+
+const SEND_MESSAGE_RETRY_DELAYS_MS = [250, 750];
+
+function isTransientSendStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
+
+function waitForRetry(delayMs: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
 }
 
 function messageBody(text: string, attachments: OutgoingImageAttachment[]): { text: string; attachments?: OutgoingImageAttachment[] } {
@@ -312,6 +388,18 @@ function parseSessionSnapshots(value: unknown): SessionSnapshot[] {
   return value.map(parseSessionSnapshot);
 }
 
+function parseApprovalRequests(value: unknown): ApprovalRequest[] {
+  if (!Array.isArray(value)) {
+    throw new ApiValidationError("Approvals response must be an array");
+  }
+  return value.map((approval) => {
+    if (!isApprovalRequest(approval)) {
+      throw new ApiValidationError("Approval response is missing required fields");
+    }
+    return approval;
+  });
+}
+
 function parseSessionSnapshot(value: unknown): SessionSnapshot {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ApiValidationError("Session snapshot must be an object");
@@ -347,6 +435,50 @@ function parseSessionEvents(value: unknown): SessionEvent[] {
     throw new ApiValidationError("Session events response must be an array");
   }
   return value.map(parseSessionEvent);
+}
+
+function parseSessionEventPage(value: unknown): SessionEventPage {
+  if (Array.isArray(value)) {
+    const events = parseSessionEvents(value);
+    return {
+      events,
+      beforeCursor: events[0]?.id,
+      afterCursor: events.at(-1)?.id,
+      hasMoreBefore: false,
+      hasMoreAfter: false,
+      reset: false,
+      legacySnapshot: true,
+    };
+  }
+  if (!value || typeof value !== "object") {
+    throw new ApiValidationError("Session event page must be an object");
+  }
+
+  const page = value as Record<string, unknown>;
+  if (
+    !Array.isArray(page.events) ||
+    typeof page.hasMoreBefore !== "boolean" ||
+    typeof page.hasMoreAfter !== "boolean" ||
+    typeof page.reset !== "boolean" ||
+    !isOptionalString(page.beforeCursor) ||
+    !isOptionalString(page.afterCursor)
+  ) {
+    throw new ApiValidationError("Session event page is missing required fields");
+  }
+
+  return {
+    events: parseSessionEvents(page.events),
+    beforeCursor: typeof page.beforeCursor === "string" ? page.beforeCursor : undefined,
+    afterCursor: typeof page.afterCursor === "string" ? page.afterCursor : undefined,
+    hasMoreBefore: page.hasMoreBefore,
+    hasMoreAfter: page.hasMoreAfter,
+    reset: page.reset,
+    legacySnapshot: false,
+  };
+}
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || value === null || typeof value === "string";
 }
 
 function parseSessionEvent(value: unknown): SessionEvent {

@@ -252,6 +252,7 @@ impl BridgeProcessManager {
         let stderr = append_log_file(&plan.stderr_log)?;
         let mut command = tokio::process::Command::new(&self.config.sidecar_binary);
         command
+            .kill_on_drop(true)
             .args(&self.config.sidecar_args)
             .envs(plan.env.iter().map(|(key, value)| (key, value)))
             .stdout(Stdio::from(stdout))
@@ -283,6 +284,16 @@ impl BridgeProcessManager {
         self.state.status = BridgeProcessStatus::Stopped;
         self.state.detail = None;
         Ok(self.snapshot(None))
+    }
+
+    pub fn terminate_now(&mut self) -> BridgeProcessSnapshot {
+        self.state.status = BridgeProcessStatus::Stopping;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
+        self.state.status = BridgeProcessStatus::Stopped;
+        self.state.detail = None;
+        self.snapshot(None)
     }
 
     pub async fn restart(&mut self) -> Result<BridgeProcessSnapshot, BridgeProcessError> {
@@ -493,6 +504,7 @@ pub fn pairing_link_for_bridge_url(bridge_url: &str, pairing_token: &str) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use tempfile::TempDir;
 
     fn test_config(temp: &TempDir) -> BridgeProcessConfig {
@@ -622,6 +634,117 @@ mod tests {
         let snapshot = manager.status();
         assert_eq!(snapshot.status, BridgeProcessStatus::Failed);
         assert!(snapshot.detail.expect("failure detail").contains("exit"));
+    }
+
+    #[tokio::test]
+    async fn dropping_manager_terminates_running_sidecar() {
+        let temp = TempDir::new().expect("temp dir creates");
+        let mut config = test_config(&temp);
+        config.sidecar_binary = std::env::current_exe().expect("test executable resolves");
+        config.sidecar_args = vec![
+            "--exact".to_string(),
+            "bridge_process::tests::bridge_process_drop_test_child".to_string(),
+            "--nocapture".to_string(),
+        ];
+        config.startup_timeout = Duration::from_secs(2);
+
+        let pid = {
+            let mut manager = BridgeProcessManager::new(config);
+            manager
+                .start()
+                .await
+                .expect("test sidecar becomes healthy")
+                .pid
+                .expect("test sidecar has a pid")
+        };
+
+        let stopped = wait_for_process_exit(pid).await;
+        if !stopped {
+            terminate_process(pid);
+        }
+        assert!(stopped, "sidecar {pid} survived manager drop");
+    }
+
+    #[tokio::test]
+    async fn terminate_now_stops_running_sidecar_without_async_wait() {
+        let temp = TempDir::new().expect("temp dir creates");
+        let mut config = test_config(&temp);
+        config.sidecar_binary = std::env::current_exe().expect("test executable resolves");
+        config.sidecar_args = vec![
+            "--exact".to_string(),
+            "bridge_process::tests::bridge_process_drop_test_child".to_string(),
+            "--nocapture".to_string(),
+        ];
+        config.startup_timeout = Duration::from_secs(2);
+        let mut manager = BridgeProcessManager::new(config);
+        let pid = manager
+            .start()
+            .await
+            .expect("test sidecar becomes healthy")
+            .pid
+            .expect("test sidecar has a pid");
+
+        let snapshot = manager.terminate_now();
+
+        assert_eq!(snapshot.status, BridgeProcessStatus::Stopped);
+        let stopped = wait_for_process_exit(pid).await;
+        if !stopped {
+            terminate_process(pid);
+        }
+        assert!(stopped, "sidecar {pid} survived synchronous termination");
+    }
+
+    #[test]
+    fn bridge_process_drop_test_child() {
+        if std::env::var_os("CODEX_MOBILE_BRIDGE_CONTROL_TOKEN").is_none() {
+            return;
+        }
+
+        let bind_addr = std::env::var("CODEX_MOBILE_BRIDGE_BIND")
+            .expect("bridge bind env exists")
+            .parse::<SocketAddr>()
+            .expect("bridge bind env parses");
+        let listener = TcpListener::bind(bind_addr).expect("test sidecar binds");
+        let body = r#"{"status":"ok","connectionState":"writable"}"#;
+
+        for stream in listener.incoming() {
+            let mut stream = stream.expect("health connection accepts");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("health response writes");
+        }
+    }
+
+    async fn wait_for_process_exit(pid: u32) -> bool {
+        for _ in 0..50 {
+            if !process_is_running(pid) {
+                return true;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    fn process_is_running(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn terminate_process(pid: u32) {
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 
     trait LaunchPlanExt {

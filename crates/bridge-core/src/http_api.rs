@@ -9,7 +9,7 @@ use axum::{
     Extension, Json, Router,
     body::Body,
     extract::{
-        DefaultBodyLimit, Path, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, Request, StatusCode, header},
@@ -21,11 +21,15 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::{Mutex, RwLock};
-use tower_http::services::{ServeDir, ServeFile};
+use tokio::sync::{Mutex, Notify, RwLock};
+use tower_http::{
+    compression::CompressionLayer,
+    services::{ServeDir, ServeFile},
+};
 use uuid::Uuid;
 
 use crate::{
+    approval::ApprovalDetector,
     codex_rpc::{CodexAdapter, CodexRpcError, UserImageAttachment},
     diagnostics::DiagnosticsReport,
     event_hub::EventHub,
@@ -43,6 +47,9 @@ pub struct AppState {
     pairing: Arc<Mutex<PairingManager>>,
     event_hub: EventHub,
     event_history: Arc<Mutex<HashMap<String, VecDeque<SessionEvent>>>>,
+    adapter_event_cache: Arc<Mutex<HashMap<String, AdapterEventCache>>>,
+    pending_approvals: Arc<Mutex<HashMap<String, ApprovalRequest>>>,
+    message_dedupe: Arc<Mutex<MessageDedupeCache>>,
     refresh_failures: Arc<Mutex<HashMap<String, usize>>>,
     local_assets: Arc<Mutex<LocalAssetRegistry>>,
     control_token: Arc<str>,
@@ -50,13 +57,45 @@ pub struct AppState {
     diagnostics: Arc<RwLock<DiagnosticsReport>>,
 }
 
+#[derive(Debug, Default)]
+struct AdapterEventCache {
+    events: Vec<SessionEvent>,
+    next_cursor: Option<String>,
+    loaded_older: bool,
+}
+
+#[derive(Debug, Default)]
+struct MessageDedupeCache {
+    entries: HashMap<String, MessageDedupeEntry>,
+    completed_order: VecDeque<String>,
+}
+
+#[derive(Debug)]
+enum MessageDedupeEntry {
+    InFlight(Arc<Notify>),
+    Completed,
+}
+
+enum MessageDedupeClaim {
+    Owner { key: String, notify: Arc<Notify> },
+    Completed,
+}
+
 const EVENT_HISTORY_LIMIT_PER_THREAD: usize = 256;
+const MAX_ADAPTER_HISTORY_PAGES_PER_REQUEST: usize = 4;
+const DEFAULT_EVENT_PAGE_LIMIT: usize = 50;
+const MAX_EVENT_PAGE_LIMIT: usize = 100;
 const MAX_UPLOAD_IMAGE_ATTACHMENTS: usize = 4;
 const MAX_UPLOAD_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AUTHENTICATED_JSON_BODY_BYTES: usize = 48 * 1024 * 1024;
+const MAX_MESSAGE_DEDUPE_ENTRIES: usize = 1_024;
 #[cfg(test)]
 const MAX_REFRESH_FAILURES_PER_DEVICE: usize = 5;
 const BRIDGE_CONTROL_TOKEN_HEADER: &str = "x-bridge-control-token";
+const EVENT_LIMIT_HEADER: &str = "x-codex-events-limit";
+const EVENT_BEFORE_HEADER: &str = "x-codex-events-before";
+const EVENT_SINCE_HEADER: &str = "x-codex-events-since";
+const CLIENT_MESSAGE_ID_HEADER: &str = "x-codex-client-message-id";
 
 #[derive(Debug, Clone)]
 struct AuthenticatedDevice {
@@ -68,6 +107,7 @@ struct AuthenticatedDevice {
 pub struct HealthResponse {
     status: String,
     connection_state: String,
+    version: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,6 +174,25 @@ pub struct CreateSessionRequest {
     attachments: Vec<IncomingImageAttachment>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionEventsQuery {
+    limit: Option<usize>,
+    before: Option<String>,
+    since: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionEventsPage {
+    events: Vec<SessionEvent>,
+    before_cursor: Option<String>,
+    after_cursor: Option<String>,
+    has_more_before: bool,
+    has_more_after: bool,
+    reset: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IncomingImageAttachment {
@@ -187,6 +246,9 @@ impl AppState {
             pairing: Arc::new(Mutex::new(pairing)),
             event_hub,
             event_history: Arc::new(Mutex::new(HashMap::new())),
+            adapter_event_cache: Arc::new(Mutex::new(HashMap::new())),
+            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            message_dedupe: Arc::new(Mutex::new(MessageDedupeCache::default())),
             refresh_failures: Arc::new(Mutex::new(HashMap::new())),
             local_assets: Arc::new(Mutex::new(LocalAssetRegistry::default())),
             control_token: control_token.into(),
@@ -232,6 +294,14 @@ impl AppState {
             thread_events.pop_front();
         }
         thread_events.push_back(event);
+    }
+
+    async fn replace_session_event_history(&self, thread_id: &str, events: &[SessionEvent]) {
+        let start = events.len().saturating_sub(EVENT_HISTORY_LIMIT_PER_THREAD);
+        self.event_history.lock().await.insert(
+            thread_id.to_string(),
+            events[start..].iter().cloned().collect(),
+        );
     }
 
     async fn register_local_assets_for_event(&self, mut event: SessionEvent) -> SessionEvent {
@@ -289,6 +359,7 @@ fn phone_routes(state: AppState) -> Router<AppState> {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:thread_id/events", get(list_session_events))
         .route("/api/sessions/:thread_id/messages", post(send_message))
+        .route("/api/approvals", get(list_approvals))
         .route(
             "/api/approvals/:approval_id/decision",
             post(decide_approval),
@@ -297,7 +368,8 @@ fn phone_routes(state: AppState) -> Router<AppState> {
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
-        ));
+        ))
+        .layer(CompressionLayer::new());
     let websocket_route =
         Router::new()
             .route("/ws", get(ws_handler))
@@ -346,6 +418,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: diagnostics.status.as_str().to_string(),
         connection_state: diagnostics.connection_state.as_str().to_string(),
+        version: env!("CARGO_PKG_VERSION"),
     })
 }
 
@@ -457,6 +530,35 @@ async fn list_sessions(
     Ok(Json(state.event_hub.all_snapshots().await))
 }
 
+async fn list_approvals(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApprovalRequest>>, ApiError> {
+    let created_at = current_time_ms();
+    let adapter_approvals = if let Some(adapter) = state.codex_adapter.as_ref() {
+        adapter
+            .list_pending_approvals()
+            .await?
+            .iter()
+            .filter_map(|pending| ApprovalDetector::detect_pending(pending, created_at))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut pending_approvals = state.pending_approvals.lock().await;
+    pending_approvals.retain(|approval_id, _| is_dev_approval_id(approval_id));
+    for approval in adapter_approvals {
+        pending_approvals.insert(approval.id.clone(), approval);
+    }
+    let mut approvals = pending_approvals.values().cloned().collect::<Vec<_>>();
+    approvals.sort_by(|left, right| {
+        left.thread_id
+            .cmp(&right.thread_id)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    Ok(Json(approvals))
+}
+
 async fn create_session(
     State(state): State<AppState>,
     Json(request): Json<CreateSessionRequest>,
@@ -490,7 +592,7 @@ async fn create_session(
     snapshot.status = SessionStatus::Running;
 
     state.event_hub.set_snapshot(snapshot.clone()).await;
-    let event = event_for_user_message(snapshot.thread_id.clone(), text, attachments, now);
+    let event = event_for_user_message(snapshot.thread_id.clone(), text, attachments, now, None);
     let event = state.register_local_assets_for_event(event).await;
     state.publish_session_event(event).await;
 
@@ -500,27 +602,254 @@ async fn create_session(
 async fn list_session_events(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
-) -> Result<Json<Vec<SessionEvent>>, ApiError> {
-    if let Some(adapter) = state.codex_adapter.as_ref() {
-        let turns = adapter.list_turns(&thread_id).await?;
-        let mut events = Vec::new();
-        for event in Normalizer::events_from_turns(&thread_id, &turns) {
-            let event = state.register_local_assets_for_event(event).await;
-            state.record_session_event(event.clone()).await;
-            events.push(event);
+    headers: HeaderMap,
+    Query(query): Query<SessionEventsQuery>,
+) -> Result<Response, ApiError> {
+    let query = query.with_headers(&headers)?;
+    if query.is_paginated() {
+        query.validate()?;
+    }
+    let (events, adapter_has_more_older) = if let Some(adapter) = state.codex_adapter.as_ref() {
+        if query.is_paginated() {
+            adapter_events_for_query(&state, adapter, &thread_id, &query).await?
+        } else {
+            let turns = adapter.list_turns(&thread_id).await?;
+            let events = Normalizer::events_from_turns(&thread_id, &turns);
+            state
+                .replace_session_event_history(&thread_id, &events)
+                .await;
+            (events, false)
         }
-        return Ok(Json(events));
+    } else {
+        (
+            state
+                .event_history
+                .lock()
+                .await
+                .get(&thread_id)
+                .map(|events| events.iter().cloned().collect())
+                .unwrap_or_default(),
+            false,
+        )
+    };
+
+    if !query.is_paginated() {
+        let events = mobile_session_events(&state, events).await;
+        return Ok(Json(events).into_response());
     }
 
-    let events = state
-        .event_history
-        .lock()
-        .await
-        .get(&thread_id)
-        .map(|events| events.iter().cloned().collect())
-        .unwrap_or_default();
+    let mut page = paginate_session_events(&events, &query)?;
+    if adapter_has_more_older
+        && page.before_cursor.as_deref() == events.first().map(|event| event.id.as_str())
+    {
+        page.has_more_before = true;
+    }
+    page.events = mobile_session_events(&state, page.events).await;
+    Ok(Json(page).into_response())
+}
 
-    Ok(Json(events))
+async fn adapter_events_for_query(
+    state: &AppState,
+    adapter: &Arc<dyn CodexAdapter>,
+    thread_id: &str,
+    query: &SessionEventsQuery,
+) -> Result<(Vec<SessionEvent>, bool), ApiError> {
+    let first_page = adapter.list_turns_page(thread_id, None).await?;
+    let first_page_turn_ids = first_page
+        .turns
+        .iter()
+        .filter_map(|turn| turn.id.clone())
+        .collect::<Vec<_>>();
+    let first_page_events = Normalizer::events_from_turns(thread_id, &first_page.turns);
+    let limit = query.page_limit()?;
+    let mut caches = state.adapter_event_cache.lock().await;
+    let cache = caches.entry(thread_id.to_string()).or_default();
+    replace_adapter_turn_events(&mut cache.events, first_page_events, &first_page_turn_ids);
+    if !cache.loaded_older {
+        cache.next_cursor = first_page.next_cursor;
+    }
+
+    if let Some(before) = query.before.as_deref() {
+        for _ in 0..MAX_ADAPTER_HISTORY_PAGES_PER_REQUEST {
+            let Some(cursor_index) = cache.events.iter().position(|event| event.id == before)
+            else {
+                break;
+            };
+            if cursor_index >= limit {
+                break;
+            }
+            let Some(cursor) = cache.next_cursor.clone() else {
+                break;
+            };
+            let older_page = adapter.list_turns_page(thread_id, Some(&cursor)).await?;
+            let older_events = Normalizer::events_from_turns(thread_id, &older_page.turns);
+            let added = merge_adapter_events(&mut cache.events, older_events);
+            cache.next_cursor = older_page.next_cursor;
+            cache.loaded_older = true;
+            if added == 0 && cache.next_cursor.as_deref() == Some(cursor.as_str()) {
+                break;
+            }
+        }
+    }
+
+    let events = cache.events.clone();
+    let has_more_older = cache.next_cursor.is_some();
+    drop(caches);
+    state
+        .replace_session_event_history(thread_id, &events)
+        .await;
+    Ok((events, has_more_older))
+}
+
+fn replace_adapter_turn_events(
+    existing: &mut Vec<SessionEvent>,
+    incoming: Vec<SessionEvent>,
+    turn_ids: &[String],
+) {
+    existing.retain(|event| {
+        !turn_ids
+            .iter()
+            .any(|turn_id| event_belongs_to_turn(&event.id, turn_id))
+    });
+    merge_adapter_events(existing, incoming);
+}
+
+fn event_belongs_to_turn(event_id: &str, turn_id: &str) -> bool {
+    event_id
+        .strip_prefix(turn_id)
+        .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
+fn merge_adapter_events(existing: &mut Vec<SessionEvent>, incoming: Vec<SessionEvent>) -> usize {
+    let mut added = 0;
+    for event in incoming {
+        if let Some(index) = existing.iter().position(|current| current.id == event.id) {
+            existing[index] = event;
+        } else {
+            existing.push(event);
+            added += 1;
+        }
+    }
+    existing.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    added
+}
+
+async fn mobile_session_events(state: &AppState, events: Vec<SessionEvent>) -> Vec<SessionEvent> {
+    let mut mobile_events = Vec::with_capacity(events.len());
+    for event in events {
+        let event = state.register_local_assets_for_event(event).await;
+        mobile_events.push(session_event_for_mobile(event));
+    }
+    mobile_events
+}
+
+impl SessionEventsQuery {
+    fn with_headers(mut self, headers: &HeaderMap) -> Result<Self, ApiError> {
+        if self.limit.is_none() {
+            self.limit = optional_event_header(headers, EVENT_LIMIT_HEADER)?
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .map_err(|_| ApiError::BadRequest("invalid event page limit"))
+                })
+                .transpose()?;
+        }
+        if self.before.is_none() {
+            self.before = optional_event_header(headers, EVENT_BEFORE_HEADER)?;
+        }
+        if self.since.is_none() {
+            self.since = optional_event_header(headers, EVENT_SINCE_HEADER)?;
+        }
+        Ok(self)
+    }
+
+    fn is_paginated(&self) -> bool {
+        self.limit.is_some() || self.before.is_some() || self.since.is_some()
+    }
+
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.before.is_some() && self.since.is_some() {
+            return Err(ApiError::BadRequest(
+                "before and since cursors cannot be combined",
+            ));
+        }
+        self.page_limit().map(|_| ())
+    }
+
+    fn page_limit(&self) -> Result<usize, ApiError> {
+        let requested_limit = self.limit.unwrap_or(DEFAULT_EVENT_PAGE_LIMIT);
+        if requested_limit == 0 {
+            return Err(ApiError::BadRequest("event page limit must be positive"));
+        }
+        Ok(requested_limit.min(MAX_EVENT_PAGE_LIMIT))
+    }
+}
+
+fn optional_event_header(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest("invalid event pagination header"))?
+        .trim();
+    if value.is_empty() {
+        return Err(ApiError::BadRequest("event pagination header is empty"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn paginate_session_events(
+    events: &[SessionEvent],
+    query: &SessionEventsQuery,
+) -> Result<SessionEventsPage, ApiError> {
+    query.validate()?;
+    let limit = query.page_limit()?;
+    let latest_window = || {
+        let end = events.len();
+        (end.saturating_sub(limit), end)
+    };
+
+    let mut reset = false;
+    let (start, end) = if let Some(before) = query.before.as_deref() {
+        if let Some(cursor_index) = events.iter().position(|event| event.id == before) {
+            let end = cursor_index;
+            (end.saturating_sub(limit), end)
+        } else {
+            reset = true;
+            latest_window()
+        }
+    } else if let Some(since) = query.since.as_deref() {
+        if let Some(cursor_index) = events.iter().rposition(|event| event.id == since) {
+            let end = (cursor_index + limit.max(2)).min(events.len());
+            (cursor_index, end)
+        } else {
+            reset = true;
+            latest_window()
+        }
+    } else {
+        latest_window()
+    };
+
+    let page_events = events[start..end].to_vec();
+    Ok(SessionEventsPage {
+        before_cursor: page_events.first().map(|event| event.id.clone()),
+        after_cursor: page_events.last().map(|event| event.id.clone()),
+        has_more_before: start > 0,
+        has_more_after: end < events.len(),
+        events: page_events,
+        reset,
+    })
+}
+
+fn session_event_for_mobile(mut event: SessionEvent) -> SessionEvent {
+    if let Some(payload) = event.payload.as_object_mut() {
+        payload.remove("raw");
+    }
+    event
 }
 
 async fn get_local_image_asset(
@@ -716,6 +1045,7 @@ fn event_for_user_message(
     text: String,
     attachments: Vec<StoredImageAttachment>,
     created_at: u64,
+    client_message_id: Option<&str>,
 ) -> SessionEvent {
     let mut payload = json!({
         "role": "user",
@@ -742,8 +1072,17 @@ fn event_for_user_message(
         );
     }
 
+    if let Some(client_message_id) = client_message_id
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert("bridgeEcho".to_string(), json!(true));
+        object.insert("clientMessageId".to_string(), json!(client_message_id));
+    }
+
     SessionEvent {
-        id: Uuid::new_v4().to_string(),
+        id: client_message_id
+            .map(ToString::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
         thread_id,
         event_type: SessionEventType::Message,
         payload,
@@ -882,6 +1221,8 @@ fn display_name_for_attachment(name: &str, fallback_extension: &str) -> String {
 async fn send_message(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
+    Extension(device): Extension<AuthenticatedDevice>,
+    headers: HeaderMap,
     Json(request): Json<SendMessageRequest>,
 ) -> Result<(StatusCode, Json<AcceptedResponse>), ApiError> {
     let text = request.text.trim().to_string();
@@ -890,7 +1231,65 @@ async fn send_message(
             "message text or attachment is required",
         ));
     }
-    let attachments = store_incoming_image_attachments(&request.attachments).await?;
+    let client_message_id = client_message_id_from_headers(&headers)?;
+    let claim = if let Some(client_message_id) = client_message_id.as_deref() {
+        claim_message_dedupe(
+            &state.message_dedupe,
+            message_dedupe_key(&device.device_id, &thread_id, client_message_id),
+        )
+        .await
+    } else {
+        None
+    };
+    match claim {
+        Some(MessageDedupeClaim::Completed) => {}
+        Some(MessageDedupeClaim::Owner { key, notify }) => {
+            let task_state = state.clone();
+            let task = tokio::spawn(async move {
+                let result = deliver_user_message(
+                    task_state.clone(),
+                    thread_id,
+                    text,
+                    request.attachments,
+                    client_message_id,
+                )
+                .await;
+                if result.is_ok() {
+                    complete_message_dedupe(&task_state.message_dedupe, key, &notify).await;
+                } else {
+                    fail_message_dedupe(&task_state.message_dedupe, &key, &notify).await;
+                }
+                result
+            });
+            task.await
+                .map_err(|_| ApiError::Internal("message delivery task failed"))??;
+        }
+        None => {
+            deliver_user_message(
+                state,
+                thread_id,
+                text,
+                request.attachments,
+                client_message_id,
+            )
+            .await?;
+        }
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(AcceptedResponse { accepted: true }),
+    ))
+}
+
+async fn deliver_user_message(
+    state: AppState,
+    thread_id: String,
+    text: String,
+    incoming_attachments: Vec<IncomingImageAttachment>,
+    client_message_id: Option<String>,
+) -> Result<(), ApiError> {
+    let attachments = store_incoming_image_attachments(&incoming_attachments).await?;
     let adapter_attachments = codex_image_attachments(&attachments);
 
     if let Some(adapter) = state.codex_adapter.as_ref() {
@@ -899,14 +1298,91 @@ async fn send_message(
             .await?;
     }
 
-    let event = event_for_user_message(thread_id, text, attachments, current_time_ms());
+    let event = event_for_user_message(
+        thread_id,
+        text,
+        attachments,
+        current_time_ms(),
+        client_message_id.as_deref(),
+    );
     let event = state.register_local_assets_for_event(event).await;
     state.publish_session_event(event).await;
+    Ok(())
+}
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(AcceptedResponse { accepted: true }),
-    ))
+fn client_message_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get(CLIENT_MESSAGE_ID_HEADER) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest("invalid client message id"))?
+        .trim();
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ApiError::BadRequest("invalid client message id"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn message_dedupe_key(device_id: &str, thread_id: &str, client_message_id: &str) -> String {
+    format!("{device_id}\n{thread_id}\n{client_message_id}")
+}
+
+async fn claim_message_dedupe(
+    cache: &Mutex<MessageDedupeCache>,
+    key: String,
+) -> Option<MessageDedupeClaim> {
+    loop {
+        let waiter = {
+            let mut cache = cache.lock().await;
+            match cache.entries.get(&key) {
+                Some(MessageDedupeEntry::Completed) => {
+                    return Some(MessageDedupeClaim::Completed);
+                }
+                Some(MessageDedupeEntry::InFlight(notify)) => Some(notify.clone().notified_owned()),
+                None => {
+                    let notify = Arc::new(Notify::new());
+                    cache
+                        .entries
+                        .insert(key.clone(), MessageDedupeEntry::InFlight(notify.clone()));
+                    return Some(MessageDedupeClaim::Owner { key, notify });
+                }
+            }
+        };
+        if let Some(waiter) = waiter {
+            waiter.await;
+        }
+    }
+}
+
+async fn complete_message_dedupe(cache: &Mutex<MessageDedupeCache>, key: String, notify: &Notify) {
+    let mut cache = cache.lock().await;
+    cache
+        .entries
+        .insert(key.clone(), MessageDedupeEntry::Completed);
+    cache.completed_order.push_back(key);
+    while cache.completed_order.len() > MAX_MESSAGE_DEDUPE_ENTRIES {
+        if let Some(expired_key) = cache.completed_order.pop_front()
+            && matches!(
+                cache.entries.get(&expired_key),
+                Some(MessageDedupeEntry::Completed)
+            )
+        {
+            cache.entries.remove(&expired_key);
+        }
+    }
+    drop(cache);
+    notify.notify_waiters();
+}
+
+async fn fail_message_dedupe(cache: &Mutex<MessageDedupeCache>, key: &str, notify: &Notify) {
+    cache.lock().await.entries.remove(key);
+    notify.notify_waiters();
 }
 
 async fn decide_approval(
@@ -930,6 +1406,12 @@ async fn decide_approval(
             .respond_approval(&decision.approval_id, &decision)
             .await?;
     }
+
+    state
+        .pending_approvals
+        .lock()
+        .await
+        .remove(&decision.approval_id);
 
     state
         .event_hub
@@ -978,6 +1460,11 @@ async fn trigger_dev_approval(
         created_at: now,
         expires_at: None,
     };
+    state
+        .pending_approvals
+        .lock()
+        .await
+        .insert(approval.id.clone(), approval.clone());
 
     if let Some(mut snapshot) = state.event_hub.snapshot_for_thread(&thread_id).await {
         if !snapshot.pending_approval_ids.contains(&approval.id) {
@@ -1225,7 +1712,10 @@ mod tests {
 
     use crate::{
         cdp::BridgeConnectionState,
-        codex_rpc::{CodexAdapter, CodexRpcError, CodexThread, CodexTurn},
+        codex_rpc::{
+            CodexAdapter, CodexPendingApproval, CodexRpcError, CodexThread, CodexTurn,
+            CodexTurnPage,
+        },
         diagnostics::DiagnosticsReport,
         local_assets::LocalAssetRegistryConfig,
         pairing::PairingManager,
@@ -1308,6 +1798,7 @@ mod tests {
             json!({
                 "status": "degraded",
                 "connectionState": "codex_not_running",
+                "version": env!("CARGO_PKG_VERSION"),
             })
         );
     }
@@ -1863,6 +2354,98 @@ mod tests {
             }
             envelope => panic!("expected approval request, got {envelope:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn lists_real_pending_approvals_from_desktop_adapter() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::with_pending_approvals(vec![
+            CodexPendingApproval {
+                thread_id: "thread-approval".to_string(),
+                request_id: "7".to_string(),
+                method: "mcpServer/elicitation/request".to_string(),
+                params: json!({
+                    "serverName": "mcpServers",
+                    "message": "Allow the mcpServers MCP server to run tool \"read_memory\"?",
+                    "_meta": {
+                        "codex_approval_kind": "mcp_tool_call",
+                        "tool_params": { "uri": "system://boot" },
+                        "tool_params_display": [
+                            { "name": "uri", "value": "system://boot", "display_name": "uri" }
+                        ]
+                    }
+                }),
+            },
+        ]));
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/approvals")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body[0]["id"], json!("thread-approval:7"));
+        assert_eq!(body[0]["threadId"], json!("thread-approval"));
+        assert_eq!(body[0]["kind"], json!("mcp"));
+        assert_eq!(body[0]["title"], json!("Allow read_memory"));
+        assert_eq!(body[0]["detail"], json!("uri: system://boot"));
+    }
+
+    #[tokio::test]
+    async fn approval_list_preserves_debug_approvals() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let app = build_router(state);
+
+        let trigger_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/control/dev/approvals")
+                    .header(BRIDGE_CONTROL_TOKEN_HEADER, TEST_CONTROL_TOKEN)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "threadId": "thread-debug",
+                            "title": "Debug approval",
+                            "detail": "echo debug"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        assert_eq!(trigger_response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/approvals")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body.as_array().map(Vec::len), Some(1));
+        assert_eq!(body[0]["threadId"], json!("thread-debug"));
+        assert_eq!(body[0]["title"], json!("Debug approval"));
     }
 
     #[tokio::test]
@@ -2497,6 +3080,450 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paginated_event_request_returns_latest_bounded_page() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        for index in 1..=4 {
+            state
+                .publish_session_event(SessionEvent {
+                    id: format!("event-{index}"),
+                    thread_id: "thread-1".to_string(),
+                    event_type: SessionEventType::Message,
+                    payload: json!({ "role": "assistant", "text": format!("message-{index}") }),
+                    created_at: 1_725_000_000_000 + index,
+                })
+                .await;
+        }
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events?limit=2")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["events"][0]["id"], json!("event-3"));
+        assert_eq!(body["events"][1]["id"], json!("event-4"));
+        assert_eq!(body["beforeCursor"], json!("event-3"));
+        assert_eq!(body["afterCursor"], json!("event-4"));
+        assert_eq!(body["hasMoreBefore"], json!(true));
+        assert_eq!(body["hasMoreAfter"], json!(false));
+        assert_eq!(body["reset"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn event_since_cursor_returns_tail_overlap_and_new_events() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        for index in 1..=5 {
+            state
+                .publish_session_event(SessionEvent {
+                    id: format!("event-{index}"),
+                    thread_id: "thread-1".to_string(),
+                    event_type: SessionEventType::Message,
+                    payload: json!({ "role": "assistant", "text": format!("message-{index}") }),
+                    created_at: 1_725_000_000_000 + index,
+                })
+                .await;
+        }
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events?limit=3&since=event-2")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["events"][0]["id"], json!("event-2"));
+        assert_eq!(body["events"][2]["id"], json!("event-4"));
+        assert_eq!(body["afterCursor"], json!("event-4"));
+        assert_eq!(body["hasMoreAfter"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn event_before_cursor_returns_previous_history_page() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        for index in 1..=5 {
+            state
+                .publish_session_event(SessionEvent {
+                    id: format!("event-{index}"),
+                    thread_id: "thread-1".to_string(),
+                    event_type: SessionEventType::Message,
+                    payload: json!({ "role": "assistant", "text": format!("message-{index}") }),
+                    created_at: 1_725_000_000_000 + index,
+                })
+                .await;
+        }
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events?limit=2&before=event-4")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["events"][0]["id"], json!("event-2"));
+        assert_eq!(body["events"][1]["id"], json!("event-3"));
+        assert_eq!(body["beforeCursor"], json!("event-2"));
+        assert_eq!(body["hasMoreBefore"], json!(true));
+        assert_eq!(body["hasMoreAfter"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn adapter_cursor_fetches_older_turns_for_history_page() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::with_turn_pages(
+            "thread-1",
+            CodexTurnPage {
+                turns: vec![message_turn(4), message_turn(3)],
+                next_cursor: Some("older-cursor".to_string()),
+                backwards_cursor: Some("newer-cursor".to_string()),
+            },
+            vec![(
+                "older-cursor",
+                CodexTurnPage {
+                    turns: vec![message_turn(2), message_turn(1)],
+                    next_cursor: None,
+                    backwards_cursor: Some("page-2-newer".to_string()),
+                },
+            )],
+        ));
+        let requested_cursors = adapter.turn_page_cursors();
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let initial = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events?limit=2")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        let initial = response_json(initial).await;
+        assert_eq!(initial["events"][0]["id"], json!("turn-3:item-3"));
+        assert_eq!(initial["events"][1]["id"], json!("turn-4:item-4"));
+        assert_eq!(initial["hasMoreBefore"], json!(true));
+
+        let older = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events?limit=2&before=turn-3%3Aitem-3")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        let older = response_json(older).await;
+        assert_eq!(older["events"][0]["id"], json!("turn-1:item-1"));
+        assert_eq!(older["events"][1]["id"], json!("turn-2:item-2"));
+        assert_eq!(older["hasMoreBefore"], json!(false));
+        assert_eq!(
+            requested_cursors.lock().expect("cursor lock").as_slice(),
+            &[None, None, Some("older-cursor".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn event_pagination_headers_enable_bounded_page_response() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        for index in 1..=3 {
+            state
+                .publish_session_event(SessionEvent {
+                    id: format!("event-{index}"),
+                    thread_id: "thread-1".to_string(),
+                    event_type: SessionEventType::Message,
+                    payload: json!({ "role": "assistant", "text": format!("message-{index}") }),
+                    created_at: 1_725_000_000_000 + index,
+                })
+                .await;
+        }
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header("x-codex-events-limit", "2")
+                    .header("x-codex-events-since", "event-1")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["events"][0]["id"], json!("event-1"));
+        assert_eq!(body["events"][1]["id"], json!("event-2"));
+        assert_eq!(body["hasMoreAfter"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn paginated_event_response_supports_gzip_compression() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        for index in 1..=20 {
+            state
+                .publish_session_event(SessionEvent {
+                    id: format!("event-{index}"),
+                    thread_id: "thread-1".to_string(),
+                    event_type: SessionEventType::Message,
+                    payload: json!({
+                        "role": "assistant",
+                        "text": format!("message-{index}-{}", "compressible".repeat(100)),
+                    }),
+                    created_at: 1_725_000_000_000 + index,
+                })
+                .await;
+        }
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events?limit=20")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING),
+            Some(&header::HeaderValue::from_static("gzip"))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_adapter_polls_replace_cached_history_instead_of_duplicating_events() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::with_turns(
+            "thread-1",
+            vec![CodexTurn {
+                id: Some("turn-1".to_string()),
+                thread_id: Some("thread-1".to_string()),
+                created_at: Some(1_725_000_000_000),
+                updated_at: None,
+                raw: json!({
+                    "items": [{
+                        "id": "item-1",
+                        "type": "agentMessage",
+                        "text": "Stable reply",
+                    }],
+                }),
+            }],
+        ));
+        let state = state.with_codex_adapter(adapter);
+        let app = build_router(state.clone());
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/sessions/thread-1/events?limit=50")
+                        .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("request succeeds");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            state
+                .event_history
+                .lock()
+                .await
+                .get("thread-1")
+                .map(VecDeque::len),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_adapter_polls_replace_changed_items_within_same_turn() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::with_turns(
+            "thread-1",
+            vec![CodexTurn {
+                id: Some("turn-changing".to_string()),
+                thread_id: Some("thread-1".to_string()),
+                created_at: Some(1_725_000_000_000),
+                updated_at: None,
+                raw: json!({
+                    "items": [{
+                        "id": "item-1",
+                        "type": "userMessage",
+                        "text": "same prompt",
+                    }],
+                }),
+            }],
+        ));
+        let state = state.with_codex_adapter(adapter.clone());
+        let app = build_router(state.clone());
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events?limit=50")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        assert_eq!(
+            response_json(first).await["events"][0]["id"],
+            json!("turn-changing:item-1")
+        );
+
+        adapter.turns.lock().expect("turns lock").insert(
+            "thread-1".to_string(),
+            vec![CodexTurn {
+                id: Some("turn-changing".to_string()),
+                thread_id: Some("thread-1".to_string()),
+                created_at: Some(1_725_000_000_000),
+                updated_at: None,
+                raw: json!({
+                    "items": [
+                        {
+                            "id": "item-5",
+                            "type": "userMessage",
+                            "text": "same prompt",
+                        },
+                        {
+                            "id": "item-7",
+                            "type": "agentMessage",
+                            "text": "final answer",
+                        }
+                    ],
+                }),
+            }],
+        );
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-1/events?limit=50&since=turn-changing%3Aitem-1")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        let second = response_json(second).await;
+
+        assert_eq!(second["reset"], json!(true));
+        assert_eq!(
+            second["events"]
+                .as_array()
+                .expect("events are returned")
+                .iter()
+                .map(|event| event["id"].as_str().expect("event id"))
+                .collect::<Vec<_>>(),
+            vec!["turn-changing:item-5", "turn-changing:item-7"]
+        );
+        assert_eq!(
+            state
+                .event_history
+                .lock()
+                .await
+                .get("thread-1")
+                .map(VecDeque::len),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_device_event_response_omits_large_adapter_raw_payload() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::with_turns(
+            "thread-large",
+            vec![CodexTurn {
+                id: Some("turn-large".to_string()),
+                thread_id: Some("thread-large".to_string()),
+                created_at: Some(1_725_000_000_000),
+                updated_at: Some(1_725_000_000_000),
+                raw: json!({
+                    "id": "turn-large",
+                    "items": [{
+                        "id": "item-large",
+                        "type": "agentMessage",
+                        "text": "Visible reply",
+                        "debugTrace": "x".repeat(500_000),
+                    }],
+                }),
+            }],
+        ));
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-large/events")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body[0]["payload"]["text"], json!("Visible reply"));
+        assert_eq!(body[0]["payload"].get("raw"), None);
+    }
+
+    #[tokio::test]
     async fn paired_device_send_message_routes_to_codex_adapter() {
         let (_dir, state) = test_state();
         let session_token = pair_device(&state).await;
@@ -2522,6 +3549,99 @@ mod tests {
             messages.lock().expect("messages lock").as_slice(),
             &[("thread-1".to_string(), "hello Codex".to_string(), vec![])]
         );
+    }
+
+    #[tokio::test]
+    async fn paired_device_message_retries_are_idempotent_by_client_message_id() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::default());
+        let messages = adapter.messages();
+        let mut subscriber = state.event_hub().subscribe().await;
+        let app = build_router(state.with_codex_adapter(adapter));
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/sessions/thread-1/messages")
+                .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-codex-client-message-id", "client-message-1")
+                .body(Body::from(json!({ "text": "retry safely" }).to_string()))
+                .expect("request builds")
+        };
+
+        let first = app
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("first request succeeds");
+        let second = app
+            .oneshot(request())
+            .await
+            .expect("retry request succeeds");
+
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        assert_eq!(messages.lock().expect("messages lock").len(), 1);
+        assert!(matches!(
+            subscriber.recv().await.expect("message event broadcasts"),
+            ServerEnvelope::SessionEvent(_)
+        ));
+        let unexpected =
+            tokio::time::timeout(std::time::Duration::from_millis(20), subscriber.recv()).await;
+        assert!(matches!(
+            unexpected,
+            Err(_) | Ok(Err(tokio::sync::broadcast::error::RecvError::Closed))
+        ));
+    }
+
+    #[tokio::test]
+    async fn idempotent_retry_survives_first_http_request_cancellation() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let send_started = Arc::new(tokio::sync::Semaphore::new(0));
+        let send_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let adapter = Arc::new(RecordingAdapter::with_send_gate(
+            send_started.clone(),
+            send_release.clone(),
+        ));
+        let messages = adapter.messages();
+        let app = build_router(state.with_codex_adapter(adapter));
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/sessions/thread-1/messages")
+                .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-codex-client-message-id", "client-message-cancelled")
+                .body(Body::from(
+                    json!({ "text": "retry after disconnect" }).to_string(),
+                ))
+                .expect("request builds")
+        };
+
+        let first_app = app.clone();
+        let first_request = request();
+        let second_request = request();
+        let first = tokio::spawn(async move { first_app.oneshot(first_request).await });
+        send_started
+            .acquire()
+            .await
+            .expect("first send starts")
+            .forget();
+        first.abort();
+        let _ = first.await;
+
+        let second = tokio::spawn(async move { app.oneshot(second_request).await });
+        send_release.add_permits(1);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("retry completes")
+            .expect("retry task joins")
+            .expect("retry request succeeds");
+
+        assert_eq!(second.status(), StatusCode::ACCEPTED);
+        assert_eq!(messages.lock().expect("messages lock").len(), 1);
     }
 
     #[tokio::test]
@@ -2731,13 +3851,34 @@ mod tests {
             .to_string()
     }
 
+    fn message_turn(index: u64) -> CodexTurn {
+        CodexTurn {
+            id: Some(format!("turn-{index}")),
+            thread_id: Some("thread-1".to_string()),
+            created_at: Some(1_725_000_000_000 + index),
+            updated_at: None,
+            raw: json!({
+                "items": [{
+                    "id": format!("item-{index}"),
+                    "type": "agentMessage",
+                    "text": format!("message-{index}"),
+                }],
+            }),
+        }
+    }
+
     #[derive(Default)]
     struct RecordingAdapter {
         decisions: Arc<StdMutex<Vec<ApprovalDecision>>>,
         messages: Arc<StdMutex<Vec<(String, String, Vec<UserImageAttachment>)>>>,
+        pending_approvals: Arc<StdMutex<Vec<CodexPendingApproval>>>,
+        send_release: Option<Arc<tokio::sync::Semaphore>>,
+        send_started: Option<Arc<tokio::sync::Semaphore>>,
         started_threads: Arc<StdMutex<Vec<String>>>,
         threads: Arc<StdMutex<Vec<CodexThread>>>,
         turns: Arc<StdMutex<StdHashMap<String, Vec<CodexTurn>>>>,
+        turn_pages: Arc<StdMutex<StdHashMap<String, CodexTurnPage>>>,
+        turn_page_cursors: Arc<StdMutex<Vec<Option<String>>>>,
     }
 
     impl RecordingAdapter {
@@ -2768,6 +3909,40 @@ mod tests {
             }
         }
 
+        fn with_turn_pages(
+            thread_id: &str,
+            first_page: CodexTurnPage,
+            cursor_pages: Vec<(&str, CodexTurnPage)>,
+        ) -> Self {
+            let mut turn_pages = StdHashMap::new();
+            turn_pages.insert(turn_page_key(thread_id, None), first_page);
+            for (cursor, page) in cursor_pages {
+                turn_pages.insert(turn_page_key(thread_id, Some(cursor)), page);
+            }
+            Self {
+                turn_pages: Arc::new(StdMutex::new(turn_pages)),
+                ..Self::default()
+            }
+        }
+
+        fn with_pending_approvals(pending_approvals: Vec<CodexPendingApproval>) -> Self {
+            Self {
+                pending_approvals: Arc::new(StdMutex::new(pending_approvals)),
+                ..Self::default()
+            }
+        }
+
+        fn with_send_gate(
+            send_started: Arc<tokio::sync::Semaphore>,
+            send_release: Arc<tokio::sync::Semaphore>,
+        ) -> Self {
+            Self {
+                send_release: Some(send_release),
+                send_started: Some(send_started),
+                ..Self::default()
+            }
+        }
+
         fn decisions(&self) -> Arc<StdMutex<Vec<ApprovalDecision>>> {
             self.decisions.clone()
         }
@@ -2778,6 +3953,10 @@ mod tests {
 
         fn started_threads(&self) -> Arc<StdMutex<Vec<String>>> {
             self.started_threads.clone()
+        }
+
+        fn turn_page_cursors(&self) -> Arc<StdMutex<Vec<Option<String>>>> {
+            self.turn_page_cursors.clone()
         }
     }
 
@@ -2845,6 +4024,31 @@ mod tests {
                 .unwrap_or_default())
         }
 
+        async fn list_turns_page(
+            &self,
+            thread_id: &str,
+            cursor: Option<&str>,
+        ) -> Result<CodexTurnPage, CodexRpcError> {
+            self.turn_page_cursors
+                .lock()
+                .expect("turn page cursor lock")
+                .push(cursor.map(ToString::to_string));
+            if let Some(page) = self
+                .turn_pages
+                .lock()
+                .expect("turn pages lock")
+                .get(&turn_page_key(thread_id, cursor))
+                .cloned()
+            {
+                return Ok(page);
+            }
+            Ok(CodexTurnPage {
+                turns: self.list_turns(thread_id).await?,
+                next_cursor: None,
+                backwards_cursor: None,
+            })
+        }
+
         async fn send_user_message(
             &self,
             thread_id: &str,
@@ -2856,7 +4060,25 @@ mod tests {
                 text.to_string(),
                 attachments.to_vec(),
             ));
+            if let Some(send_started) = &self.send_started {
+                send_started.add_permits(1);
+            }
+            if let Some(send_release) = &self.send_release {
+                send_release
+                    .acquire()
+                    .await
+                    .expect("send release semaphore stays open")
+                    .forget();
+            }
             Ok(())
+        }
+
+        async fn list_pending_approvals(&self) -> Result<Vec<CodexPendingApproval>, CodexRpcError> {
+            Ok(self
+                .pending_approvals
+                .lock()
+                .expect("pending approvals lock")
+                .clone())
         }
 
         async fn subscribe_events(&self, _thread_id: Option<&str>) -> Result<(), CodexRpcError> {
@@ -2874,5 +4096,9 @@ mod tests {
                 .push(decision.clone());
             Ok(())
         }
+    }
+
+    fn turn_page_key(thread_id: &str, cursor: Option<&str>) -> String {
+        format!("{thread_id}\u{0}{}", cursor.unwrap_or_default())
     }
 }

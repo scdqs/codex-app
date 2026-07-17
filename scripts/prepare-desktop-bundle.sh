@@ -85,6 +85,8 @@ prepare_cloudflared() {
 
 cd "${repo_root}"
 
+"${script_dir}/check-version-sync.sh"
+
 cargo build -p bridge-sidecar --release
 
 (

@@ -2,9 +2,12 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
+use reqwest::Client;
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
@@ -16,6 +19,8 @@ use uuid::Uuid;
 
 const DEFAULT_TUNNEL_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_TUNNEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_TUNNEL_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+const TUNNEL_HEALTH_FAILURES_BEFORE_ROTATE: u32 = 3;
 const LOCAL_URL_PLACEHOLDER: &str = "{local_url}";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +28,7 @@ pub enum TunnelStatus {
     Stopped,
     Starting,
     Ready,
+    Reconnecting,
     Failed,
     Stopping,
 }
@@ -83,6 +89,46 @@ pub enum TunnelError {
     ChildExited(String),
     #[error("tunnel provider did not print a trycloudflare.com URL within {0:?}")]
     PublicUrlTimeout(Duration),
+    #[error("public tunnel health did not become ready within {0:?}: {1}")]
+    PublicHealthTimeout(Duration, String),
+}
+
+#[async_trait]
+pub trait TunnelHealthProbe: Send + Sync {
+    async fn check(&self, public_url: &str) -> Result<(), String>;
+}
+
+struct HttpTunnelHealthProbe {
+    client: Client,
+}
+
+impl HttpTunnelHealthProbe {
+    fn new() -> Self {
+        Self {
+            client: Client::builder()
+                .timeout(DEFAULT_TUNNEL_HEALTH_TIMEOUT)
+                .build()
+                .expect("tunnel health HTTP client configuration is valid"),
+        }
+    }
+}
+
+#[async_trait]
+impl TunnelHealthProbe for HttpTunnelHealthProbe {
+    async fn check(&self, public_url: &str) -> Result<(), String> {
+        let health_url = format!("{}/api/health", public_url.trim_end_matches('/'));
+        let response = self
+            .client
+            .get(&health_url)
+            .send()
+            .await
+            .map_err(|error| format!("{health_url}: {error}"))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("{health_url} returned {}", response.status()))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -94,20 +140,31 @@ struct TunnelState {
 
 pub struct QuickTunnelManager {
     config: QuickTunnelConfig,
+    health_probe: Arc<dyn TunnelHealthProbe>,
     state: TunnelState,
     child: Option<Child>,
+    consecutive_health_failures: u32,
 }
 
 impl QuickTunnelManager {
     pub fn new(config: QuickTunnelConfig) -> Self {
+        Self::with_health_probe(config, Arc::new(HttpTunnelHealthProbe::new()))
+    }
+
+    pub fn with_health_probe(
+        config: QuickTunnelConfig,
+        health_probe: Arc<dyn TunnelHealthProbe>,
+    ) -> Self {
         Self {
             config,
+            health_probe,
             state: TunnelState {
                 status: TunnelStatus::Stopped,
                 session: None,
                 detail: None,
             },
             child: None,
+            consecutive_health_failures: 0,
         }
     }
 
@@ -120,6 +177,50 @@ impl QuickTunnelManager {
         self.snapshot()
     }
 
+    pub async fn refresh_status(&mut self) -> TunnelSnapshot {
+        self.reconcile_child_status();
+        if self.child.is_none()
+            || !matches!(
+                self.state.status,
+                TunnelStatus::Ready | TunnelStatus::Reconnecting
+            )
+        {
+            return self.snapshot();
+        }
+        let Some(public_url) = self
+            .state
+            .session
+            .as_ref()
+            .map(|session| session.public_url.clone())
+        else {
+            return self.snapshot();
+        };
+
+        match self.health_probe.check(&public_url).await {
+            Ok(()) => {
+                self.consecutive_health_failures = 0;
+                self.state.status = TunnelStatus::Ready;
+                self.state.detail = None;
+            }
+            Err(error) => {
+                self.consecutive_health_failures =
+                    self.consecutive_health_failures.saturating_add(1);
+                self.state.status = TunnelStatus::Reconnecting;
+                let guidance =
+                    if self.consecutive_health_failures >= TUNNEL_HEALTH_FAILURES_BEFORE_ROTATE {
+                        "Use 换链接 if the connection does not recover."
+                    } else {
+                        "Retrying automatically."
+                    };
+                self.state.detail = Some(format!(
+                    "public tunnel health check failed ({}/{}): {error}. {guidance}",
+                    self.consecutive_health_failures, TUNNEL_HEALTH_FAILURES_BEFORE_ROTATE
+                ));
+            }
+        }
+        self.snapshot()
+    }
+
     pub async fn start(
         &mut self,
         local_url: impl Into<String>,
@@ -128,6 +229,7 @@ impl QuickTunnelManager {
             return Err(TunnelError::AlreadyRunning);
         }
         self.child = None;
+        self.consecutive_health_failures = 0;
 
         let local_url = local_url.into();
         let args = self.launch_args(&local_url);
@@ -139,6 +241,7 @@ impl QuickTunnelManager {
 
         let mut command = Command::new(&self.config.binary);
         command
+            .kill_on_drop(true)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -157,33 +260,29 @@ impl QuickTunnelManager {
         };
         let mut output = tunnel_output_lines(&mut child);
 
-        match self.wait_for_public_url(&mut child, &mut output).await {
-            Ok(public_url) => {
-                drain_tunnel_output(output);
-                let session = TunnelSession {
-                    id: Uuid::new_v4().to_string(),
-                    local_url,
-                    public_url,
-                    started_at: current_time_ms(),
-                };
-                self.state = TunnelState {
-                    status: TunnelStatus::Ready,
-                    session: Some(session),
-                    detail: None,
-                };
-                self.child = Some(child);
-                Ok(self.snapshot())
-            }
-            Err(error) => {
-                self.state = TunnelState {
-                    status: TunnelStatus::Failed,
-                    session: None,
-                    detail: Some(error.to_string()),
-                };
-                let _ = child.kill().await;
-                Err(error)
-            }
+        let public_url = match self.wait_for_public_url(&mut child, &mut output).await {
+            Ok(public_url) => public_url,
+            Err(error) => return self.fail_start(child, error).await,
+        };
+        drain_tunnel_output(output);
+        if let Err(error) = self.wait_for_public_health(&mut child, &public_url).await {
+            return self.fail_start(child, error).await;
         }
+
+        let session = TunnelSession {
+            id: Uuid::new_v4().to_string(),
+            local_url,
+            public_url,
+            started_at: current_time_ms(),
+        };
+        self.state = TunnelState {
+            status: TunnelStatus::Ready,
+            session: Some(session),
+            detail: None,
+        };
+        self.consecutive_health_failures = 0;
+        self.child = Some(child);
+        Ok(self.snapshot())
     }
 
     pub async fn stop(&mut self) -> Result<TunnelSnapshot, TunnelError> {
@@ -196,7 +295,22 @@ impl QuickTunnelManager {
             session: None,
             detail: None,
         };
+        self.consecutive_health_failures = 0;
         Ok(self.snapshot())
+    }
+
+    pub fn terminate_now(&mut self) -> TunnelSnapshot {
+        self.state.status = TunnelStatus::Stopping;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
+        self.state = TunnelState {
+            status: TunnelStatus::Stopped,
+            session: None,
+            detail: None,
+        };
+        self.consecutive_health_failures = 0;
+        self.snapshot()
     }
 
     pub async fn rotate(&mut self) -> Result<TunnelSnapshot, TunnelError> {
@@ -270,6 +384,48 @@ impl QuickTunnelManager {
         }
     }
 
+    async fn wait_for_public_health(
+        &self,
+        child: &mut Child,
+        public_url: &str,
+    ) -> Result<(), TunnelError> {
+        let deadline = Instant::now() + self.config.startup_timeout;
+
+        loop {
+            if let Some(status) = child.try_wait().map_err(TunnelError::Spawn)? {
+                return Err(TunnelError::ChildExited(status.to_string()));
+            }
+
+            let health_error = match self.health_probe.check(public_url).await {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+
+            if Instant::now() >= deadline {
+                return Err(TunnelError::PublicHealthTimeout(
+                    self.config.startup_timeout,
+                    health_error,
+                ));
+            }
+            sleep(self.config.poll_interval).await;
+        }
+    }
+
+    async fn fail_start(
+        &mut self,
+        mut child: Child,
+        error: TunnelError,
+    ) -> Result<TunnelSnapshot, TunnelError> {
+        self.state = TunnelState {
+            status: TunnelStatus::Failed,
+            session: None,
+            detail: Some(error.to_string()),
+        };
+        self.consecutive_health_failures = 0;
+        let _ = child.kill().await;
+        Err(error)
+    }
+
     fn running_child(&mut self) -> Result<bool, TunnelError> {
         if let Some(child) = self.child.as_mut()
             && child.try_wait().map_err(TunnelError::Spawn)?.is_none()
@@ -287,6 +443,7 @@ impl QuickTunnelManager {
             self.state.status = TunnelStatus::Failed;
             self.state.session = None;
             self.state.detail = Some(format!("tunnel provider exited: {status}"));
+            self.consecutive_health_failures = 0;
         }
     }
 
@@ -399,7 +556,29 @@ fn current_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::{collections::VecDeque, sync::Arc};
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
+
+    struct SequenceHealthProbe {
+        results: Mutex<VecDeque<Result<(), String>>>,
+    }
+
+    impl SequenceHealthProbe {
+        fn new(results: impl IntoIterator<Item = Result<(), String>>) -> Self {
+            Self {
+                results: Mutex::new(results.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TunnelHealthProbe for SequenceHealthProbe {
+        async fn check(&self, _public_url: &str) -> Result<(), String> {
+            self.results.lock().await.pop_front().unwrap_or(Ok(()))
+        }
+    }
 
     fn shell_config(script: &str) -> QuickTunnelConfig {
         QuickTunnelConfig {
@@ -408,6 +587,13 @@ mod tests {
             startup_timeout: Duration::from_millis(300),
             poll_interval: Duration::from_millis(10),
         }
+    }
+
+    fn healthy_shell_manager(script: &str) -> QuickTunnelManager {
+        QuickTunnelManager::with_health_probe(
+            shell_config(script),
+            Arc::new(SequenceHealthProbe::new([Ok(())])),
+        )
     }
 
     #[test]
@@ -447,9 +633,8 @@ mod tests {
 
     #[test]
     fn bundled_tunnel_binary_resolves_from_macos_app_executable() {
-        let executable = PathBuf::from(
-            "/Applications/Codex Mobile Bridge.app/Contents/MacOS/desktop-shell",
-        );
+        let executable =
+            PathBuf::from("/Applications/Codex Mobile Bridge.app/Contents/MacOS/desktop-shell");
 
         assert_eq!(
             bundled_tunnel_binary_from_exe(&executable),
@@ -476,9 +661,8 @@ mod tests {
 
     #[tokio::test]
     async fn start_returns_ready_session_from_provider_stderr_url() {
-        let mut manager = QuickTunnelManager::new(shell_config(
-            "echo 'INF https://first.trycloudflare.com' >&2; sleep 5",
-        ));
+        let mut manager =
+            healthy_shell_manager("echo 'INF https://first.trycloudflare.com' >&2; sleep 5");
 
         let snapshot = manager
             .start("http://127.0.0.1:57324")
@@ -492,6 +676,119 @@ mod tests {
 
         let stopped = manager.stop().await.expect("tunnel stops");
         assert_eq!(stopped.status, TunnelStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn dropping_manager_terminates_running_provider() {
+        let pid = {
+            let mut manager = healthy_shell_manager(
+                "echo 'INF https://drop-test.trycloudflare.com' >&2; exec sleep 30",
+            );
+            manager
+                .start("http://127.0.0.1:57324")
+                .await
+                .expect("tunnel starts");
+            manager
+                .child
+                .as_ref()
+                .and_then(Child::id)
+                .expect("tunnel provider has a pid")
+        };
+
+        let stopped = wait_for_process_exit(pid).await;
+        if !stopped {
+            terminate_process(pid);
+        }
+        assert!(stopped, "tunnel provider {pid} survived manager drop");
+    }
+
+    #[tokio::test]
+    async fn terminate_now_stops_running_provider_without_async_wait() {
+        let mut manager = healthy_shell_manager(
+            "echo 'INF https://terminate-test.trycloudflare.com' >&2; exec sleep 30",
+        );
+        manager
+            .start("http://127.0.0.1:57324")
+            .await
+            .expect("tunnel starts");
+        let pid = manager
+            .child
+            .as_ref()
+            .and_then(Child::id)
+            .expect("tunnel provider has a pid");
+
+        let snapshot = manager.terminate_now();
+
+        assert_eq!(snapshot.status, TunnelStatus::Stopped);
+        let stopped = wait_for_process_exit(pid).await;
+        if !stopped {
+            terminate_process(pid);
+        }
+        assert!(
+            stopped,
+            "tunnel provider {pid} survived synchronous termination"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_waits_for_public_health_before_ready() {
+        let probe = Arc::new(SequenceHealthProbe::new([
+            Err("edge returned 502".to_string()),
+            Ok(()),
+        ]));
+        let mut manager = QuickTunnelManager::with_health_probe(
+            shell_config("echo 'INF https://warming.trycloudflare.com' >&2; sleep 5"),
+            probe.clone(),
+        );
+
+        let snapshot = manager
+            .start("http://127.0.0.1:57324")
+            .await
+            .expect("tunnel becomes healthy");
+
+        assert_eq!(snapshot.status, TunnelStatus::Ready);
+        assert!(probe.results.lock().await.is_empty());
+        let _ = manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn running_tunnel_reconnects_after_a_public_health_blip() {
+        let probe = Arc::new(SequenceHealthProbe::new([
+            Ok(()),
+            Err("edge returned 502".to_string()),
+            Ok(()),
+        ]));
+        let mut manager = QuickTunnelManager::with_health_probe(
+            shell_config("echo 'INF https://steady.trycloudflare.com' >&2; sleep 5"),
+            probe,
+        );
+        manager
+            .start("http://127.0.0.1:57324")
+            .await
+            .expect("tunnel starts healthy");
+
+        let reconnecting = manager.refresh_status().await;
+
+        assert_eq!(reconnecting.status, TunnelStatus::Reconnecting);
+        assert_eq!(
+            reconnecting
+                .session
+                .as_ref()
+                .map(|session| session.public_url.as_str()),
+            Some("https://steady.trycloudflare.com")
+        );
+        assert!(
+            reconnecting
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("502"))
+        );
+
+        let recovered = manager.refresh_status().await;
+
+        assert_eq!(recovered.status, TunnelStatus::Ready);
+        assert_eq!(recovered.detail, None);
+        let _ = manager.stop().await;
     }
 
     #[tokio::test]
@@ -531,9 +828,8 @@ mod tests {
 
     #[tokio::test]
     async fn status_clears_session_when_provider_exits_after_ready() {
-        let mut manager = QuickTunnelManager::new(shell_config(
-            "echo 'INF https://done.trycloudflare.com' >&2; sleep 0.05",
-        ));
+        let mut manager =
+            healthy_shell_manager("echo 'INF https://done.trycloudflare.com' >&2; sleep 0.05");
 
         let ready = manager
             .start("http://127.0.0.1:57324")
@@ -557,9 +853,9 @@ mod tests {
 
     #[tokio::test]
     async fn keeps_provider_running_after_public_url_when_logs_continue() {
-        let mut manager = QuickTunnelManager::new(shell_config(
+        let mut manager = healthy_shell_manager(
             "echo 'INF https://steady.trycloudflare.com' >&2; i=0; while [ $i -lt 30 ]; do echo \"INF still running $i\" >&2; i=$((i+1)); sleep 0.01; done; sleep 5",
-        ));
+        );
 
         let ready = manager
             .start("http://127.0.0.1:57324")
@@ -581,9 +877,8 @@ mod tests {
 
     #[tokio::test]
     async fn rotate_restarts_tunnel_for_existing_local_url() {
-        let mut manager = QuickTunnelManager::new(shell_config(
-            "echo 'INF https://rotated.trycloudflare.com' >&2; sleep 5",
-        ));
+        let mut manager =
+            healthy_shell_manager("echo 'INF https://rotated.trycloudflare.com' >&2; sleep 5");
 
         let first = manager
             .start("http://127.0.0.1:57324")
@@ -603,5 +898,32 @@ mod tests {
         assert_ne!(rotated.id, first.id);
 
         let _ = manager.stop().await;
+    }
+
+    async fn wait_for_process_exit(pid: u32) -> bool {
+        for _ in 0..50 {
+            if !process_is_running(pid) {
+                return true;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    fn process_is_running(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn terminate_process(pid: u32) {
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
