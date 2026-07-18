@@ -27,6 +27,7 @@ const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_RUNTIME_HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 const DEFAULT_RUNTIME_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_AUTHENTICATION_SETTLE_WINDOW: Duration = Duration::from_millis(500);
 const DEFAULT_MAX_NETWORK_RETRIES: u8 = 3;
 const OUTPUT_RING_CAPACITY: usize = 64;
 
@@ -108,12 +109,22 @@ pub trait NamedTunnelHealthProbe: Send + Sync {
     async fn health(&self, base_url: &str) -> Result<BridgeHealthIdentity, ProbeFailure>;
 }
 
+trait NamedTunnelProcessLauncher: Send + Sync {
+    fn spawn(&self, binary: &Path, args: &[String]) -> Result<Child, NamedTunnelError>;
+}
+
+struct CloudflaredProcessLauncher;
+
+impl NamedTunnelProcessLauncher for CloudflaredProcessLauncher {
+    fn spawn(&self, binary: &Path, args: &[String]) -> Result<Child, NamedTunnelError> {
+        spawn_cloudflared(binary, args)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum NamedTunnelError {
     #[error("named tunnel is already running")]
     AlreadyRunning,
-    #[error("named tunnel configuration is invalid")]
-    InvalidConfiguration,
     #[error("Tunnel Token is missing")]
     TokenMissing,
     #[error("Cloudflare rejected the Tunnel Token")]
@@ -139,9 +150,7 @@ pub enum NamedTunnelError {
 impl NamedTunnelError {
     pub fn failure_kind(&self) -> NamedTunnelFailureKind {
         match self {
-            Self::AlreadyRunning | Self::InvalidConfiguration => {
-                NamedTunnelFailureKind::InvalidConfiguration
-            }
+            Self::AlreadyRunning | Self::Io(_) => NamedTunnelFailureKind::InvalidConfiguration,
             Self::TokenMissing => NamedTunnelFailureKind::TokenMissing,
             Self::TokenRejected => NamedTunnelFailureKind::TokenRejected,
             Self::LocalHealthUnavailable => NamedTunnelFailureKind::LocalHealthUnavailable,
@@ -152,7 +161,6 @@ impl NamedTunnelError {
             Self::WrongBridgeInstance => NamedTunnelFailureKind::WrongBridgeInstance,
             Self::NetworkUnavailable => NamedTunnelFailureKind::NetworkUnavailable,
             Self::ChildExited => NamedTunnelFailureKind::ChildExited,
-            Self::Io(_) => NamedTunnelFailureKind::ChildExited,
         }
     }
 
@@ -178,8 +186,6 @@ pub struct NamedTunnelConfig {
     pub retry_delays: [Duration; 3],
     pub runtime_health_interval: Duration,
     pub runtime_health_timeout: Duration,
-    /// Test-only command support for the same child lifecycle used by cloudflared.
-    pub launch_args_override: Option<Vec<String>>,
 }
 
 impl Default for NamedTunnelConfig {
@@ -203,7 +209,6 @@ impl Default for NamedTunnelConfig {
             ],
             runtime_health_interval: DEFAULT_RUNTIME_HEALTH_INTERVAL,
             runtime_health_timeout: DEFAULT_RUNTIME_HEALTH_TIMEOUT,
-            launch_args_override: None,
         }
     }
 }
@@ -312,16 +317,6 @@ impl TunnelOutputMonitor {
         rejected
     }
 
-    async fn token_rejected_within(&mut self, duration: Duration) -> bool {
-        if self.token_rejected() {
-            return true;
-        }
-        matches!(
-            timeout(duration, self.events.recv()).await,
-            Ok(Some(OutputEvent::TokenRejected))
-        )
-    }
-
     async fn shutdown(&mut self) {
         for reader in &self.readers {
             reader.abort();
@@ -351,6 +346,7 @@ impl Drop for TunnelOutputMonitor {
 pub struct NamedTunnelManager {
     config: NamedTunnelConfig,
     probe: Arc<dyn NamedTunnelHealthProbe>,
+    launcher: Arc<dyn NamedTunnelProcessLauncher>,
     state: NamedTunnelState,
     child: Option<Child>,
     output_monitor: Option<TunnelOutputMonitor>,
@@ -370,6 +366,25 @@ impl NamedTunnelManager {
         Self {
             config,
             probe,
+            launcher: Arc::new(CloudflaredProcessLauncher),
+            state: NamedTunnelState::at(NamedTunnelStatus::Stopped),
+            child: None,
+            output_monitor: None,
+            local_identity: None,
+            last_runtime_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_dependencies(
+        config: NamedTunnelConfig,
+        probe: Arc<dyn NamedTunnelHealthProbe>,
+        launcher: Arc<dyn NamedTunnelProcessLauncher>,
+    ) -> Self {
+        Self {
+            config,
+            probe,
+            launcher,
             state: NamedTunnelState::at(NamedTunnelStatus::Stopped),
             child: None,
             output_monitor: None,
@@ -395,17 +410,7 @@ impl NamedTunnelManager {
             return Err(error);
         }
 
-        let profile = match NamedTunnelProfile::new(
-            &self.config.profile.hostname,
-            self.config.profile.local_port,
-        ) {
-            Ok(profile) => profile,
-            Err(_) => {
-                let error = NamedTunnelError::InvalidConfiguration;
-                self.fail_without_child(&error);
-                return Err(error);
-            }
-        };
+        let profile = self.config.profile.clone();
         let local_url = profile.local_url();
         let public_url = profile.public_url();
         self.state = NamedTunnelState {
@@ -436,13 +441,9 @@ impl NamedTunnelManager {
                 return Err(error);
             }
         };
-        let args = self
-            .config
-            .launch_args_override
-            .clone()
-            .unwrap_or_else(|| named_tunnel_launch_args(token_file.path(), &local_url));
+        let args = named_tunnel_launch_args(token_file.path(), &local_url);
         self.state.status = NamedTunnelStatus::Starting;
-        let mut child = match spawn_cloudflared(&self.config.binary, &args) {
+        let mut child = match self.launcher.spawn(&self.config.binary, &args) {
             Ok(child) => child,
             Err(error) => {
                 self.fail_without_child(&error);
@@ -452,27 +453,35 @@ impl NamedTunnelManager {
         let mut output = tunnel_output_lines(&mut child);
         self.state.status = NamedTunnelStatus::VerifyingPublic;
 
-        for attempt in 0..=self.config.max_network_retries {
+        let max_network_retries = self
+            .config
+            .max_network_retries
+            .min(DEFAULT_MAX_NETWORK_RETRIES);
+        for attempt in 0..=max_network_retries {
             if let Err(error) = fail_if_child_exited_or_token_rejected(&mut child, &mut output) {
                 return self.fail_start(child, output, error).await;
             }
-            match self
-                .probe_with_timeout(&public_url, self.config.startup_timeout)
-                .await
+            match monitored_probe_with_timeout(
+                Arc::clone(&self.probe),
+                &public_url,
+                self.config.startup_timeout,
+                self.config.poll_interval,
+                &mut child,
+                &mut output,
+            )
+            .await
             {
-                Ok(public_identity) if public_identity == local_identity => {
-                    if output
-                        .token_rejected_within(
-                            self.config.poll_interval.min(Duration::from_millis(10)),
-                        )
-                        .await
-                    {
-                        return self
-                            .fail_start(child, output, NamedTunnelError::TokenRejected)
-                            .await;
-                    }
-                    if let Err(error) =
-                        fail_if_child_exited_or_token_rejected(&mut child, &mut output)
+                Err(error) => return self.fail_start(child, output, error).await,
+                Ok(Ok(public_identity)) if public_identity == local_identity => {
+                    if let Err(error) = monitor_child_for_duration(
+                        self.config
+                            .startup_timeout
+                            .min(DEFAULT_AUTHENTICATION_SETTLE_WINDOW),
+                        self.config.poll_interval,
+                        &mut child,
+                        &mut output,
+                    )
+                    .await
                     {
                         return self.fail_start(child, output, error).await;
                     }
@@ -484,22 +493,22 @@ impl NamedTunnelManager {
                     self.state = NamedTunnelState::ready(local_url, public_url);
                     return Ok(self.snapshot());
                 }
-                Ok(_) => {
+                Ok(Ok(_)) => {
                     return self
                         .fail_start(child, output, NamedTunnelError::WrongBridgeInstance)
                         .await;
                 }
-                Err(error) if error.is_deterministic() => {
+                Ok(Err(error)) if error.is_deterministic() => {
                     return self
                         .fail_start(child, output, NamedTunnelError::from_public_probe(error))
                         .await;
                 }
-                Err(error) if attempt == self.config.max_network_retries => {
+                Ok(Err(error)) if attempt == max_network_retries => {
                     return self
                         .fail_start(child, output, NamedTunnelError::from_public_probe(error))
                         .await;
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     self.state.status = NamedTunnelStatus::Retrying;
                     self.state.retry_attempt = attempt + 1;
                     self.state.detail = Some(error.public_message());
@@ -569,33 +578,44 @@ impl NamedTunnelManager {
             return Ok(self.snapshot());
         }
 
-        let public_url = self.state.public_url.clone().ok_or_else(|| {
-            self.fail_without_child(&NamedTunnelError::InvalidConfiguration);
-            NamedTunnelError::InvalidConfiguration
-        })?;
-        let local_identity = self.local_identity.clone().ok_or_else(|| {
-            self.fail_without_child(&NamedTunnelError::InvalidConfiguration);
-            NamedTunnelError::InvalidConfiguration
-        })?;
+        let (public_url, local_identity) =
+            match (self.state.public_url.clone(), self.local_identity.clone()) {
+                (Some(public_url), Some(local_identity)) => (public_url, local_identity),
+                _ => return Ok(self.snapshot()),
+            };
         self.last_runtime_probe = Some(Instant::now());
-        match self
-            .probe_with_timeout(&public_url, self.config.runtime_health_timeout)
+        let probe_result = {
+            let child = self.child.as_mut().expect("child checked above");
+            let output = self
+                .output_monitor
+                .as_mut()
+                .expect("running child has an output monitor");
+            monitored_probe_with_timeout(
+                Arc::clone(&self.probe),
+                &public_url,
+                self.config.runtime_health_timeout,
+                self.config.poll_interval,
+                child,
+                output,
+            )
             .await
-        {
-            Ok(identity) if identity == local_identity => {
+        };
+        match probe_result {
+            Err(error) => self.fail_runtime(error).await,
+            Ok(Ok(identity)) if identity == local_identity => {
                 self.state.status = NamedTunnelStatus::Ready;
                 self.state.failure_kind = None;
                 self.state.detail = None;
             }
-            Ok(_) => {
+            Ok(Ok(_)) => {
                 self.fail_runtime(NamedTunnelError::WrongBridgeInstance)
                     .await
             }
-            Err(error) if error.is_deterministic() => {
+            Ok(Err(error)) if error.is_deterministic() => {
                 self.fail_runtime(NamedTunnelError::from_public_probe(error))
                     .await;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 self.state.status = NamedTunnelStatus::Degraded;
                 self.state.failure_kind = None;
                 self.state.detail = Some(error.public_message());
@@ -818,6 +838,62 @@ async fn stop_child(mut child: Child) {
     let _ = child.wait().await;
 }
 
+async fn monitor_child_for_duration(
+    duration: Duration,
+    poll_interval: Duration,
+    child: &mut Child,
+    output: &mut TunnelOutputMonitor,
+) -> Result<(), NamedTunnelError> {
+    let poll_interval = if poll_interval.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        poll_interval
+    };
+    let deadline = Instant::now() + duration;
+
+    loop {
+        fail_if_child_exited_or_token_rejected(child, output)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        sleep(remaining.min(poll_interval)).await;
+    }
+
+    fail_if_child_exited_or_token_rejected(child, output)
+}
+
+async fn monitored_probe_with_timeout(
+    probe: Arc<dyn NamedTunnelHealthProbe>,
+    base_url: &str,
+    duration: Duration,
+    poll_interval: Duration,
+    child: &mut Child,
+    output: &mut TunnelOutputMonitor,
+) -> Result<Result<BridgeHealthIdentity, ProbeFailure>, NamedTunnelError> {
+    let probe = timeout(duration, probe.health(base_url));
+    tokio::pin!(probe);
+    let poll_interval = if poll_interval.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        poll_interval
+    };
+
+    loop {
+        tokio::select! {
+            result = &mut probe => {
+                tokio::task::yield_now().await;
+                fail_if_child_exited_or_token_rejected(child, output)?;
+                return Ok(result.unwrap_or(Err(ProbeFailure::Timeout)));
+            }
+            _ = sleep(poll_interval) => {
+                tokio::task::yield_now().await;
+                fail_if_child_exited_or_token_rejected(child, output)?;
+            }
+        }
+    }
+}
+
 pub fn named_tunnel_launch_args(token_file: &Path, local_url: &str) -> Vec<String> {
     vec![
         "tunnel".to_string(),
@@ -838,6 +914,10 @@ impl TemporarySecretFile {
     fn create(runtime_dir: &Path, secret: &str) -> Result<Self, NamedTunnelError> {
         std::fs::create_dir_all(runtime_dir)?;
         let path = runtime_dir.join(format!("cloudflared-token-{}", Uuid::new_v4()));
+        Self::create_at_path(path, secret)
+    }
+
+    fn create_at_path(path: PathBuf, secret: &str) -> Result<Self, NamedTunnelError> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -845,8 +925,8 @@ impl TemporarySecretFile {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
+        let mut file = options.open(&path)?;
         let write_result = (|| -> Result<(), std::io::Error> {
-            let mut file = options.open(&path)?;
             file.write_all(secret.as_bytes())?;
             file.sync_all()
         })();
@@ -872,6 +952,7 @@ impl Drop for TemporarySecretFile {
 mod tests {
     use std::{
         collections::VecDeque,
+        fs,
         path::{Path, PathBuf},
         sync::{
             Arc,
@@ -881,18 +962,25 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use tokio::sync::Mutex;
+    use std::process::Stdio;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        process::{Child, Command},
+        sync::Mutex,
+    };
 
     use super::{
-        BridgeHealthIdentity, NamedTunnelConfig, NamedTunnelFailureKind, NamedTunnelHealthProbe,
-        NamedTunnelManager, NamedTunnelStatus, ProbeFailure, TemporarySecretFile,
-        named_tunnel_launch_args,
+        BridgeHealthIdentity, HttpNamedTunnelHealthProbe, NamedTunnelConfig, NamedTunnelError,
+        NamedTunnelFailureKind, NamedTunnelHealthProbe, NamedTunnelManager,
+        NamedTunnelProcessLauncher, NamedTunnelStatus, OUTPUT_RING_CAPACITY, ProbeFailure,
+        TemporarySecretFile, named_tunnel_launch_args,
     };
 
     struct ScriptedProbe {
         results: Mutex<VecDeque<Result<BridgeHealthIdentity, ProbeFailure>>>,
         public_attempts: AtomicUsize,
-        delay: Duration,
+        public_delay: Duration,
     }
 
     impl ScriptedProbe {
@@ -902,18 +990,18 @@ mod tests {
             Self {
                 results: Mutex::new(results.into_iter().collect()),
                 public_attempts: AtomicUsize::new(0),
-                delay: Duration::ZERO,
+                public_delay: Duration::ZERO,
             }
         }
 
-        fn with_delay(
+        fn with_public_delay(
             results: impl IntoIterator<Item = Result<BridgeHealthIdentity, ProbeFailure>>,
             delay: Duration,
         ) -> Self {
             Self {
                 results: Mutex::new(results.into_iter().collect()),
                 public_attempts: AtomicUsize::new(0),
-                delay,
+                public_delay: delay,
             }
         }
 
@@ -925,11 +1013,11 @@ mod tests {
     #[async_trait]
     impl NamedTunnelHealthProbe for ScriptedProbe {
         async fn health(&self, base_url: &str) -> Result<BridgeHealthIdentity, ProbeFailure> {
-            if !self.delay.is_zero() {
-                tokio::time::sleep(self.delay).await;
-            }
             if base_url.starts_with("https://") {
                 self.public_attempts.fetch_add(1, Ordering::SeqCst);
+                if !self.public_delay.is_zero() {
+                    tokio::time::sleep(self.public_delay).await;
+                }
             }
             self.results
                 .lock()
@@ -946,12 +1034,39 @@ mod tests {
         }
     }
 
-    fn test_config() -> NamedTunnelConfig {
+    #[cfg(unix)]
+    fn shell_quote(path: &Path) -> String {
+        format!(
+            "'{}'",
+            path.display().to_string().replace('\'', "'\\\"'\\\"'")
+        )
+    }
+
+    #[cfg(unix)]
+    fn fake_cloudflared(dir: &Path, args_file: &Path, behavior: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let binary = dir.join("fake-cloudflared");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\n: > {args_file}\nfor argument in \"$@\"; do\n  printf '%s\\n' \"$argument\" >> {args_file}\ndone\n{behavior}\n",
+                args_file = shell_quote(args_file),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        binary
+    }
+
+    #[cfg(unix)]
+    fn production_config_with_behavior(behavior: &str) -> (NamedTunnelConfig, PathBuf) {
         let dir = tempfile::tempdir().unwrap().keep();
-        NamedTunnelConfig {
-            binary: PathBuf::from("/bin/sh"),
+        let args_file = dir.join("received-args");
+        let config = NamedTunnelConfig {
+            binary: fake_cloudflared(&dir, &args_file, behavior),
             profile: crate::NamedTunnelProfile::new("codex.example.com", 57324).unwrap(),
-            runtime_dir: dir,
+            runtime_dir: dir.join("runtime"),
             startup_timeout: Duration::from_millis(50),
             poll_interval: Duration::from_millis(5),
             max_network_retries: 3,
@@ -962,12 +1077,68 @@ mod tests {
             ],
             runtime_health_interval: Duration::from_millis(20),
             runtime_health_timeout: Duration::from_millis(30),
-            launch_args_override: Some(vec!["-c".to_string(), "exec sleep 30".to_string()]),
+        };
+        (config, args_file)
+    }
+
+    fn test_config() -> NamedTunnelConfig {
+        let dir = tempfile::tempdir().unwrap().keep();
+        NamedTunnelConfig {
+            binary: PathBuf::from("test-cloudflared"),
+            profile: crate::NamedTunnelProfile::new("codex.example.com", 57324).unwrap(),
+            runtime_dir: dir.join("runtime"),
+            startup_timeout: Duration::from_millis(50),
+            poll_interval: Duration::from_millis(5),
+            max_network_retries: 3,
+            retry_delays: [
+                Duration::from_millis(5),
+                Duration::from_millis(10),
+                Duration::from_millis(15),
+            ],
+            runtime_health_interval: Duration::from_millis(20),
+            runtime_health_timeout: Duration::from_millis(30),
         }
     }
 
+    struct ShellProcessLauncher {
+        behavior: String,
+    }
+
+    impl ShellProcessLauncher {
+        fn new(behavior: impl Into<String>) -> Self {
+            Self {
+                behavior: behavior.into(),
+            }
+        }
+    }
+
+    impl NamedTunnelProcessLauncher for ShellProcessLauncher {
+        fn spawn(&self, _binary: &Path, _args: &[String]) -> Result<Child, NamedTunnelError> {
+            Command::new("/bin/sh")
+                .kill_on_drop(true)
+                .arg("-c")
+                .arg(&self.behavior)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(NamedTunnelError::Io)
+        }
+    }
+
+    fn test_manager_with_behavior(
+        probe: Arc<dyn NamedTunnelHealthProbe>,
+        behavior: impl Into<String>,
+    ) -> NamedTunnelManager {
+        NamedTunnelManager::with_dependencies(
+            test_config(),
+            probe,
+            Arc::new(ShellProcessLauncher::new(behavior)),
+        )
+    }
+
     fn test_manager(probe: Arc<dyn NamedTunnelHealthProbe>) -> NamedTunnelManager {
-        NamedTunnelManager::with_health_probe(test_config(), probe)
+        test_manager_with_behavior(probe, "exec sleep 30")
     }
 
     async fn running_manager(probe: Arc<dyn NamedTunnelHealthProbe>) -> NamedTunnelManager {
@@ -996,6 +1167,26 @@ mod tests {
         assert!(!args.join(" ").contains("secret-token-value"));
     }
 
+    #[tokio::test]
+    async fn production_start_always_passes_a_token_file_without_exposing_the_token() {
+        let probe = Arc::new(ScriptedProbe::new(vec![
+            Ok(identity("0.1.5", "instance-1")),
+            Ok(identity("0.1.5", "instance-1")),
+        ]));
+        let (mut config, args_file) = production_config_with_behavior("exec sleep 30");
+        config.startup_timeout = Duration::from_secs(1);
+        let mut manager = NamedTunnelManager::with_health_probe(config, probe);
+
+        manager.start("token-value").await.unwrap();
+        assert!(wait_for_file(&args_file).await);
+        let args = fs::read_to_string(&args_file).unwrap();
+
+        assert!(args.lines().any(|arg| arg == "--token-file"));
+        assert!(!args.lines().any(|arg| arg == "--token"));
+        assert!(!args.contains("token-value"));
+        let _ = manager.stop().await;
+    }
+
     #[cfg(unix)]
     #[test]
     fn temporary_token_file_is_mode_0600_and_removed_on_drop() {
@@ -1014,6 +1205,16 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[test]
+    fn temporary_secret_file_collision_never_removes_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing-token-file");
+        fs::write(&path, "existing-secret").unwrap();
+
+        assert!(TemporarySecretFile::create_at_path(path.clone(), "new-secret").is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "existing-secret");
+    }
+
     #[tokio::test]
     async fn dns_failure_is_deterministic_and_is_not_retried() {
         let probe = Arc::new(ScriptedProbe::new(vec![
@@ -1023,7 +1224,15 @@ mod tests {
         let mut manager = test_manager(probe.clone());
         let runtime_dir = manager.config().runtime_dir.clone();
 
-        let error = manager.start("token-value").await.unwrap_err();
+        let result = manager.start("token-value").await;
+        if result.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            panic!(
+                "token rejection was not observed: {:?}",
+                manager.output_monitor.as_ref().unwrap().recent_lines()
+            );
+        }
+        let error = result.unwrap_err();
 
         assert_eq!(error.failure_kind(), NamedTunnelFailureKind::DnsNotReady);
         assert_eq!(probe.public_attempts(), 1);
@@ -1042,7 +1251,15 @@ mod tests {
         ]));
         let mut manager = test_manager(probe.clone());
 
-        let error = manager.start("token-value").await.unwrap_err();
+        let result = manager.start("token-value").await;
+        if result.is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            panic!(
+                "token rejection was not observed: {:?}",
+                manager.output_monitor.as_ref().unwrap().recent_lines()
+            );
+        }
+        let error = result.unwrap_err();
 
         assert_eq!(
             error.failure_kind(),
@@ -1050,6 +1267,32 @@ mod tests {
         );
         assert_eq!(probe.public_attempts(), 4);
         assert_eq!(manager.status().status, NamedTunnelStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn configured_retries_are_clamped_to_three_public_retries() {
+        let probe = Arc::new(ScriptedProbe::new(vec![
+            Ok(identity("0.1.5", "instance-1")),
+            Err(ProbeFailure::Timeout),
+            Err(ProbeFailure::Timeout),
+            Err(ProbeFailure::Timeout),
+            Err(ProbeFailure::Timeout),
+        ]));
+        let mut config = test_config();
+        config.max_network_retries = 9;
+        let mut manager = NamedTunnelManager::with_dependencies(
+            config,
+            probe.clone(),
+            Arc::new(ShellProcessLauncher::new("exec sleep 30")),
+        );
+
+        let error = manager.start("token-value").await.unwrap_err();
+
+        assert_eq!(
+            error.failure_kind(),
+            NamedTunnelFailureKind::NetworkUnavailable
+        );
+        assert_eq!(probe.public_attempts(), 4);
     }
 
     #[tokio::test]
@@ -1070,19 +1313,14 @@ mod tests {
 
     #[tokio::test]
     async fn token_rejection_in_provider_output_overrides_a_successful_public_probe() {
-        let probe = Arc::new(ScriptedProbe::with_delay(
+        let probe = Arc::new(ScriptedProbe::with_public_delay(
             vec![
                 Ok(identity("0.1.5", "instance-1")),
                 Ok(identity("0.1.5", "instance-1")),
             ],
             Duration::from_millis(5),
         ));
-        let mut config = test_config();
-        config.launch_args_override = Some(vec![
-            "-c".to_string(),
-            "echo Unauthorized >&2; exec sleep 30".to_string(),
-        ]);
-        let mut manager = NamedTunnelManager::with_health_probe(config, probe);
+        let mut manager = test_manager_with_behavior(probe, "echo Unauthorized >&2\nexec sleep 30");
 
         let error = manager.start("token-value").await.unwrap_err();
 
@@ -1096,6 +1334,32 @@ mod tests {
                 .unwrap_or_default()
                 .contains("token-value")
         );
+    }
+
+    #[tokio::test]
+    async fn startup_detects_early_token_rejection_while_public_probe_is_slow() {
+        let probe = Arc::new(ScriptedProbe::with_public_delay(
+            vec![
+                Ok(identity("0.1.5", "instance-1")),
+                Ok(identity("0.1.5", "instance-1")),
+            ],
+            Duration::from_millis(500),
+        ));
+        let mut config = test_config();
+        config.startup_timeout = Duration::from_millis(500);
+        let mut manager = NamedTunnelManager::with_dependencies(
+            config,
+            probe,
+            Arc::new(ShellProcessLauncher::new(
+                "sleep 0.02\necho Unauthorized >&2\nexec sleep 30",
+            )),
+        );
+        let started = std::time::Instant::now();
+
+        let error = manager.start("token-value").await.unwrap_err();
+
+        assert_eq!(error.failure_kind(), NamedTunnelFailureKind::TokenRejected);
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 
     #[tokio::test]
@@ -1127,6 +1391,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminate_now_stops_the_child_and_sets_stopped() {
+        let probe = Arc::new(ScriptedProbe::new(vec![
+            Ok(identity("0.1.5", "instance-1")),
+            Ok(identity("0.1.5", "instance-1")),
+        ]));
+        let mut manager = running_manager(probe).await;
+        let pid = manager.status().pid.unwrap();
+
+        let snapshot = manager.terminate_now();
+
+        assert_eq!(snapshot.status, NamedTunnelStatus::Stopped);
+        assert!(wait_for_process_exit(pid).await);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_manager_terminates_the_child() {
+        let probe = Arc::new(ScriptedProbe::new(vec![
+            Ok(identity("0.1.5", "instance-1")),
+            Ok(identity("0.1.5", "instance-1")),
+        ]));
+        let pid = {
+            let mut manager = running_manager(probe).await;
+            manager.status().pid.unwrap()
+        };
+
+        assert!(wait_for_process_exit(pid).await);
+    }
+
+    #[tokio::test]
+    async fn continuous_output_is_drained_while_the_ring_remains_bounded() {
+        let marker_dir = tempfile::tempdir().unwrap().keep();
+        let marker = marker_dir.join("output-drained");
+        let behavior = format!(
+            "i=0\nwhile [ \"$i\" -lt 5000 ]; do\n  printf 'stdout %s\\n' \"$i\"\n  printf 'stderr %s\\n' \"$i\" >&2\n  i=$((i + 1))\ndone\n: > {}\nexec sleep 30",
+            shell_quote(&marker)
+        );
+        let probe = Arc::new(ScriptedProbe::new(vec![
+            Ok(identity("0.1.5", "instance-1")),
+            Ok(identity("0.1.5", "instance-1")),
+        ]));
+        let mut manager = test_manager_with_behavior(probe, behavior);
+
+        assert_eq!(
+            manager.start("token-value").await.unwrap().status,
+            NamedTunnelStatus::Ready
+        );
+        assert!(wait_for_file(&marker).await);
+        let lines = manager.output_monitor.as_ref().unwrap().recent_lines();
+
+        assert!(lines.len() <= OUTPUT_RING_CAPACITY);
+        let _ = manager.stop().await;
+    }
+
+    #[tokio::test]
     async fn runtime_network_loss_degrades_then_recovers_without_respawning_cloudflared() {
         let probe = Arc::new(ScriptedProbe::new(vec![
             Ok(identity("0.1.5", "instance-1")),
@@ -1149,6 +1467,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_health_respects_interval_unless_forced() {
+        let probe = Arc::new(ScriptedProbe::new(vec![
+            Ok(identity("0.1.5", "instance-1")),
+            Ok(identity("0.1.5", "instance-1")),
+            Ok(identity("0.1.5", "instance-1")),
+        ]));
+        let mut manager = running_manager(probe.clone()).await;
+
+        manager.refresh_runtime_health(false).await.unwrap();
+        assert_eq!(probe.public_attempts(), 1);
+        manager.refresh_runtime_health(true).await.unwrap();
+        assert_eq!(probe.public_attempts(), 2);
+        let _ = manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn runtime_child_exit_marks_failed_without_respawning() {
+        let probe = Arc::new(ScriptedProbe::new(vec![
+            Ok(identity("0.1.5", "instance-1")),
+            Ok(identity("0.1.5", "instance-1")),
+        ]));
+        let mut manager = running_manager(probe).await;
+        let pid = manager.status().pid.unwrap();
+        std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let snapshot = manager.refresh_runtime_health(true).await.unwrap();
+
+        assert_eq!(snapshot.status, NamedTunnelStatus::Failed);
+        assert_eq!(
+            snapshot.failure_kind,
+            Some(NamedTunnelFailureKind::ChildExited)
+        );
+        assert_eq!(snapshot.pid, None);
+    }
+
+    #[tokio::test]
     async fn runtime_route_rejection_stops_the_existing_child() {
         let probe = Arc::new(ScriptedProbe::new(vec![
             Ok(identity("0.1.5", "instance-1")),
@@ -1163,6 +1521,115 @@ mod tests {
         assert_eq!(snapshot.status, NamedTunnelStatus::Failed);
         assert_eq!(snapshot.pid, None);
         assert!(wait_for_process_exit(original_pid).await);
+    }
+
+    struct SlowRuntimeProbe {
+        public_attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl NamedTunnelHealthProbe for SlowRuntimeProbe {
+        async fn health(&self, base_url: &str) -> Result<BridgeHealthIdentity, ProbeFailure> {
+            if base_url.starts_with("https://")
+                && self.public_attempts.fetch_add(1, Ordering::SeqCst) > 0
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Ok(identity("0.1.5", "instance-1"))
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_probe_token_rejection_never_recovers_to_ready() {
+        let probe = Arc::new(SlowRuntimeProbe {
+            public_attempts: AtomicUsize::new(0),
+        });
+        let mut config = test_config();
+        config.runtime_health_timeout = Duration::from_millis(500);
+        let mut manager = NamedTunnelManager::with_dependencies(
+            config,
+            probe,
+            Arc::new(ShellProcessLauncher::new(
+                "sleep 0.08\necho Unauthorized >&2\nexec sleep 30",
+            )),
+        );
+        manager.start("token-value").await.unwrap();
+        let started = std::time::Instant::now();
+
+        let snapshot = manager.refresh_runtime_health(true).await.unwrap();
+
+        assert_eq!(snapshot.status, NamedTunnelStatus::Failed);
+        assert_eq!(
+            snapshot.failure_kind,
+            Some(NamedTunnelFailureKind::TokenRejected)
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn default_http_probe_disables_cache() {
+        let (base_url, server) =
+            serve_health_response(r#"{"version":"0.1.5","instanceId":"instance-1"}"#).await;
+
+        let health_identity = HttpNamedTunnelHealthProbe::new()
+            .health(&base_url)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+
+        assert_eq!(health_identity, identity("0.1.5", "instance-1"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("cache-control: no-cache")
+        );
+    }
+
+    #[tokio::test]
+    async fn default_http_probe_rejects_empty_identity_fields() {
+        for body in [
+            r#"{"version":"","instanceId":"instance-1"}"#,
+            r#"{"version":"0.1.5","instanceId":""}"#,
+        ] {
+            let (base_url, server) = serve_health_response(body).await;
+
+            let error = HttpNamedTunnelHealthProbe::new()
+                .health(&base_url)
+                .await
+                .unwrap_err();
+            let _ = server.await.unwrap();
+
+            assert_eq!(error, ProbeFailure::InvalidHealthPayload);
+        }
+    }
+
+    async fn serve_health_response(body: &str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_owned();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let read = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        (format!("http://{address}"), server)
+    }
+
+    async fn wait_for_file(path: &Path) -> bool {
+        for _ in 0..500 {
+            if path.exists() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
     }
 
     async fn wait_for_process_exit(pid: u32) -> bool {
