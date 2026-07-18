@@ -2,13 +2,11 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum RemoteAccessConfigError {
@@ -105,11 +103,10 @@ impl RemoteAccessConfigStore {
                 "remote access configuration path has no file name",
             )
         })?;
-        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let temp_path = parent.join(format!(
-            ".{}.tmp-{}-{counter}",
+            ".{}.tmp-{}",
             file_name.to_string_lossy(),
-            std::process::id()
+            Uuid::new_v4()
         ));
 
         let write_result = write_temp_file(&temp_path, &contents);
@@ -142,13 +139,13 @@ fn write_temp_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         file.flush()?;
         file.sync_all()
     })();
-    drop(file);
 
     if let Err(error) = write_result {
         let _ = fs::remove_file(path);
         return Err(error);
     }
 
+    drop(file);
     Ok(())
 }
 
@@ -178,8 +175,20 @@ mod tests {
     }
 
     #[test]
-    fn named_profile_rejects_url_paths_and_zero_port() {
+    fn named_profile_rejects_url_components_and_zero_port() {
         assert!(NamedTunnelProfile::new("https://codex.example.com/path", 57324).is_err());
+        assert!(matches!(
+            NamedTunnelProfile::new("codex.example.com?cache=1", 57324),
+            Err(RemoteAccessConfigError::InvalidHostname)
+        ));
+        assert!(matches!(
+            NamedTunnelProfile::new("codex.example.com#fragment", 57324),
+            Err(RemoteAccessConfigError::InvalidHostname)
+        ));
+        assert!(matches!(
+            NamedTunnelProfile::new("codex.example.com:443", 57324),
+            Err(RemoteAccessConfigError::InvalidHostname)
+        ));
         assert!(NamedTunnelProfile::new("codex.example.com", 0).is_err());
     }
 
@@ -214,6 +223,19 @@ mod tests {
         assert!(matches!(
             store.load(),
             Err(RemoteAccessConfigError::InvalidPort)
+        ));
+    }
+
+    #[test]
+    fn load_rejects_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote-access.json");
+        std::fs::write(&path, b"{malformed").unwrap();
+        let store = RemoteAccessConfigStore::new(path);
+
+        assert!(matches!(
+            store.load(),
+            Err(RemoteAccessConfigError::Json(_))
         ));
     }
 
