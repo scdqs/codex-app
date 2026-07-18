@@ -140,7 +140,10 @@ function App() {
   const draftImagesRef = useRef<DraftImageAttachment[]>([]);
   const newSessionImagesRef = useRef<DraftImageAttachment[]>([]);
   const canSyncSessionData =
-    Boolean(deviceSession) && (isSessionDataEnabled(connection.label) || connection.label === "Connection error");
+    Boolean(deviceSession) &&
+    (isSessionDataEnabled(connection.label) ||
+      connection.label === "Connection error" ||
+      connection.label === "Pairing");
   const sessionDataLoaded = liveSessions !== null;
   const sessions = liveSessions ?? [];
   const approvals = liveApprovals;
@@ -169,6 +172,16 @@ function App() {
     setConnection(mapHealthToConnection(health));
   }
 
+  function clearAuthenticatedSessionData() {
+    setDeviceSession(null);
+    setLiveSessions(null);
+    setEventsByThread({});
+    eventSyncByThreadRef.current = {};
+    setEventSyncByThread({});
+    setLiveApprovals([]);
+    setSelectedThreadId("");
+  }
+
   async function refreshActiveSession(activeSession: DeviceSession): Promise<RefreshedDeviceSession> {
     if (!sessionRefreshPromiseRef.current) {
       setConnection({ label: "Pairing", detail: "Refreshing session" });
@@ -193,6 +206,9 @@ function App() {
         return { session: nextSession, health };
       })()
         .catch((error) => {
+          if (isAuthError(error)) {
+            clearAuthenticatedSessionData();
+          }
           setConnection(connectionStateForError(error, 1));
           throw error;
         })

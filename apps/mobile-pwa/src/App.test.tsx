@@ -1596,6 +1596,84 @@ describe("App", () => {
       sessionExpiresAt: Date.now() + 60_000,
       bridgeUrl: "http://bridge.local",
     });
+    let refreshRequests = 0;
+    let rejectFirstRefresh: ((response: Response) => void) | undefined;
+    const firstRefresh = new Promise<Response>((resolve) => {
+      rejectFirstRefresh = resolve;
+    });
+    const stalledRefresh = new Promise<Response>(() => {});
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-revoked",
+            title: "Revoked device thread",
+            preview: "Should be cleared after revocation",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/approvals") {
+        return jsonResponse([
+          {
+            id: "approval-revoked",
+            threadId: "thread-revoked",
+            kind: "command",
+            title: "Stale approval",
+            detail: "Should be cleared after revocation",
+            createdAt: 1_784_270_000_000,
+          },
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-revoked/events") {
+        return jsonResponse({ code: "unauthorized", error: "expired" }, 401);
+      }
+      if (url === "http://bridge.local/api/session/refresh" && init?.method === "POST") {
+        refreshRequests += 1;
+        return refreshRequests === 1 ? firstRefresh : stalledRefresh;
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Revoked device thread" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Pending approvals" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(refreshRequests).toBe(1);
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Refreshing session");
+    });
+    await act(async () => {
+      rejectFirstRefresh?.(jsonResponse({ code: "adapter_error", error: "refresh unavailable" }, 502));
+    });
+    await waitFor(() => {
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Reconnecting");
+    });
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+
+    expect(refreshRequests).toBe(1);
+    expect(screen.getByLabelText("Connection status")).not.toHaveTextContent("Refreshing session");
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("refresh unavailable");
+  });
+
+  it("stops_polling_when_device_session_refresh_is_rejected", async () => {
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "old-token",
+      sessionExpiresAt: Date.now() + 60_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    let refreshRequests = 0;
+    let rejectFirstRefresh: ((response: Response) => void) | undefined;
+    const firstRefresh = new Promise<Response>((resolve) => {
+      rejectFirstRefresh = resolve;
+    });
+    const stalledRefresh = new Promise<Response>(() => {});
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
       if (url === "http://bridge.local/api/health") {
@@ -1608,7 +1686,10 @@ describe("App", () => {
         return jsonResponse([]);
       }
       if (url === "http://bridge.local/api/session/refresh" && init?.method === "POST") {
-        return jsonResponse({ code: "adapter_error", error: "refresh unavailable" }, 502);
+        refreshRequests += 1;
+        return refreshRequests === 1
+          ? firstRefresh
+          : stalledRefresh;
       }
       return jsonResponse({});
     });
@@ -1616,10 +1697,22 @@ describe("App", () => {
     render(<App />);
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Reconnecting");
+      expect(refreshRequests).toBe(1);
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Refreshing session");
     });
+    await act(async () => {
+      rejectFirstRefresh?.(jsonResponse({ code: "unauthorized", error: "unauthorized" }, 401));
+    });
+    await waitFor(() => {
+      expect(screen.getByLabelText("Connection status")).toHaveTextContent("Session revoked or expired");
+    });
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+
+    expect(refreshRequests).toBe(1);
+    expect(screen.getByLabelText("Connection status")).toHaveTextContent("Needs new link");
     expect(screen.getByLabelText("Connection status")).not.toHaveTextContent("Refreshing session");
-    expect(screen.getByLabelText("Connection status")).toHaveTextContent("refresh unavailable");
+    expect(screen.queryByRole("heading", { name: "Revoked device thread" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Pending approvals" })).not.toBeInTheDocument();
   });
 
   it("refreshes_session_once_when_new_session_creation_rejects_the_saved_token", async () => {
