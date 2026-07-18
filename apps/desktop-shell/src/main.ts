@@ -1,5 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import QRCode from "qrcode";
+import {
+  escapeHtml,
+  nextWizardState,
+  renderRemoteAccessPanel,
+  type RemoteAccessPreferences,
+  type RemoteAccessStatus,
+  type RemoteModeSelection,
+  type RemoteWizardState,
+} from "./remote-access";
 import "./styles.css";
 
 type BridgeSnapshot = {
@@ -29,13 +38,7 @@ type ShellStatus = {
   appVersion: string;
   bridge: BridgeSnapshot;
   tunnel: TunnelSnapshot;
-  remoteAccess?: {
-    fixedOriginReady: boolean;
-    namedProfile: {
-      hostname: string;
-      localPort: number;
-    } | null;
-  };
+  remoteAccess: RemoteAccessStatus;
   lastPairingLink: string | null;
 };
 
@@ -73,13 +76,22 @@ let pairingQrError = "";
 let busy = false;
 let notice = "";
 let errorText = "";
+let remoteNotice = "";
+let remoteError = "";
+let remotePreferences: RemoteAccessPreferences | null = null;
+let remoteModeSelection: RemoteModeSelection = "named";
+let remoteModeInitialized = false;
+let remoteWizardInitialized = false;
+let remoteWizard: RemoteWizardState = {
+  step: 1,
+  hostname: "",
+  localPort: 57324,
+  tokenStored: false,
+  tokenDraft: "",
+};
 
 function bridgeRunning() {
   return status?.bridge.status === "ready" || status?.bridge.status === "degraded";
-}
-
-function tunnelRunning() {
-  return status?.tunnel.status === "ready" || status?.tunnel.status === "reconnecting";
 }
 
 function setBusy(nextBusy: boolean) {
@@ -102,13 +114,70 @@ async function runAction(label: string, action: () => Promise<void>) {
   }
 }
 
+async function runRemoteAction(label: string, action: () => Promise<void>) {
+  setBusy(true);
+  remoteNotice = "";
+  remoteError = "";
+  try {
+    await action();
+    remoteNotice = label;
+  } catch (error) {
+    remoteError = error instanceof Error ? error.message : String(error);
+  } finally {
+    setBusy(false);
+    await refresh(false);
+  }
+}
+
 async function copyText(text: string) {
   await invoke("copy_text", { text });
+}
+
+function syncRemotePreferences(
+  preferences: RemoteAccessPreferences,
+  options: { resetForm?: boolean } = {},
+) {
+  remotePreferences = preferences;
+  const shouldReset = options.resetForm || !remoteWizardInitialized;
+  if (shouldReset) {
+    remoteWizard = {
+      step: preferences.namedProfile ? 3 : 1,
+      hostname: preferences.namedProfile?.hostname ?? "",
+      localPort: preferences.namedProfile?.localPort ?? 57324,
+      tokenStored: preferences.tokenStored,
+      tokenDraft: "",
+    };
+    remoteWizardInitialized = true;
+    return;
+  }
+  remoteWizard = {
+    ...remoteWizard,
+    tokenStored: preferences.tokenStored,
+  };
+}
+
+function syncRemoteMode(remoteAccess: RemoteAccessStatus) {
+  if (remoteModeInitialized) {
+    return;
+  }
+  remoteModeSelection = remoteAccess.mode === "quick" ? "quick" : "named";
+  remoteModeInitialized = true;
 }
 
 async function refresh(showErrors = true) {
   try {
     status = await invoke<ShellStatus>("get_app_status");
+    syncRemoteMode(status.remoteAccess);
+    try {
+      const preferences = await invoke<RemoteAccessPreferences>(
+        "get_remote_access_preferences",
+      );
+      syncRemotePreferences(preferences);
+    } catch (error) {
+      if (showErrors) {
+        remoteError = error instanceof Error ? error.message : String(error);
+      }
+    }
     if (bridgeRunning()) {
       devices = await invoke<Device[]>("list_devices");
       diagnostics = await invoke<Diagnostics>("get_control_diagnostics");
@@ -127,16 +196,50 @@ async function refresh(showErrors = true) {
 async function refreshShellStatus() {
   try {
     status = await invoke<ShellStatus>("get_app_status");
+    syncRemoteMode(status.remoteAccess);
   } catch {
+    return;
+  }
+  const activeElement = document.activeElement;
+  const editingRemoteForm =
+    activeElement instanceof HTMLInputElement &&
+    Boolean(activeElement.closest(".remote-connect-form"));
+  if (
+    remoteWizard.step === 2 &&
+    remoteModeSelection === "named" &&
+    (editingRemoteForm || remoteWizard.tokenDraft.length > 0)
+  ) {
     return;
   }
   render();
 }
 
+function stoppedRemoteAccess(): RemoteAccessStatus {
+  return {
+    mode: "none",
+    namedProfile: remotePreferences?.namedProfile ?? null,
+    named: {
+      status: "stopped",
+      pid: null,
+      localUrl: null,
+      publicUrl: null,
+      retryAttempt: 0,
+      failureKind: null,
+      detail: null,
+    },
+    quick: {
+      status: "stopped",
+      publicUrl: null,
+      localUrl: null,
+      detail: null,
+    },
+    fixedOriginReady: false,
+  };
+}
+
 function render() {
   syncPairingQr();
   const bridge = status?.bridge;
-  const tunnel = status?.tunnel;
   app.innerHTML = `
     <section class="shell">
       <header class="topbar">
@@ -173,7 +276,7 @@ function render() {
           ${renderBridge(bridge)}
         </article>
 
-        <article class="panel">
+        <article class="panel wide">
           <div class="panel-title">
             <h2>手机配对</h2>
             <button data-action="pairing-link" ${busy || !bridgeRunning() ? "disabled" : ""}>生成新链接</button>
@@ -181,17 +284,15 @@ function render() {
           ${renderPairingLink()}
         </article>
 
-        <article class="panel">
-          <div class="panel-title">
-            <h2>远程链接 Beta</h2>
-            <div class="button-row">
-              <button data-action="start-tunnel" ${busy || !bridgeRunning() || tunnelRunning() ? "disabled" : ""}>开启</button>
-              <button data-action="rotate-tunnel" ${busy || !tunnelRunning() ? "disabled" : ""}>换链接</button>
-              <button data-action="stop-tunnel" ${busy || !tunnelRunning() ? "disabled" : ""}>关闭</button>
-            </div>
-          </div>
-          ${renderTunnel(tunnel)}
-        </article>
+        ${renderRemoteAccessPanel({
+          selectedMode: remoteModeSelection,
+          wizard: remoteWizard,
+          bridgeStatus: bridge?.status ?? "stopped",
+          busy,
+          remoteAccess: status?.remoteAccess ?? stoppedRemoteAccess(),
+          notice: remoteNotice,
+          error: remoteError,
+        })}
 
         <article class="panel wide">
           <div class="panel-title">
@@ -309,21 +410,6 @@ function syncPairingQr() {
     });
 }
 
-function renderTunnel(tunnel?: TunnelSnapshot) {
-  if (!tunnel) {
-    return `<p class="muted">远程链接默认关闭。</p>`;
-  }
-  return `
-    <dl class="facts">
-      <div><dt>状态</dt><dd>${escapeHtml(tunnel.status)}</dd></div>
-      <div><dt>Public URL</dt><dd>${tunnel.publicUrl ? link(tunnel.publicUrl) : "无"}</dd></div>
-      <div><dt>Local URL</dt><dd>${tunnel.localUrl ? link(tunnel.localUrl) : "无"}</dd></div>
-    </dl>
-    <p class="muted">Quick Tunnel 是临时 Beta 能力，链接旋转后需要重新配对。</p>
-    ${tunnel.detail ? `<p class="muted">${escapeHtml(tunnel.detail)}</p>` : ""}
-  `;
-}
-
 function renderDevices() {
   if (!bridgeRunning()) {
     return `<p class="muted">Bridge 启动后才能读取设备。</p>`;
@@ -384,6 +470,7 @@ function bindActions() {
   app.querySelectorAll<HTMLButtonElement>("button[data-action]").forEach((button) => {
     button.addEventListener("click", async () => {
       const action = button.dataset.action;
+      const inRemotePanel = Boolean(button.closest(".remote-access-panel"));
       if (action === "refresh") await refresh();
       if (action === "attach-codex") {
         await runAction("ChatGPT/Codex 检测完成", async () => {
@@ -393,13 +480,97 @@ function bindActions() {
       if (action === "start-bridge") await runAction("Bridge 已启动", () => invoke("start_bridge"));
       if (action === "stop-bridge") await runAction("Bridge 已停止", () => invoke("stop_bridge"));
       if (action === "pairing-link") await runAction("已生成新配对链接", () => invoke("create_pairing_link"));
-      if (action === "start-tunnel") await runAction("远程链接已开启", () => invoke("start_quick_tunnel"));
-      if (action === "rotate-tunnel") await runAction("远程链接已更换", () => invoke("rotate_quick_tunnel"));
-      if (action === "stop-tunnel") await runAction("远程链接已关闭", () => invoke("stop_quick_tunnel"));
+      if (action === "remote-wizard-continue") {
+        remoteWizard = nextWizardState(remoteWizard, { type: "continue" });
+        render();
+      }
+      if (action === "remote-wizard-back") {
+        remoteWizard = nextWizardState(remoteWizard, { type: "back" });
+        render();
+      }
+      if (action === "save-named-profile") {
+        const nextState = nextWizardState(remoteWizard, { type: "continue" });
+        if (nextState.error) {
+          remoteWizard = nextState;
+          render();
+        } else {
+          await runRemoteAction("固定域名配置已保存", async () => {
+            const preferences = await invoke<RemoteAccessPreferences>(
+              "save_named_tunnel_profile",
+              {
+                hostname: remoteWizard.hostname,
+                localPort: remoteWizard.localPort,
+                token: remoteWizard.tokenDraft.trim() || null,
+              },
+            );
+            syncRemotePreferences(preferences, { resetForm: true });
+            remoteModeSelection = "named";
+          });
+        }
+      }
+      if (action === "edit-named-tunnel") {
+        remoteModeSelection = "named";
+        remoteWizard = {
+          ...remoteWizard,
+          step: 2,
+          error: undefined,
+        };
+        remoteNotice = "";
+        remoteError = "";
+        render();
+      }
+      if (action === "start-named-tunnel") {
+        remoteModeSelection = "named";
+        await runRemoteAction("固定域名验证完成", () => invoke("start_named_tunnel"));
+      }
+      if (action === "retry-named-tunnel") {
+        remoteModeSelection = "named";
+        await runRemoteAction("固定域名已重新验证", () => invoke("retry_named_tunnel"));
+      }
+      if (action === "recheck-named-tunnel-health") {
+        await runRemoteAction("固定域名状态已刷新", () =>
+          invoke("recheck_named_tunnel_health"),
+        );
+      }
+      if (action === "stop-named-tunnel") {
+        await runRemoteAction("固定域名已关闭", () => invoke("stop_named_tunnel"));
+      }
+      if (action === "start-temporary-tunnel") {
+        await runRemoteAction("临时通道已启动", async () => {
+          await invoke("start_temporary_tunnel");
+          remoteModeSelection = "quick";
+        });
+      }
+      if (action === "rotate-quick-tunnel") {
+        await runRemoteAction("临时链接已更换", () => invoke("rotate_quick_tunnel"));
+      }
+      if (action === "stop-quick-tunnel") {
+        await runRemoteAction("临时通道已关闭", () => invoke("stop_quick_tunnel"));
+      }
+      if (action === "copy-origin-service") {
+        await copyText(`http://localhost:${remoteWizard.localPort}`);
+        remoteNotice = "Origin Service 已复制";
+        remoteError = "";
+        render();
+      }
+      if (action === "copy-remote-url") {
+        const remoteAccess = status?.remoteAccess;
+        const url =
+          remoteModeSelection === "quick"
+            ? remoteAccess?.quick.publicUrl
+            : remoteAccess?.named.publicUrl;
+        if (url) {
+          await copyText(url);
+          remoteNotice = "远程 URL 已复制";
+          remoteError = "";
+          render();
+        }
+      }
       if (action === "load-devices") await refresh();
       if (action === "load-diagnostics") await refresh();
       if (action === "copy-diagnostics") {
-        await runAction("诊断 JSON 已复制", async () => {
+        const runner = inRemotePanel ? runRemoteAction : runAction;
+        await runner("诊断 JSON 已复制", async () => {
           const bundle = await invoke<DiagnosticsBundle>("get_diagnostics_bundle");
           await copyText(JSON.stringify(bundle, null, 2));
         });
@@ -417,23 +588,51 @@ function bindActions() {
       }
     });
   });
+
+  app.querySelectorAll<HTMLInputElement>("input[data-remote-mode]").forEach((input) => {
+    input.addEventListener("change", () => {
+      remoteModeSelection = input.value === "quick" ? "quick" : "named";
+      remoteNotice = "";
+      remoteError = "";
+      render();
+    });
+  });
+
+  app.querySelector<HTMLInputElement>('input[name="publicHostname"]')?.addEventListener(
+    "input",
+    (event) => {
+      remoteWizard = {
+        ...remoteWizard,
+        hostname: (event.currentTarget as HTMLInputElement).value,
+        error: undefined,
+      };
+    },
+  );
+  app.querySelector<HTMLInputElement>('input[name="tunnelToken"]')?.addEventListener(
+    "input",
+    (event) => {
+      remoteWizard = {
+        ...remoteWizard,
+        tokenDraft: (event.currentTarget as HTMLInputElement).value,
+        error: undefined,
+      };
+    },
+  );
+  app.querySelector<HTMLInputElement>('input[name="localPort"]')?.addEventListener(
+    "input",
+    (event) => {
+      const value = Number((event.currentTarget as HTMLInputElement).value);
+      remoteWizard = {
+        ...remoteWizard,
+        localPort: Number.isFinite(value) ? value : remoteWizard.localPort,
+        error: undefined,
+      };
+    },
+  );
 }
 
 function link(url: string) {
   return `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer">${escapeHtml(url)}</a>`;
-}
-
-function escapeHtml(value: string) {
-  return value.replace(/[&<>"']/g, (character) => {
-    const entities: Record<string, string> = {
-      "&": "&amp;",
-      "<": "&lt;",
-      ">": "&gt;",
-      '"': "&quot;",
-      "'": "&#39;",
-    };
-    return entities[character] ?? character;
-  });
 }
 
 void refresh(false);
