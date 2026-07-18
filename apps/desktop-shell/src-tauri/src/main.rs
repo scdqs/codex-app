@@ -4,48 +4,204 @@ use std::{
     net::{IpAddr, Ipv4Addr, UdpSocket},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
+#[cfg(test)]
+use desktop_core::MemorySecretStore;
 use desktop_core::{
     BridgeProcessConfig, BridgeProcessManager, BridgeProcessSnapshot, BridgeProcessStatus,
-    CodexLaunchCommand, CodexLaunchConfig, CodexLaunchManager, CodexLaunchOutcome, DiagnosticCheck,
-    DiagnosticLog, DiagnosticsBundleInput, PortPolicy, QuickTunnelConfig, QuickTunnelManager,
-    TunnelSnapshot, TunnelStatus, build_diagnostics_bundle,
+    CLOUDFLARE_TUNNEL_TOKEN_KEY, CodexLaunchCommand, CodexLaunchConfig, CodexLaunchManager,
+    CodexLaunchOutcome, DiagnosticCheck, DiagnosticLog, DiagnosticsBundleInput, KeyringSecretStore,
+    NamedTunnelConfig, NamedTunnelFailureKind, NamedTunnelManager, NamedTunnelProfile,
+    NamedTunnelSnapshot, NamedTunnelStatus, PortPolicy, QuickTunnelConfig, QuickTunnelManager,
+    RemoteAccessConfigStore, RemoteAccessPreferences, SecretStore, TunnelSnapshot, TunnelStatus,
+    build_diagnostics_bundle, redact_sensitive_text,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Manager, State};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 const DEFAULT_DEBUG_PORT: u16 = 9229;
 const DEFAULT_BRIDGE_PORT: u16 = 57324;
 const CONTROL_TOKEN_HEADER: &str = "x-bridge-control-token";
+const SECRET_STORE_SERVICE: &str = "com.codex.mobile.bridge";
+const NAMED_TUNNEL_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteAccessMode {
+    None,
+    Quick,
+    Named,
+    NamedFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteAccessAction {
+    StartNamed,
+    StartTemporary,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionResult {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RemoteAccessTransition {
+    stop_quick: bool,
+    stop_named: bool,
+    start_quick: bool,
+    start_named: bool,
+    resulting_mode: RemoteAccessMode,
+}
+
+fn transition_remote_access(
+    current: RemoteAccessMode,
+    action: RemoteAccessAction,
+    result: ActionResult,
+) -> RemoteAccessTransition {
+    let stop_quick = action == RemoteAccessAction::StartNamed && current == RemoteAccessMode::Quick;
+    let stop_named = matches!(
+        current,
+        RemoteAccessMode::Named | RemoteAccessMode::NamedFailed
+    ) && matches!(
+        action,
+        RemoteAccessAction::StartNamed
+            | RemoteAccessAction::StartTemporary
+            | RemoteAccessAction::Stop
+    );
+    let (start_quick, start_named, resulting_mode) = match (action, result) {
+        (RemoteAccessAction::StartNamed, ActionResult::Succeeded) => {
+            (false, true, RemoteAccessMode::Named)
+        }
+        (RemoteAccessAction::StartNamed, ActionResult::Failed) => {
+            (false, true, RemoteAccessMode::NamedFailed)
+        }
+        (RemoteAccessAction::StartTemporary, ActionResult::Succeeded) => {
+            (true, false, RemoteAccessMode::Quick)
+        }
+        (RemoteAccessAction::StartTemporary, ActionResult::Failed) => {
+            (true, false, RemoteAccessMode::NamedFailed)
+        }
+        (RemoteAccessAction::Stop, _) => (false, false, RemoteAccessMode::None),
+    };
+    RemoteAccessTransition {
+        stop_quick,
+        stop_named,
+        start_quick,
+        start_named,
+        resulting_mode,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NamedFailureSnapshot {
+    local_url: Option<String>,
+    public_url: Option<String>,
+    failure_kind: String,
+    detail: String,
+}
 
 struct ShellState {
     bridge: Mutex<Option<BridgeProcessManager>>,
-    tunnel: Mutex<QuickTunnelManager>,
+    quick_tunnel: Mutex<QuickTunnelManager>,
+    named_tunnel: Mutex<Option<NamedTunnelManager>>,
+    remote_preferences: Mutex<RemoteAccessConfigStore>,
+    secret_store: Arc<dyn SecretStore>,
+    active_remote_mode: Mutex<RemoteAccessMode>,
+    remote_access_operation: Mutex<()>,
+    last_named_failure: Mutex<Option<NamedFailureSnapshot>>,
     last_pairing_link: Mutex<Option<String>>,
     last_pairing_source: Mutex<Option<PairingLinkSource>>,
     exit_cleanup_started: AtomicBool,
+    supervisor_shutdown: Notify,
 }
 
-impl Default for ShellState {
-    fn default() -> Self {
+impl ShellState {
+    fn new(
+        remote_preferences: RemoteAccessConfigStore,
+        secret_store: Arc<dyn SecretStore>,
+    ) -> Self {
         Self {
             bridge: Mutex::new(None),
-            tunnel: Mutex::new(QuickTunnelManager::new(QuickTunnelConfig::default())),
+            quick_tunnel: Mutex::new(QuickTunnelManager::new(QuickTunnelConfig::default())),
+            named_tunnel: Mutex::new(None),
+            remote_preferences: Mutex::new(remote_preferences),
+            secret_store,
+            active_remote_mode: Mutex::new(RemoteAccessMode::None),
+            remote_access_operation: Mutex::new(()),
+            last_named_failure: Mutex::new(None),
             last_pairing_link: Mutex::new(None),
             last_pairing_source: Mutex::new(None),
             exit_cleanup_started: AtomicBool::new(false),
+            supervisor_shutdown: Notify::new(),
         }
+    }
+}
+
+#[cfg(test)]
+impl Default for ShellState {
+    fn default() -> Self {
+        Self::new(
+            RemoteAccessConfigStore::new(
+                env::temp_dir().join("codex-mobile-bridge-remote-access.json"),
+            ),
+            Arc::new(MemorySecretStore::default()),
+        )
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairingLinkSource {
     Local,
-    Tunnel,
+    QuickTunnel,
+    NamedTunnel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedPairingEvent {
+    StartAttempt,
+    StartFailed,
+    PairingFailed,
+    RuntimeFailed,
+    RuntimeDegraded,
+}
+
+fn should_clear_named_pairing(event: NamedPairingEvent) -> bool {
+    !matches!(event, NamedPairingEvent::RuntimeDegraded)
+}
+
+fn named_runtime_mode(current: RemoteAccessMode, status: NamedTunnelStatus) -> RemoteAccessMode {
+    match (current, status) {
+        (RemoteAccessMode::Named, NamedTunnelStatus::Failed) => RemoteAccessMode::NamedFailed,
+        (RemoteAccessMode::Named, NamedTunnelStatus::Ready | NamedTunnelStatus::Degraded) => {
+            RemoteAccessMode::Named
+        }
+        (RemoteAccessMode::NamedFailed, _) => RemoteAccessMode::NamedFailed,
+        _ => current,
+    }
+}
+
+fn should_supervisor_refresh_named(status: NamedTunnelStatus) -> bool {
+    matches!(
+        status,
+        NamedTunnelStatus::Ready | NamedTunnelStatus::Degraded
+    )
+}
+
+fn legacy_quick_start_allowed(mode: RemoteAccessMode) -> bool {
+    !matches!(
+        mode,
+        RemoteAccessMode::Named | RemoteAccessMode::NamedFailed
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -54,6 +210,7 @@ struct ShellStatusDto {
     app_version: String,
     bridge: BridgeProcessSnapshotDto,
     tunnel: TunnelSnapshotDto,
+    remote_access: RemoteAccessStatusDto,
     last_pairing_link: Option<String>,
 }
 
@@ -67,13 +224,48 @@ struct BridgeProcessSnapshotDto {
     detail: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TunnelSnapshotDto {
     status: String,
     public_url: Option<String>,
     local_url: Option<String>,
     detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteAccessStatusDto {
+    mode: String,
+    named_profile: Option<NamedTunnelProfile>,
+    named: NamedTunnelSnapshotDto,
+    quick: TunnelSnapshotDto,
+    fixed_origin_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NamedTunnelSnapshotDto {
+    status: String,
+    pid: Option<u32>,
+    local_url: Option<String>,
+    public_url: Option<String>,
+    retry_attempt: u8,
+    failure_kind: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteAccessPreferencesDto {
+    named_profile: Option<NamedTunnelProfile>,
+    token_stored: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgePortMode {
+    Flexible,
+    Fixed(u16),
 }
 
 #[derive(Debug, Serialize)]
@@ -121,25 +313,129 @@ async fn get_app_status(state: State<'_, ShellState>) -> Result<ShellStatusDto, 
             .map(BridgeProcessManager::status)
             .unwrap_or_else(stopped_bridge_snapshot)
     };
-    let tunnel = {
-        let mut tunnel = state.tunnel.lock().await;
-        tunnel.refresh_status().await
+    let named_snapshot = refresh_named_runtime(&state, false).await?;
+    let quick_snapshot = {
+        let mut quick_tunnel = state.quick_tunnel.lock().await;
+        quick_tunnel.refresh_status().await
     };
-    clear_stale_tunnel_pairing_link(&state, &tunnel).await;
+    clear_stale_quick_pairing_link(&state, &quick_snapshot).await;
+    let preferences = load_remote_access_preferences(&state).await?;
+    let mode = *state.active_remote_mode.lock().await;
+    let failure = state.last_named_failure.lock().await.clone();
+    let named = if mode == RemoteAccessMode::NamedFailed {
+        failure
+            .map(NamedTunnelSnapshotDto::failed)
+            .or_else(|| named_snapshot.map(Into::into))
+            .unwrap_or_else(NamedTunnelSnapshotDto::stopped)
+    } else {
+        named_snapshot
+            .map(Into::into)
+            .unwrap_or_else(NamedTunnelSnapshotDto::stopped)
+    };
+    let quick = TunnelSnapshotDto::from(quick_snapshot);
+    let fixed_origin_ready = mode == RemoteAccessMode::Named && named.status == "ready";
     let last_pairing_link = state.last_pairing_link.lock().await.clone();
 
     Ok(ShellStatusDto {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         bridge: BridgeProcessSnapshotDto::from(bridge),
-        tunnel: TunnelSnapshotDto::from(tunnel),
+        tunnel: quick.clone(),
+        remote_access: RemoteAccessStatusDto {
+            mode: remote_access_mode(mode).to_string(),
+            named_profile: preferences.named_tunnel,
+            named,
+            quick,
+            fixed_origin_ready,
+        },
         last_pairing_link,
     })
 }
 
 #[tauri::command]
+async fn get_remote_access_preferences(
+    state: State<'_, ShellState>,
+) -> Result<RemoteAccessPreferencesDto, String> {
+    remote_access_preferences_dto(&state).await
+}
+
+#[tauri::command]
+async fn save_named_tunnel_profile(
+    hostname: String,
+    local_port: u16,
+    token: Option<String>,
+    state: State<'_, ShellState>,
+) -> Result<RemoteAccessPreferencesDto, String> {
+    let _operation = state.remote_access_operation.lock().await;
+    let profile = NamedTunnelProfile::new(&hostname, local_port)
+        .map_err(|error| redact_sensitive_text(&error.to_string()))?;
+    if let Some(token) = token.filter(|value| !value.trim().is_empty()) {
+        state
+            .secret_store
+            .set(CLOUDFLARE_TUNNEL_TOKEN_KEY, token.trim())
+            .map_err(|error| redact_sensitive_text(&error.to_string()))?;
+    } else if state
+        .secret_store
+        .get(CLOUDFLARE_TUNNEL_TOKEN_KEY)
+        .map_err(|error| redact_sensitive_text(&error.to_string()))?
+        .is_none()
+    {
+        return Err("Tunnel Token is required for the first setup".to_string());
+    }
+
+    let current_mode = *state.active_remote_mode.lock().await;
+    if matches!(
+        current_mode,
+        RemoteAccessMode::Named | RemoteAccessMode::NamedFailed
+    ) {
+        stop_named_process(&state).await?;
+        clear_pairing_link_for_source(&state, PairingLinkSource::NamedTunnel).await;
+        *state.active_remote_mode.lock().await = RemoteAccessMode::None;
+        *state.last_named_failure.lock().await = None;
+    }
+
+    state
+        .remote_preferences
+        .lock()
+        .await
+        .save(&RemoteAccessPreferences {
+            named_tunnel: Some(profile),
+        })
+        .map_err(|error| redact_sensitive_text(&error.to_string()))?;
+    remote_access_preferences_dto(&state).await
+}
+
+#[tauri::command]
+async fn delete_named_tunnel_profile(state: State<'_, ShellState>) -> Result<(), String> {
+    let _operation = state.remote_access_operation.lock().await;
+    stop_named_process(&state).await?;
+    clear_pairing_link_for_source(&state, PairingLinkSource::NamedTunnel).await;
+    state
+        .remote_preferences
+        .lock()
+        .await
+        .delete()
+        .map_err(|error| redact_sensitive_text(&error.to_string()))?;
+    state
+        .secret_store
+        .delete(CLOUDFLARE_TUNNEL_TOKEN_KEY)
+        .map_err(|error| redact_sensitive_text(&error.to_string()))?;
+    let current_mode = *state.active_remote_mode.lock().await;
+    if matches!(
+        current_mode,
+        RemoteAccessMode::Named | RemoteAccessMode::NamedFailed
+    ) {
+        *state.active_remote_mode.lock().await = RemoteAccessMode::None;
+    }
+    *state.last_named_failure.lock().await = None;
+    Ok(())
+}
+
+#[tauri::command]
 async fn ensure_codex_ready() -> CodexLaunchOutcomeDto {
-    let mut config = CodexLaunchConfig::default();
-    config.debug_port = debug_port();
+    let config = CodexLaunchConfig {
+        debug_port: debug_port(),
+        ..CodexLaunchConfig::default()
+    };
     CodexLaunchManager::mac_default(config)
         .ensure_ready()
         .await
@@ -151,121 +447,891 @@ async fn start_bridge(
     app: AppHandle,
     state: State<'_, ShellState>,
 ) -> Result<BridgeProcessSnapshotDto, String> {
-    let mut bridge = state.bridge.lock().await;
-    if bridge.is_none() {
-        *bridge = Some(BridgeProcessManager::new(bridge_config(&app)?));
-    }
-
-    let manager = bridge.as_mut().expect("bridge manager is initialized");
-    let snapshot = manager.start().await.map_err(|error| error.to_string())?;
-    Ok(snapshot.into())
+    let _operation = state.remote_access_operation.lock().await;
+    let mode = *state.active_remote_mode.lock().await;
+    let port_mode = if matches!(
+        mode,
+        RemoteAccessMode::Named | RemoteAccessMode::NamedFailed
+    ) {
+        let preferences = load_remote_access_preferences(&state).await?;
+        let profile = preferences
+            .named_tunnel
+            .ok_or_else(|| "Named Tunnel is not configured".to_string())?;
+        BridgePortMode::Fixed(profile.local_port)
+    } else {
+        BridgePortMode::Flexible
+    };
+    ensure_bridge_for_mode(&app, &state, port_mode)
+        .await
+        .map(Into::into)
 }
 
 #[tauri::command]
 async fn stop_bridge(state: State<'_, ShellState>) -> Result<BridgeProcessSnapshotDto, String> {
+    let _operation = state.remote_access_operation.lock().await;
+    stop_remote_access_inner(&state).await?;
     let mut bridge = state.bridge.lock().await;
     let manager = bridge
         .as_mut()
         .ok_or_else(|| "bridge service is not initialized".to_string())?;
-    let snapshot = manager.stop().await.map_err(|error| error.to_string())?;
-    *state.last_pairing_link.lock().await = None;
-    *state.last_pairing_source.lock().await = None;
+    let snapshot = manager
+        .stop()
+        .await
+        .map_err(|error| redact_sensitive_text(&error.to_string()))?;
+    set_pairing_link(&state, None, None).await;
     Ok(snapshot.into())
 }
 
 #[tauri::command]
 async fn create_pairing_link(state: State<'_, ShellState>) -> Result<String, String> {
+    let _operation = state.remote_access_operation.lock().await;
+    let mode = *state.active_remote_mode.lock().await;
+    let (public_url, source) = match mode {
+        RemoteAccessMode::None => (None, PairingLinkSource::Local),
+        RemoteAccessMode::Quick => {
+            let snapshot = state.quick_tunnel.lock().await.status();
+            let public_url = snapshot
+                .session
+                .map(|session| session.public_url)
+                .ok_or_else(|| "Quick Tunnel public URL is not available".to_string())?;
+            (Some(public_url), PairingLinkSource::QuickTunnel)
+        }
+        RemoteAccessMode::Named => {
+            let snapshot = {
+                let mut named_tunnel = state.named_tunnel.lock().await;
+                named_tunnel
+                    .as_mut()
+                    .map(NamedTunnelManager::status)
+                    .ok_or_else(|| "Named Tunnel is not initialized".to_string())?
+            };
+            if !matches!(
+                snapshot.status,
+                NamedTunnelStatus::Ready | NamedTunnelStatus::Degraded
+            ) {
+                return Err("Named Tunnel is not ready for pairing".to_string());
+            }
+            let public_url = snapshot
+                .public_url
+                .ok_or_else(|| "Named Tunnel public URL is not available".to_string())?;
+            (Some(public_url), PairingLinkSource::NamedTunnel)
+        }
+        RemoteAccessMode::NamedFailed => {
+            return Err(
+                "Named Tunnel has failed; retry it or start a temporary tunnel".to_string(),
+            );
+        }
+    };
     let link = {
         let bridge = state.bridge.lock().await;
         let manager = bridge
             .as_ref()
             .ok_or_else(|| "bridge service is not initialized".to_string())?;
-        manager
-            .create_pairing_link()
-            .await
-            .map_err(|error| error.to_string())?
+        match public_url {
+            Some(public_url) => {
+                manager
+                    .create_pairing_link_for_bridge_url(&public_url)
+                    .await
+            }
+            None => manager.create_pairing_link().await,
+        }
+        .map_err(|error| redact_sensitive_text(&error.to_string()))?
     };
-    *state.last_pairing_link.lock().await = Some(link.clone());
-    *state.last_pairing_source.lock().await = Some(PairingLinkSource::Local);
+    set_pairing_link(&state, Some(link.clone()), Some(source)).await;
     Ok(link)
 }
 
 #[tauri::command]
-async fn start_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnapshotDto, String> {
-    let (snapshot, pairing_link) = {
-        let bridge = state.bridge.lock().await;
-        let manager = bridge
-            .as_ref()
-            .ok_or_else(|| "bridge service must be running before tunnel starts".to_string())?;
-        let local_url = bridge_local_url(manager)?;
-        let mut tunnel = state.tunnel.lock().await;
-        let snapshot = tunnel
-            .start(local_url)
-            .await
-            .map_err(|error| error.to_string())?;
-        let pairing_link = match snapshot.session.as_ref() {
-            Some(session) => Some(
-                manager
-                    .create_pairing_link_for_bridge_url(&session.public_url)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            ),
-            None => None,
-        };
-        (snapshot, pairing_link)
-    };
-    *state.last_pairing_link.lock().await = pairing_link;
-    *state.last_pairing_source.lock().await = Some(PairingLinkSource::Tunnel);
-    Ok(snapshot.into())
+async fn start_quick_tunnel(
+    app: AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<TunnelSnapshotDto, String> {
+    let _operation = state.remote_access_operation.lock().await;
+    let current = *state.active_remote_mode.lock().await;
+    start_quick_access(&app, &state, current).await
 }
 
 #[tauri::command]
 async fn rotate_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnapshotDto, String> {
-    let (snapshot, pairing_link) = {
-        let bridge = state.bridge.lock().await;
-        let manager = bridge
-            .as_ref()
-            .ok_or_else(|| "bridge service must be running before tunnel rotates".to_string())?;
-        let mut tunnel = state.tunnel.lock().await;
-        let snapshot = tunnel.rotate().await.map_err(|error| error.to_string())?;
-        let pairing_link = match snapshot.session.as_ref() {
-            Some(session) => Some(
-                manager
-                    .create_pairing_link_for_bridge_url(&session.public_url)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            ),
-            None => None,
-        };
-        (snapshot, pairing_link)
+    let _operation = state.remote_access_operation.lock().await;
+    if *state.active_remote_mode.lock().await != RemoteAccessMode::Quick {
+        return Err("Quick Tunnel is not the active remote access mode".to_string());
+    }
+    let snapshot = {
+        let mut quick_tunnel = state.quick_tunnel.lock().await;
+        quick_tunnel
+            .rotate()
+            .await
+            .map_err(|error| redact_sensitive_text(&error.to_string()))?
     };
-    *state.last_pairing_link.lock().await = pairing_link;
-    *state.last_pairing_source.lock().await = Some(PairingLinkSource::Tunnel);
+    let public_url = match snapshot.session.as_ref() {
+        Some(session) => session.public_url.as_str(),
+        None => {
+            let _ = state.quick_tunnel.lock().await.stop().await;
+            *state.active_remote_mode.lock().await = RemoteAccessMode::None;
+            clear_pairing_link_for_source(&state, PairingLinkSource::QuickTunnel).await;
+            return Err("Quick Tunnel public URL is not available".to_string());
+        }
+    };
+    let pairing_link = match pairing_link_for_public_url(&state, public_url).await {
+        Ok(link) => link,
+        Err(error) => {
+            let _ = state.quick_tunnel.lock().await.stop().await;
+            *state.active_remote_mode.lock().await = RemoteAccessMode::None;
+            clear_pairing_link_for_source(&state, PairingLinkSource::QuickTunnel).await;
+            return Err(error);
+        }
+    };
+    set_pairing_link(
+        &state,
+        Some(pairing_link),
+        Some(PairingLinkSource::QuickTunnel),
+    )
+    .await;
     Ok(snapshot.into())
 }
 
 #[tauri::command]
 async fn stop_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnapshotDto, String> {
-    let mut tunnel = state.tunnel.lock().await;
-    let snapshot = tunnel.stop().await.map_err(|error| error.to_string())?;
-    *state.last_pairing_link.lock().await = None;
-    *state.last_pairing_source.lock().await = None;
+    let _operation = state.remote_access_operation.lock().await;
+    let snapshot = {
+        let mut quick_tunnel = state.quick_tunnel.lock().await;
+        quick_tunnel
+            .stop()
+            .await
+            .map_err(|error| redact_sensitive_text(&error.to_string()))?
+    };
+    if *state.active_remote_mode.lock().await == RemoteAccessMode::Quick {
+        *state.active_remote_mode.lock().await = RemoteAccessMode::None;
+    }
+    clear_pairing_link_for_source(&state, PairingLinkSource::QuickTunnel).await;
     Ok(snapshot.into())
 }
 
-async fn clear_stale_tunnel_pairing_link(state: &ShellState, tunnel: &TunnelSnapshot) {
+#[tauri::command]
+async fn start_named_tunnel(
+    app: AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<NamedTunnelSnapshotDto, String> {
+    let _operation = state.remote_access_operation.lock().await;
+    start_named_tunnel_inner(&app, &state).await
+}
+
+#[tauri::command]
+async fn retry_named_tunnel(
+    app: AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<NamedTunnelSnapshotDto, String> {
+    let _operation = state.remote_access_operation.lock().await;
+    start_named_tunnel_inner(&app, &state).await
+}
+
+#[tauri::command]
+async fn recheck_named_tunnel_health(
+    state: State<'_, ShellState>,
+) -> Result<NamedTunnelSnapshotDto, String> {
+    let _operation = state.remote_access_operation.lock().await;
+    let snapshot = refresh_named_runtime(&state, true)
+        .await?
+        .ok_or_else(|| "Named Tunnel is not initialized".to_string())?;
+    if snapshot.status == NamedTunnelStatus::Stopped {
+        return Err("Named Tunnel is not running".to_string());
+    }
+    Ok(snapshot.into())
+}
+
+#[tauri::command]
+async fn stop_named_tunnel(state: State<'_, ShellState>) -> Result<NamedTunnelSnapshotDto, String> {
+    let _operation = state.remote_access_operation.lock().await;
+    let snapshot = stop_named_process(&state).await?;
+    let current = *state.active_remote_mode.lock().await;
+    if matches!(
+        current,
+        RemoteAccessMode::Named | RemoteAccessMode::NamedFailed
+    ) {
+        *state.active_remote_mode.lock().await = RemoteAccessMode::None;
+    }
+    *state.last_named_failure.lock().await = None;
+    clear_pairing_link_for_source(&state, PairingLinkSource::NamedTunnel).await;
+    Ok(snapshot.into())
+}
+
+#[tauri::command]
+async fn start_temporary_tunnel(
+    app: AppHandle,
+    state: State<'_, ShellState>,
+) -> Result<TunnelSnapshotDto, String> {
+    let _operation = state.remote_access_operation.lock().await;
+    let current = *state.active_remote_mode.lock().await;
+    let profile = load_remote_access_preferences(&state)
+        .await
+        .ok()
+        .and_then(|preferences| preferences.named_tunnel);
+    if let Err(error) = stop_named_process(&state).await {
+        let error = fail_temporary_start(&state, current, profile.as_ref(), &error).await;
+        return Err(error);
+    }
+    clear_pairing_link_for_source(&state, PairingLinkSource::NamedTunnel).await;
+    if let Err(error) = stop_quick_if_running(&state).await {
+        let error = fail_temporary_start(&state, current, profile.as_ref(), &error).await;
+        return Err(error);
+    }
+    let bridge_snapshot = match ensure_bridge_for_mode(&app, &state, BridgePortMode::Flexible).await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let error = fail_temporary_start(&state, current, profile.as_ref(), &error).await;
+            return Err(error);
+        }
+    };
+    let local_url = match bridge_snapshot.port {
+        Some(port) => format!("http://127.0.0.1:{port}"),
+        None => {
+            let error = fail_temporary_start(
+                &state,
+                current,
+                profile.as_ref(),
+                "bridge port is not available",
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let start_result = {
+        let mut quick_tunnel = state.quick_tunnel.lock().await;
+        quick_tunnel.start(local_url).await
+    };
+    let snapshot = match start_result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let error =
+                fail_temporary_start(&state, current, profile.as_ref(), &error.to_string()).await;
+            return Err(error);
+        }
+    };
+    let public_url = match snapshot.session.as_ref() {
+        Some(session) => session.public_url.as_str(),
+        None => {
+            let _ = state.quick_tunnel.lock().await.stop().await;
+            let error = fail_temporary_start(
+                &state,
+                current,
+                profile.as_ref(),
+                "Quick Tunnel public URL is not available",
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let pairing_link = match pairing_link_for_public_url(&state, public_url).await {
+        Ok(link) => link,
+        Err(error) => {
+            let _ = state.quick_tunnel.lock().await.stop().await;
+            let error = fail_temporary_start(&state, current, profile.as_ref(), &error).await;
+            return Err(error);
+        }
+    };
+    activate_quick_remote_access(&state, current, pairing_link).await;
+    Ok(snapshot.into())
+}
+
+#[tauri::command]
+async fn stop_remote_access(state: State<'_, ShellState>) -> Result<(), String> {
+    let _operation = state.remote_access_operation.lock().await;
+    stop_remote_access_inner(&state).await
+}
+
+async fn start_named_tunnel_inner(
+    app: &AppHandle,
+    state: &ShellState,
+) -> Result<NamedTunnelSnapshotDto, String> {
+    let current = *state.active_remote_mode.lock().await;
+    let preflight = transition_remote_access(
+        current,
+        RemoteAccessAction::StartNamed,
+        ActionResult::Failed,
+    );
+    handle_named_pairing_event(state, NamedPairingEvent::StartAttempt).await;
+    let quick_stop = stop_quick_if_running(state).await;
+    require_quick_stopped_for_named_start(state, current, quick_stop).await?;
+    if preflight.stop_named
+        && let Err(error) = stop_named_process(state).await
+    {
+        let error =
+            fail_named_start(state, current, None, "named_tunnel_stop_failed", &error).await;
+        return Err(error);
+    }
+
+    let preferences = match load_remote_access_preferences(state).await {
+        Ok(preferences) => preferences,
+        Err(error) => {
+            let error =
+                fail_named_start(state, current, None, "invalid_configuration", &error).await;
+            return Err(error);
+        }
+    };
+    let profile = match preferences.named_tunnel {
+        Some(profile) => profile,
+        None => {
+            let error = fail_named_start(
+                state,
+                current,
+                None,
+                "invalid_configuration",
+                "Named Tunnel is not configured",
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if let Err(error) =
+        ensure_bridge_for_mode(app, state, BridgePortMode::Fixed(profile.local_port)).await
+    {
+        let failure_kind = if error.starts_with("Local port unavailable:") {
+            "local_port_unavailable"
+        } else {
+            "local_health_unavailable"
+        };
+        let error = fail_named_start(state, current, Some(&profile), failure_kind, &error).await;
+        return Err(error);
+    }
+    let token = match state.secret_store.get(CLOUDFLARE_TUNNEL_TOKEN_KEY) {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            let error = fail_named_start(
+                state,
+                current,
+                Some(&profile),
+                "token_missing",
+                "Tunnel Token is missing from Keychain",
+            )
+            .await;
+            return Err(error);
+        }
+        Err(error) => {
+            let error = fail_named_start(
+                state,
+                current,
+                Some(&profile),
+                "secret_store_unavailable",
+                &error.to_string(),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+
+    if !preflight.stop_named
+        && let Err(error) = stop_named_process(state).await
+    {
+        let error = fail_named_start(
+            state,
+            current,
+            Some(&profile),
+            "named_tunnel_stop_failed",
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
+    if let Err(error) = ensure_named_manager(app, state, profile.clone()).await {
+        let error = fail_named_start(
+            state,
+            current,
+            Some(&profile),
+            "invalid_configuration",
+            &error,
+        )
+        .await;
+        return Err(error);
+    }
+    let start_result = {
+        let mut named_tunnel = state.named_tunnel.lock().await;
+        named_tunnel
+            .as_mut()
+            .expect("named tunnel manager exists")
+            .start(&token)
+            .await
+    };
+    let snapshot = match start_result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let detail = redact_sensitive_text(&error.to_string());
+            handle_named_pairing_event(state, NamedPairingEvent::StartFailed).await;
+            let failed_snapshot = {
+                let mut named_tunnel = state.named_tunnel.lock().await;
+                named_tunnel
+                    .as_mut()
+                    .expect("named tunnel manager exists")
+                    .status()
+            };
+            set_transition_mode(
+                state,
+                current,
+                RemoteAccessAction::StartNamed,
+                ActionResult::Failed,
+            )
+            .await;
+            record_named_failure_from_snapshot(state, &failed_snapshot, &detail).await;
+            return Err(detail);
+        }
+    };
+    let public_url = match snapshot.public_url.as_deref() {
+        Some(public_url) => public_url,
+        None => {
+            let _ = stop_named_process(state).await;
+            let error = fail_named_start(
+                state,
+                current,
+                Some(&profile),
+                "invalid_configuration",
+                "Named Tunnel public URL is not available",
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let pairing_link = match pairing_link_for_public_url(state, public_url).await {
+        Ok(link) => link,
+        Err(error) => {
+            let _ = stop_named_process(state).await;
+            handle_named_pairing_event(state, NamedPairingEvent::PairingFailed).await;
+            let error = fail_remote_action(
+                state,
+                current,
+                RemoteAccessAction::StartNamed,
+                Some(&profile),
+                "pairing_failed",
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    set_pairing_link(
+        state,
+        Some(pairing_link),
+        Some(PairingLinkSource::NamedTunnel),
+    )
+    .await;
+    set_transition_mode(
+        state,
+        current,
+        RemoteAccessAction::StartNamed,
+        ActionResult::Succeeded,
+    )
+    .await;
+    *state.last_named_failure.lock().await = None;
+    Ok(snapshot.into())
+}
+
+async fn start_quick_access(
+    app: &AppHandle,
+    state: &ShellState,
+    current: RemoteAccessMode,
+) -> Result<TunnelSnapshotDto, String> {
+    if !legacy_quick_start_allowed(current) {
+        return Err("Use start_temporary_tunnel to leave Named Tunnel mode explicitly".to_string());
+    }
+    let bridge_snapshot = ensure_bridge_for_mode(app, state, BridgePortMode::Flexible).await?;
+    let local_url = bridge_snapshot
+        .port
+        .map(|port| format!("http://127.0.0.1:{port}"))
+        .ok_or_else(|| "bridge port is not available".to_string())?;
+    let snapshot = {
+        let mut quick_tunnel = state.quick_tunnel.lock().await;
+        quick_tunnel
+            .start(local_url)
+            .await
+            .map_err(|error| redact_sensitive_text(&error.to_string()))?
+    };
+    let public_url = match snapshot.session.as_ref() {
+        Some(session) => session.public_url.as_str(),
+        None => {
+            let _ = state.quick_tunnel.lock().await.stop().await;
+            return Err("Quick Tunnel public URL is not available".to_string());
+        }
+    };
+    let pairing_link = match pairing_link_for_public_url(state, public_url).await {
+        Ok(link) => link,
+        Err(error) => {
+            let _ = state.quick_tunnel.lock().await.stop().await;
+            return Err(error);
+        }
+    };
+    activate_quick_remote_access(state, current, pairing_link).await;
+    Ok(snapshot.into())
+}
+
+async fn stop_remote_access_inner(state: &ShellState) -> Result<(), String> {
+    let current = *state.active_remote_mode.lock().await;
+    stop_named_process(state).await?;
+    stop_quick_if_running(state).await?;
+    *state.active_remote_mode.lock().await =
+        transition_remote_access(current, RemoteAccessAction::Stop, ActionResult::Succeeded)
+            .resulting_mode;
+    *state.last_named_failure.lock().await = None;
+    clear_pairing_link_for_source(state, PairingLinkSource::NamedTunnel).await;
+    clear_pairing_link_for_source(state, PairingLinkSource::QuickTunnel).await;
+    Ok(())
+}
+
+async fn ensure_bridge_for_mode(
+    app: &AppHandle,
+    state: &ShellState,
+    mode: BridgePortMode,
+) -> Result<BridgeProcessSnapshot, String> {
+    let mut bridge = state.bridge.lock().await;
+    let current = bridge.as_ref().map(BridgeProcessManager::status);
+    let needs_rebuild = match (current.as_ref(), mode) {
+        (Some(snapshot), BridgePortMode::Fixed(port)) => {
+            snapshot.port != Some(port) || snapshot.port_policy != PortPolicy::Fixed
+        }
+        (Some(snapshot), BridgePortMode::Flexible) => {
+            snapshot.port_policy != PortPolicy::Flexible
+                || !matches!(
+                    snapshot.status,
+                    BridgeProcessStatus::Ready | BridgeProcessStatus::Degraded
+                )
+        }
+        (None, _) => true,
+    };
+    if needs_rebuild {
+        if let Some(manager) = bridge.as_mut() {
+            let _ = manager.stop().await;
+        }
+        let mut config = bridge_config(app)?;
+        match mode {
+            BridgePortMode::Flexible => config.port_policy = PortPolicy::Flexible,
+            BridgePortMode::Fixed(port) => {
+                config.preferred_port = Some(port);
+                config.port_policy = PortPolicy::Fixed;
+            }
+        }
+        *bridge = Some(BridgeProcessManager::new(config));
+    }
+    let manager = bridge.as_mut().expect("bridge manager exists");
+    if !matches!(
+        manager.status().status,
+        BridgeProcessStatus::Ready | BridgeProcessStatus::Degraded
+    ) {
+        manager
+            .start()
+            .await
+            .map_err(|error| map_bridge_start_error(error.to_string(), mode))?;
+    }
+    Ok(manager.status())
+}
+
+async fn ensure_named_manager(
+    app: &AppHandle,
+    state: &ShellState,
+    profile: NamedTunnelProfile,
+) -> Result<(), String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("resolve app data dir: {error}"))?;
+    let mut named_tunnel = state.named_tunnel.lock().await;
+    let needs_rebuild = named_tunnel
+        .as_ref()
+        .is_none_or(|manager| manager.config().profile != profile);
+    if needs_rebuild {
+        if let Some(manager) = named_tunnel.as_mut() {
+            let _ = manager.stop().await;
+        }
+        let config = NamedTunnelConfig {
+            binary: QuickTunnelConfig::default().binary,
+            profile,
+            runtime_dir: app_data_dir.join("runtime/named-tunnel"),
+            ..NamedTunnelConfig::default()
+        };
+        *named_tunnel = Some(NamedTunnelManager::new(config));
+    }
+    Ok(())
+}
+
+async fn load_remote_access_preferences(
+    state: &ShellState,
+) -> Result<RemoteAccessPreferences, String> {
+    state
+        .remote_preferences
+        .lock()
+        .await
+        .load()
+        .map_err(|error| redact_sensitive_text(&error.to_string()))
+}
+
+async fn remote_access_preferences_dto(
+    state: &ShellState,
+) -> Result<RemoteAccessPreferencesDto, String> {
+    let preferences = load_remote_access_preferences(state).await?;
+    let token_stored = state
+        .secret_store
+        .get(CLOUDFLARE_TUNNEL_TOKEN_KEY)
+        .map_err(|error| redact_sensitive_text(&error.to_string()))?
+        .is_some();
+    Ok(RemoteAccessPreferencesDto {
+        named_profile: preferences.named_tunnel,
+        token_stored,
+    })
+}
+
+async fn stop_quick_if_running(state: &ShellState) -> Result<TunnelSnapshot, String> {
+    let mut quick_tunnel = state.quick_tunnel.lock().await;
+    let snapshot = quick_tunnel.status();
+    if snapshot.status == TunnelStatus::Stopped {
+        return Ok(snapshot);
+    }
+    quick_tunnel
+        .stop()
+        .await
+        .map_err(|error| redact_sensitive_text(&error.to_string()))
+}
+
+async fn stop_named_process(state: &ShellState) -> Result<NamedTunnelSnapshot, String> {
+    let mut named_tunnel = state.named_tunnel.lock().await;
+    let Some(manager) = named_tunnel.as_mut() else {
+        return Ok(stopped_named_snapshot());
+    };
+    if manager.status().status == NamedTunnelStatus::Stopped {
+        return Ok(manager.status());
+    }
+    manager
+        .stop()
+        .await
+        .map_err(|error| redact_sensitive_text(&error.to_string()))
+}
+
+async fn pairing_link_for_public_url(
+    state: &ShellState,
+    public_url: &str,
+) -> Result<String, String> {
+    let bridge = state.bridge.lock().await;
+    let manager = bridge
+        .as_ref()
+        .ok_or_else(|| "bridge service is not initialized".to_string())?;
+    manager
+        .create_pairing_link_for_bridge_url(public_url)
+        .await
+        .map_err(|error| redact_sensitive_text(&error.to_string()))
+}
+
+async fn set_pairing_link(
+    state: &ShellState,
+    link: Option<String>,
+    source: Option<PairingLinkSource>,
+) {
+    let mut pairing_link = state.last_pairing_link.lock().await;
+    let mut pairing_source = state.last_pairing_source.lock().await;
+    *pairing_link = link;
+    *pairing_source = source;
+}
+
+async fn clear_pairing_link_for_source(state: &ShellState, expected: PairingLinkSource) {
+    let mut pairing_link = state.last_pairing_link.lock().await;
+    let mut pairing_source = state.last_pairing_source.lock().await;
+    if *pairing_source == Some(expected) {
+        *pairing_link = None;
+        *pairing_source = None;
+    }
+}
+
+async fn handle_named_pairing_event(state: &ShellState, event: NamedPairingEvent) {
+    if should_clear_named_pairing(event) {
+        clear_pairing_link_for_source(state, PairingLinkSource::NamedTunnel).await;
+    }
+}
+
+async fn set_transition_mode(
+    state: &ShellState,
+    current: RemoteAccessMode,
+    action: RemoteAccessAction,
+    result: ActionResult,
+) {
+    *state.active_remote_mode.lock().await =
+        transition_remote_access(current, action, result).resulting_mode;
+}
+
+async fn fail_remote_action(
+    state: &ShellState,
+    current: RemoteAccessMode,
+    action: RemoteAccessAction,
+    profile: Option<&NamedTunnelProfile>,
+    failure_kind: &str,
+    detail: &str,
+) -> String {
+    let detail = redact_sensitive_text(detail);
+    set_transition_mode(state, current, action, ActionResult::Failed).await;
+    record_named_failure(state, profile, failure_kind, &detail).await;
+    detail
+}
+
+async fn fail_named_start(
+    state: &ShellState,
+    current: RemoteAccessMode,
+    profile: Option<&NamedTunnelProfile>,
+    failure_kind: &str,
+    detail: &str,
+) -> String {
+    handle_named_pairing_event(state, NamedPairingEvent::StartFailed).await;
+    fail_remote_action(
+        state,
+        current,
+        RemoteAccessAction::StartNamed,
+        profile,
+        failure_kind,
+        detail,
+    )
+    .await
+}
+
+async fn fail_temporary_start(
+    state: &ShellState,
+    current: RemoteAccessMode,
+    profile: Option<&NamedTunnelProfile>,
+    detail: &str,
+) -> String {
+    clear_pairing_link_for_source(state, PairingLinkSource::NamedTunnel).await;
+    clear_pairing_link_for_source(state, PairingLinkSource::QuickTunnel).await;
+    fail_remote_action(
+        state,
+        current,
+        RemoteAccessAction::StartTemporary,
+        profile,
+        "temporary_tunnel_failed",
+        detail,
+    )
+    .await
+}
+
+async fn require_quick_stopped_for_named_start(
+    state: &ShellState,
+    current: RemoteAccessMode,
+    result: Result<TunnelSnapshot, String>,
+) -> Result<(), String> {
+    clear_pairing_link_for_source(state, PairingLinkSource::QuickTunnel).await;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            Err(fail_named_start(state, current, None, "quick_tunnel_stop_failed", &error).await)
+        }
+    }
+}
+
+async fn activate_quick_remote_access(
+    state: &ShellState,
+    current: RemoteAccessMode,
+    pairing_link: String,
+) {
+    set_pairing_link(
+        state,
+        Some(pairing_link),
+        Some(PairingLinkSource::QuickTunnel),
+    )
+    .await;
+    set_transition_mode(
+        state,
+        current,
+        RemoteAccessAction::StartTemporary,
+        ActionResult::Succeeded,
+    )
+    .await;
+    *state.last_named_failure.lock().await = None;
+}
+
+async fn record_named_failure(
+    state: &ShellState,
+    profile: Option<&NamedTunnelProfile>,
+    failure_kind: &str,
+    detail: &str,
+) {
+    let (local_url, public_url) = profile
+        .map(|profile| (Some(profile.local_url()), Some(profile.public_url())))
+        .unwrap_or((None, None));
+    *state.last_named_failure.lock().await = Some(NamedFailureSnapshot {
+        local_url,
+        public_url,
+        failure_kind: failure_kind.to_string(),
+        detail: redact_sensitive_text(detail),
+    });
+}
+
+async fn record_named_failure_from_snapshot(
+    state: &ShellState,
+    snapshot: &NamedTunnelSnapshot,
+    detail: &str,
+) {
+    *state.last_named_failure.lock().await = Some(NamedFailureSnapshot {
+        local_url: snapshot.local_url.clone(),
+        public_url: snapshot.public_url.clone(),
+        failure_kind: snapshot
+            .failure_kind
+            .map(named_tunnel_failure_kind)
+            .unwrap_or_else(|| "invalid_configuration".to_string()),
+        detail: redact_sensitive_text(detail),
+    });
+}
+
+async fn apply_named_runtime_snapshot(state: &ShellState, snapshot: &NamedTunnelSnapshot) {
+    let current = *state.active_remote_mode.lock().await;
+    if !matches!(
+        current,
+        RemoteAccessMode::Named | RemoteAccessMode::NamedFailed
+    ) {
+        return;
+    }
+
+    let next = named_runtime_mode(current, snapshot.status);
+    if next != current {
+        *state.active_remote_mode.lock().await = next;
+    }
+    match snapshot.status {
+        NamedTunnelStatus::Ready if current == RemoteAccessMode::Named => {
+            *state.last_named_failure.lock().await = None;
+        }
+        NamedTunnelStatus::Degraded if current == RemoteAccessMode::Named => {
+            handle_named_pairing_event(state, NamedPairingEvent::RuntimeDegraded).await;
+            *state.last_named_failure.lock().await = None;
+        }
+        NamedTunnelStatus::Failed => {
+            handle_named_pairing_event(state, NamedPairingEvent::RuntimeFailed).await;
+            let detail = snapshot.detail.as_deref().unwrap_or("Named Tunnel failed");
+            record_named_failure_from_snapshot(state, snapshot, detail).await;
+        }
+        _ => {}
+    }
+}
+
+async fn refresh_named_runtime(
+    state: &ShellState,
+    force: bool,
+) -> Result<Option<NamedTunnelSnapshot>, String> {
+    let snapshot = {
+        let mut named_tunnel = state.named_tunnel.lock().await;
+        match named_tunnel.as_mut() {
+            Some(manager) => Some(
+                manager
+                    .refresh_runtime_health(force)
+                    .await
+                    .map_err(|error| redact_sensitive_text(&error.to_string()))?,
+            ),
+            None => None,
+        }
+    };
+    if let Some(snapshot) = snapshot.as_ref() {
+        apply_named_runtime_snapshot(state, snapshot).await;
+    }
+    Ok(snapshot)
+}
+
+async fn clear_stale_quick_pairing_link(state: &ShellState, tunnel: &TunnelSnapshot) {
     if matches!(
         tunnel.status,
         TunnelStatus::Ready | TunnelStatus::Reconnecting
     ) {
         return;
     }
-    let mut source = state.last_pairing_source.lock().await;
-    if *source != Some(PairingLinkSource::Tunnel) {
-        return;
-    }
-    *state.last_pairing_link.lock().await = None;
-    *source = None;
+    clear_pairing_link_for_source(state, PairingLinkSource::QuickTunnel).await;
 }
 
 #[tauri::command]
@@ -316,20 +1382,38 @@ async fn get_diagnostics_bundle(
             .and_then(|value| serde_json::from_value::<ControlDiagnosticsDto>(value).ok()),
         None => None,
     };
-    let tunnel_snapshot = state.tunnel.lock().await.refresh_status().await;
+    let named_snapshot = refresh_named_runtime(&state, false).await?;
+    let quick_snapshot = state.quick_tunnel.lock().await.refresh_status().await;
+    let mode = *state.active_remote_mode.lock().await;
+    let named_failure = state.last_named_failure.lock().await.clone();
     let logs = diagnostic_logs(&app).await;
     let recent_connection_states = recent_connection_states(
         &bridge_snapshot,
-        &tunnel_snapshot,
+        &quick_snapshot,
+        named_snapshot.as_ref(),
+        named_failure.as_ref(),
+        mode,
         control_diagnostics.as_ref(),
     );
+    let tunnel = match mode {
+        RemoteAccessMode::NamedFailed => named_failure
+            .as_ref()
+            .map(named_failure_check)
+            .or_else(|| named_snapshot.as_ref().map(named_tunnel_check))
+            .unwrap_or_else(|| DiagnosticCheck::failed("named tunnel failed", "unknown failure")),
+        RemoteAccessMode::Named => named_snapshot
+            .as_ref()
+            .map(named_tunnel_check)
+            .unwrap_or_else(|| DiagnosticCheck::unknown("named tunnel unavailable")),
+        RemoteAccessMode::Quick | RemoteAccessMode::None => tunnel_check(&quick_snapshot),
+    };
 
     let bundle = build_diagnostics_bundle(DiagnosticsBundleInput {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         sidecar_version: None,
         codex_adapter: codex_adapter_check(control_diagnostics.as_ref()),
         bridge: bridge_check(&bridge_snapshot),
-        tunnel: tunnel_check(&tunnel_snapshot),
+        tunnel,
         recent_connection_states,
         logs,
     });
@@ -521,13 +1605,86 @@ fn tunnel_check(snapshot: &TunnelSnapshot) -> DiagnosticCheck {
     }
 }
 
+fn named_tunnel_check(snapshot: &NamedTunnelSnapshot) -> DiagnosticCheck {
+    match snapshot.status {
+        NamedTunnelStatus::Ready => DiagnosticCheck::ok(
+            snapshot
+                .public_url
+                .as_ref()
+                .map(|url| format!("named tunnel ready {url}"))
+                .unwrap_or_else(|| "named tunnel ready".to_string()),
+        ),
+        NamedTunnelStatus::Degraded => DiagnosticCheck::degraded(
+            "named tunnel degraded",
+            redact_sensitive_text(
+                snapshot
+                    .detail
+                    .as_deref()
+                    .unwrap_or("Fixed domain is temporarily unreachable"),
+            ),
+        ),
+        NamedTunnelStatus::Failed => DiagnosticCheck::failed(
+            snapshot
+                .failure_kind
+                .map(named_tunnel_failure_kind)
+                .map(|kind| format!("named tunnel failed ({kind})"))
+                .unwrap_or_else(|| "named tunnel failed".to_string()),
+            redact_sensitive_text(snapshot.detail.as_deref().unwrap_or("Named Tunnel failed")),
+        ),
+        NamedTunnelStatus::VerifyingLocal
+        | NamedTunnelStatus::Starting
+        | NamedTunnelStatus::VerifyingPublic
+        | NamedTunnelStatus::Retrying => DiagnosticCheck::degraded(
+            "named tunnel starting",
+            named_tunnel_status(snapshot.status),
+        ),
+        NamedTunnelStatus::Stopping => {
+            DiagnosticCheck::degraded("named tunnel stopping", "stopping")
+        }
+        NamedTunnelStatus::Stopped => DiagnosticCheck::unknown("named tunnel stopped"),
+    }
+}
+
+fn named_failure_check(failure: &NamedFailureSnapshot) -> DiagnosticCheck {
+    DiagnosticCheck::failed(
+        format!("named tunnel failed ({})", failure.failure_kind),
+        redact_sensitive_text(&failure.detail),
+    )
+}
+
 fn recent_connection_states(
     bridge: &BridgeProcessSnapshot,
-    tunnel: &TunnelSnapshot,
+    quick: &TunnelSnapshot,
+    named: Option<&NamedTunnelSnapshot>,
+    named_failure: Option<&NamedFailureSnapshot>,
+    mode: RemoteAccessMode,
     diagnostics: Option<&ControlDiagnosticsDto>,
 ) -> Vec<String> {
     let mut states = vec![format!("bridge={}", bridge_status(bridge.status))];
-    states.push(format!("tunnel={}", tunnel_status(tunnel.status)));
+    states.push(format!("remote_mode={}", remote_access_mode(mode)));
+    states.push(format!("quick_tunnel={}", tunnel_status(quick.status)));
+    if mode == RemoteAccessMode::NamedFailed
+        && let Some(failure) = named_failure
+    {
+        states.push(format!(
+            "named_tunnel=failed failure_kind={} detail={}",
+            failure.failure_kind, failure.detail
+        ));
+    } else if let Some(named) = named {
+        states.push(format!(
+            "named_tunnel={} failure_kind={}",
+            named_tunnel_status(named.status),
+            named
+                .failure_kind
+                .map(named_tunnel_failure_kind)
+                .unwrap_or_else(|| "none".to_string())
+        ));
+    } else if let Some(failure) = named_failure {
+        states.push(format!(
+            "named_tunnel=failed failure_kind={} detail={}",
+            failure.failure_kind, failure.detail
+        ));
+    }
     if let Some(diagnostics) = diagnostics {
         states.push(format!(
             "codex={} status={}",
@@ -555,14 +1712,6 @@ fn bridge_config(app: &AppHandle) -> Result<BridgeProcessConfig, String> {
     config.advertised_host = advertised_host();
     config.debug_port = debug_port();
     Ok(config)
-}
-
-fn bridge_local_url(manager: &BridgeProcessManager) -> Result<String, String> {
-    let snapshot = manager.status();
-    let port = snapshot
-        .port
-        .ok_or_else(|| "bridge port is not available".to_string())?;
-    Ok(format!("http://127.0.0.1:{port}"))
 }
 
 fn sidecar_binary(resource_dir: Option<&Path>, workspace_root: Option<&Path>) -> PathBuf {
@@ -701,6 +1850,18 @@ fn stopped_bridge_snapshot() -> BridgeProcessSnapshot {
     }
 }
 
+fn stopped_named_snapshot() -> NamedTunnelSnapshot {
+    NamedTunnelSnapshot {
+        status: NamedTunnelStatus::Stopped,
+        pid: None,
+        local_url: None,
+        public_url: None,
+        retry_attempt: 0,
+        failure_kind: None,
+        detail: None,
+    }
+}
+
 impl From<BridgeProcessSnapshot> for BridgeProcessSnapshotDto {
     fn from(snapshot: BridgeProcessSnapshot) -> Self {
         Self {
@@ -708,7 +1869,7 @@ impl From<BridgeProcessSnapshot> for BridgeProcessSnapshotDto {
             pid: snapshot.pid,
             port: snapshot.port,
             health_url: snapshot.health_url,
-            detail: snapshot.detail,
+            detail: snapshot.detail.map(|detail| redact_sensitive_text(&detail)),
         }
     }
 }
@@ -730,7 +1891,54 @@ impl From<TunnelSnapshot> for TunnelSnapshotDto {
             status: tunnel_status(snapshot.status).to_string(),
             public_url,
             local_url,
-            detail: snapshot.detail,
+            detail: snapshot.detail.map(|detail| redact_sensitive_text(&detail)),
+        }
+    }
+}
+
+impl From<NamedTunnelSnapshot> for NamedTunnelSnapshotDto {
+    fn from(snapshot: NamedTunnelSnapshot) -> Self {
+        let detail = match snapshot.status {
+            NamedTunnelStatus::Degraded => {
+                let suffix = snapshot
+                    .detail
+                    .as_deref()
+                    .map(redact_sensitive_text)
+                    .filter(|detail| !detail.is_empty())
+                    .map(|detail| format!(": {detail}"))
+                    .unwrap_or_default();
+                Some(format!(
+                    "Fixed domain is temporarily unreachable; waiting for cloudflared to recover{suffix}"
+                ))
+            }
+            _ => snapshot.detail.map(|detail| redact_sensitive_text(&detail)),
+        };
+        Self {
+            status: named_tunnel_status(snapshot.status).to_string(),
+            pid: snapshot.pid,
+            local_url: snapshot.local_url,
+            public_url: snapshot.public_url,
+            retry_attempt: snapshot.retry_attempt,
+            failure_kind: snapshot.failure_kind.map(named_tunnel_failure_kind),
+            detail,
+        }
+    }
+}
+
+impl NamedTunnelSnapshotDto {
+    fn stopped() -> Self {
+        stopped_named_snapshot().into()
+    }
+
+    fn failed(failure: NamedFailureSnapshot) -> Self {
+        Self {
+            status: "failed".to_string(),
+            pid: None,
+            local_url: failure.local_url,
+            public_url: failure.public_url,
+            retry_attempt: 0,
+            failure_kind: Some(failure.failure_kind),
+            detail: Some(redact_sensitive_text(&failure.detail)),
         }
     }
 }
@@ -779,14 +1987,105 @@ fn tunnel_status(status: TunnelStatus) -> &'static str {
     }
 }
 
+fn named_tunnel_status(status: NamedTunnelStatus) -> &'static str {
+    match status {
+        NamedTunnelStatus::Stopped => "stopped",
+        NamedTunnelStatus::VerifyingLocal => "verifying_local",
+        NamedTunnelStatus::Starting => "starting",
+        NamedTunnelStatus::VerifyingPublic => "verifying_public",
+        NamedTunnelStatus::Retrying => "retrying",
+        NamedTunnelStatus::Ready => "ready",
+        NamedTunnelStatus::Degraded => "degraded",
+        NamedTunnelStatus::Failed => "failed",
+        NamedTunnelStatus::Stopping => "stopping",
+    }
+}
+
+fn named_tunnel_failure_kind(kind: NamedTunnelFailureKind) -> String {
+    match kind {
+        NamedTunnelFailureKind::InvalidConfiguration => "invalid_configuration",
+        NamedTunnelFailureKind::TokenMissing => "token_missing",
+        NamedTunnelFailureKind::TokenRejected => "token_rejected",
+        NamedTunnelFailureKind::LocalHealthUnavailable => "local_health_unavailable",
+        NamedTunnelFailureKind::DnsNotReady => "dns_not_ready",
+        NamedTunnelFailureKind::PublicRouteRejected => "public_route_rejected",
+        NamedTunnelFailureKind::WrongBridgeInstance => "wrong_bridge_instance",
+        NamedTunnelFailureKind::NetworkUnavailable => "network_unavailable",
+        NamedTunnelFailureKind::ChildExited => "child_exited",
+    }
+    .to_string()
+}
+
+fn remote_access_mode(mode: RemoteAccessMode) -> &'static str {
+    match mode {
+        RemoteAccessMode::None => "none",
+        RemoteAccessMode::Quick => "quick",
+        RemoteAccessMode::Named => "named",
+        RemoteAccessMode::NamedFailed => "named_failed",
+    }
+}
+
+fn map_bridge_start_error(error: String, mode: BridgePortMode) -> String {
+    match mode {
+        BridgePortMode::Fixed(port)
+            if error == format!("preferred bridge port {port} is unavailable") =>
+        {
+            format!("Local port unavailable: {port}")
+        }
+        _ => redact_sensitive_text(&error),
+    }
+}
+
 fn begin_exit_cleanup(state: &ShellState) -> bool {
-    !state.exit_cleanup_started.swap(true, Ordering::SeqCst)
+    let should_start = !state.exit_cleanup_started.swap(true, Ordering::SeqCst);
+    if should_start {
+        state.supervisor_shutdown.notify_one();
+    }
+    should_start
+}
+
+fn start_named_tunnel_supervisor(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            {
+                let state = app.state::<ShellState>();
+                if state.exit_cleanup_started.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(NAMED_TUNNEL_SUPERVISOR_INTERVAL) => {}
+                    _ = state.supervisor_shutdown.notified() => break,
+                }
+            }
+            let state = app.state::<ShellState>();
+            if state.exit_cleanup_started.load(Ordering::SeqCst) {
+                break;
+            }
+            let snapshot = {
+                let mut named_tunnel = state.named_tunnel.lock().await;
+                named_tunnel.as_mut().map(NamedTunnelManager::status)
+            };
+            if let Some(snapshot) = snapshot {
+                if should_supervisor_refresh_named(snapshot.status) {
+                    let _ = refresh_named_runtime(&state, false).await;
+                } else if snapshot.status == NamedTunnelStatus::Failed {
+                    apply_named_runtime_snapshot(&state, &snapshot).await;
+                }
+            }
+        }
+    });
 }
 
 async fn shutdown_managed_processes(state: &ShellState) {
     {
-        let mut tunnel = state.tunnel.lock().await;
-        let _ = tunnel.stop().await;
+        let mut named_tunnel = state.named_tunnel.lock().await;
+        if let Some(manager) = named_tunnel.as_mut() {
+            let _ = manager.stop().await;
+        }
+    }
+    {
+        let mut quick_tunnel = state.quick_tunnel.lock().await;
+        let _ = quick_tunnel.stop().await;
     }
     {
         let mut bridge = state.bridge.lock().await;
@@ -797,8 +2096,15 @@ async fn shutdown_managed_processes(state: &ShellState) {
 }
 
 fn terminate_managed_processes_now(state: &ShellState) {
-    if let Ok(mut tunnel) = state.tunnel.try_lock() {
-        tunnel.terminate_now();
+    state.exit_cleanup_started.store(true, Ordering::SeqCst);
+    state.supervisor_shutdown.notify_one();
+    if let Ok(mut named_tunnel) = state.named_tunnel.try_lock()
+        && let Some(manager) = named_tunnel.as_mut()
+    {
+        manager.terminate_now();
+    }
+    if let Ok(mut quick_tunnel) = state.quick_tunnel.try_lock() {
+        quick_tunnel.terminate_now();
     }
     if let Ok(mut bridge) = state.bridge.try_lock()
         && let Some(manager) = bridge.as_mut()
@@ -809,9 +2115,20 @@ fn terminate_managed_processes_now(state: &ShellState) {
 
 fn main() {
     let app = tauri::Builder::default()
-        .manage(ShellState::default())
+        .setup(|app| {
+            let app_data_dir = app.path().app_data_dir()?;
+            app.manage(ShellState::new(
+                RemoteAccessConfigStore::new(app_data_dir.join("remote-access.json")),
+                Arc::new(KeyringSecretStore::new(SECRET_STORE_SERVICE)),
+            ));
+            start_named_tunnel_supervisor(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_app_status,
+            get_remote_access_preferences,
+            save_named_tunnel_profile,
+            delete_named_tunnel_profile,
             ensure_codex_ready,
             start_bridge,
             stop_bridge,
@@ -819,6 +2136,12 @@ fn main() {
             start_quick_tunnel,
             rotate_quick_tunnel,
             stop_quick_tunnel,
+            start_named_tunnel,
+            retry_named_tunnel,
+            recheck_named_tunnel_health,
+            stop_named_tunnel,
+            start_temporary_tunnel,
+            stop_remote_access,
             get_control_diagnostics,
             get_diagnostics_bundle,
             copy_text,
@@ -858,7 +2181,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{fs, sync::Arc};
     use tempfile::tempdir;
 
     #[test]
@@ -984,6 +2307,84 @@ mod tests {
     }
 
     #[test]
+    fn bridge_dto_redacts_sensitive_detail() {
+        let dto = BridgeProcessSnapshotDto::from(BridgeProcessSnapshot {
+            status: BridgeProcessStatus::Failed,
+            pid: None,
+            port: Some(57324),
+            port_policy: PortPolicy::Fixed,
+            health_url: None,
+            detail: Some("Authorization: Bearer secret-token".to_string()),
+        });
+
+        assert_eq!(dto.detail.as_deref(), Some("Authorization: [REDACTED]"));
+    }
+
+    #[test]
+    fn remote_access_named_dto_keeps_fixed_urls_while_degraded() {
+        let dto = NamedTunnelSnapshotDto::from(desktop_core::NamedTunnelSnapshot {
+            status: desktop_core::NamedTunnelStatus::Degraded,
+            pid: Some(42),
+            local_url: Some("http://127.0.0.1:57324".to_string()),
+            public_url: Some("https://codex.example.com".to_string()),
+            retry_attempt: 0,
+            failure_kind: None,
+            detail: Some("public network is unavailable".to_string()),
+        });
+
+        assert_eq!(dto.status, "degraded");
+        assert_eq!(dto.local_url.as_deref(), Some("http://127.0.0.1:57324"));
+        assert_eq!(dto.public_url.as_deref(), Some("https://codex.example.com"));
+        assert!(
+            dto.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("waiting for cloudflared to recover"))
+        );
+    }
+
+    #[test]
+    fn remote_access_preferences_dto_only_exposes_token_presence() {
+        let dto = RemoteAccessPreferencesDto {
+            named_profile: Some(
+                desktop_core::NamedTunnelProfile::new("codex.example.com", 57324).unwrap(),
+            ),
+            token_stored: true,
+        };
+        let json = serde_json::to_value(dto).unwrap();
+
+        assert_eq!(json["tokenStored"], true);
+        assert!(json.get("token").is_none());
+        assert!(!json.to_string().contains("secret-token"));
+    }
+
+    #[test]
+    fn remote_access_fixed_port_error_is_explicit_and_keeps_port() {
+        assert_eq!(
+            map_bridge_start_error(
+                "preferred bridge port 57324 is unavailable".to_string(),
+                BridgePortMode::Fixed(57324),
+            ),
+            "Local port unavailable: 57324"
+        );
+    }
+
+    #[test]
+    fn remote_access_named_failure_diagnostic_keeps_port_and_redacts_token() {
+        let check = named_failure_check(&NamedFailureSnapshot {
+            local_url: Some("http://127.0.0.1:57324".to_string()),
+            public_url: Some("https://codex.example.com".to_string()),
+            failure_kind: "local_port_unavailable".to_string(),
+            detail: "Local port unavailable: 57324\nAuthorization: Bearer secret-token".to_string(),
+        });
+
+        assert_eq!(check.label, "named tunnel failed (local_port_unavailable)");
+        assert_eq!(
+            check.detail.as_deref(),
+            Some("Local port unavailable: 57324\nAuthorization: [REDACTED]")
+        );
+    }
+
+    #[test]
     fn tail_text_truncates_from_end_on_large_logs() {
         let text = "0123456789abcdef";
 
@@ -997,5 +2398,278 @@ mod tests {
 
         assert!(begin_exit_cleanup(&state));
         assert!(!begin_exit_cleanup(&state));
+    }
+
+    #[test]
+    fn remote_access_starting_named_stops_quick_without_automatic_fallback() {
+        assert_eq!(
+            transition_remote_access(
+                RemoteAccessMode::Quick,
+                RemoteAccessAction::StartNamed,
+                ActionResult::Failed,
+            ),
+            RemoteAccessTransition {
+                stop_quick: true,
+                stop_named: false,
+                start_quick: false,
+                start_named: true,
+                resulting_mode: RemoteAccessMode::NamedFailed,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_access_manual_temporary_is_the_only_named_failure_path_to_quick() {
+        let transition = transition_remote_access(
+            RemoteAccessMode::NamedFailed,
+            RemoteAccessAction::StartTemporary,
+            ActionResult::Succeeded,
+        );
+
+        assert!(transition.stop_named);
+        assert!(transition.start_quick);
+        assert!(!transition.start_named);
+        assert_eq!(transition.resulting_mode, RemoteAccessMode::Quick);
+
+        for (action, result) in [
+            (RemoteAccessAction::StartNamed, ActionResult::Succeeded),
+            (RemoteAccessAction::StartNamed, ActionResult::Failed),
+            (RemoteAccessAction::Stop, ActionResult::Succeeded),
+            (RemoteAccessAction::Stop, ActionResult::Failed),
+        ] {
+            assert_ne!(
+                transition_remote_access(RemoteAccessMode::NamedFailed, action, result)
+                    .resulting_mode,
+                RemoteAccessMode::Quick
+            );
+        }
+    }
+
+    #[test]
+    fn remote_access_failed_manual_temporary_attempt_remains_named_failed() {
+        assert_eq!(
+            transition_remote_access(
+                RemoteAccessMode::NamedFailed,
+                RemoteAccessAction::StartTemporary,
+                ActionResult::Failed,
+            ),
+            RemoteAccessTransition {
+                stop_quick: false,
+                stop_named: true,
+                start_quick: true,
+                start_named: false,
+                resulting_mode: RemoteAccessMode::NamedFailed,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_access_stop_clears_every_mode_without_starting_a_tunnel() {
+        for current in [
+            RemoteAccessMode::None,
+            RemoteAccessMode::Quick,
+            RemoteAccessMode::Named,
+            RemoteAccessMode::NamedFailed,
+        ] {
+            let transition = transition_remote_access(
+                current,
+                RemoteAccessAction::Stop,
+                ActionResult::Succeeded,
+            );
+
+            assert!(!transition.start_quick);
+            assert!(!transition.start_named);
+            assert_eq!(transition.resulting_mode, RemoteAccessMode::None);
+        }
+    }
+
+    #[test]
+    fn remote_access_retry_from_named_restarts_named_without_quick() {
+        assert_eq!(
+            transition_remote_access(
+                RemoteAccessMode::Named,
+                RemoteAccessAction::StartNamed,
+                ActionResult::Succeeded,
+            ),
+            RemoteAccessTransition {
+                stop_quick: false,
+                stop_named: true,
+                start_quick: false,
+                start_named: true,
+                resulting_mode: RemoteAccessMode::Named,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_access_retry_from_named_failure_stays_failed_without_quick() {
+        assert_eq!(
+            transition_remote_access(
+                RemoteAccessMode::NamedFailed,
+                RemoteAccessAction::StartNamed,
+                ActionResult::Failed,
+            ),
+            RemoteAccessTransition {
+                stop_quick: false,
+                stop_named: true,
+                start_quick: false,
+                start_named: true,
+                resulting_mode: RemoteAccessMode::NamedFailed,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_access_named_pairing_policy_clears_failures_but_preserves_degraded() {
+        for event in [
+            NamedPairingEvent::StartAttempt,
+            NamedPairingEvent::StartFailed,
+            NamedPairingEvent::PairingFailed,
+            NamedPairingEvent::RuntimeFailed,
+        ] {
+            assert!(should_clear_named_pairing(event));
+        }
+        assert!(!should_clear_named_pairing(
+            NamedPairingEvent::RuntimeDegraded
+        ));
+    }
+
+    #[test]
+    fn remote_access_named_failed_latches_against_stale_ready_manager() {
+        assert_eq!(
+            named_runtime_mode(RemoteAccessMode::NamedFailed, NamedTunnelStatus::Ready),
+            RemoteAccessMode::NamedFailed
+        );
+        assert_eq!(
+            named_runtime_mode(RemoteAccessMode::NamedFailed, NamedTunnelStatus::Degraded,),
+            RemoteAccessMode::NamedFailed
+        );
+        assert_eq!(
+            named_runtime_mode(RemoteAccessMode::Named, NamedTunnelStatus::Failed),
+            RemoteAccessMode::NamedFailed
+        );
+    }
+
+    #[test]
+    fn remote_access_supervisor_refreshes_only_ready_or_degraded_named_manager() {
+        for status in [NamedTunnelStatus::Ready, NamedTunnelStatus::Degraded] {
+            assert!(should_supervisor_refresh_named(status));
+        }
+        for status in [
+            NamedTunnelStatus::Stopped,
+            NamedTunnelStatus::VerifyingLocal,
+            NamedTunnelStatus::Starting,
+            NamedTunnelStatus::VerifyingPublic,
+            NamedTunnelStatus::Retrying,
+            NamedTunnelStatus::Failed,
+            NamedTunnelStatus::Stopping,
+        ] {
+            assert!(!should_supervisor_refresh_named(status));
+        }
+    }
+
+    #[test]
+    fn remote_access_legacy_quick_start_cannot_leave_named_modes() {
+        assert!(!legacy_quick_start_allowed(RemoteAccessMode::Named));
+        assert!(!legacy_quick_start_allowed(RemoteAccessMode::NamedFailed));
+        assert!(legacy_quick_start_allowed(RemoteAccessMode::None));
+        assert!(legacy_quick_start_allowed(RemoteAccessMode::Quick));
+    }
+
+    #[tokio::test]
+    async fn remote_access_named_start_quick_stop_failure_latches_and_redacts() {
+        let state = ShellState::default();
+        *state.active_remote_mode.lock().await = RemoteAccessMode::Quick;
+        set_pairing_link(
+            &state,
+            Some("https://temporary.example/pair".to_string()),
+            Some(PairingLinkSource::QuickTunnel),
+        )
+        .await;
+
+        let result = require_quick_stopped_for_named_start(
+            &state,
+            RemoteAccessMode::Quick,
+            Err("Authorization: Bearer secret-token".to_string()),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), "Authorization: [REDACTED]");
+        assert_eq!(
+            *state.active_remote_mode.lock().await,
+            RemoteAccessMode::NamedFailed
+        );
+        let failure = state.last_named_failure.lock().await.clone().unwrap();
+        assert_eq!(failure.failure_kind, "quick_tunnel_stop_failed");
+        assert!(!failure.detail.contains("secret-token"));
+        assert_eq!(*state.last_pairing_link.lock().await, None);
+        assert_eq!(*state.last_pairing_source.lock().await, None);
+    }
+
+    #[tokio::test]
+    async fn remote_access_temporary_success_sets_quick_mode_and_pairing_source() {
+        let state = ShellState::default();
+        *state.active_remote_mode.lock().await = RemoteAccessMode::NamedFailed;
+
+        activate_quick_remote_access(
+            &state,
+            RemoteAccessMode::NamedFailed,
+            "codex://pair?token=opaque".to_string(),
+        )
+        .await;
+
+        assert_eq!(
+            *state.active_remote_mode.lock().await,
+            RemoteAccessMode::Quick
+        );
+        assert_eq!(
+            *state.last_pairing_source.lock().await,
+            Some(PairingLinkSource::QuickTunnel)
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_access_temporary_failure_preserves_profile_and_secret() {
+        let directory = tempdir().unwrap();
+        let profile = NamedTunnelProfile::new("codex.example.com", 57324).unwrap();
+        let preferences = RemoteAccessConfigStore::new(directory.path().join("remote-access.json"));
+        preferences
+            .save(&RemoteAccessPreferences {
+                named_tunnel: Some(profile.clone()),
+            })
+            .unwrap();
+        let secrets = Arc::new(MemorySecretStore::default());
+        secrets
+            .set(CLOUDFLARE_TUNNEL_TOKEN_KEY, "stored-secret")
+            .unwrap();
+        let state = ShellState::new(preferences, secrets.clone());
+        set_pairing_link(
+            &state,
+            Some("https://codex.example.com/pair".to_string()),
+            Some(PairingLinkSource::NamedTunnel),
+        )
+        .await;
+
+        fail_temporary_start(
+            &state,
+            RemoteAccessMode::NamedFailed,
+            Some(&profile),
+            "temporary provider failed",
+        )
+        .await;
+
+        assert_eq!(
+            load_remote_access_preferences(&state)
+                .await
+                .unwrap()
+                .named_tunnel,
+            Some(profile)
+        );
+        assert_eq!(
+            secrets.get(CLOUDFLARE_TUNNEL_TOKEN_KEY).unwrap().as_deref(),
+            Some("stored-secret")
+        );
+        assert_eq!(*state.last_pairing_link.lock().await, None);
+        assert_eq!(*state.last_pairing_source.lock().await, None);
     }
 }
