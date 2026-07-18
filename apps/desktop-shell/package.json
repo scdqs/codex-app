@@ -1,6 +1,6 @@
 {
   "name": "@codex/desktop-shell",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,7 +10,7 @@
     "test:run": "vitest run",
     "prepare:bundle": "../../scripts/prepare-desktop-bundle.sh",
     "tauri:dev": "tauri dev",
-    "tauri:build": "npm run prepare:bundle && tauri build"
+    "tauri:build": "npm run prepare:bundle && bash ../../scripts/tauri-build.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

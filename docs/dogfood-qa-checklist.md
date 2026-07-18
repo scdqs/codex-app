@@ -107,6 +107,20 @@ scripts/dogfood-smoke.sh --skip-bundle
 
 通过标准：公网能力是用户显式开启的临时 Beta，不被包装成稳定远程服务。
 
+## 固定域名远程访问
+
+- [ ] 配置 Named Tunnel 后重启 Mac App，hostname/port 保留，Token 输入框为空且显示 Keychain 已保存。
+- [ ] 固定端口被占用时显示 Local port unavailable，不切换随机端口。
+- [ ] Token 错误、DNS 错误不持续重试。
+- [ ] 临时网络错误最多重试 3 次后停止。
+- [ ] Ready 后短暂断网显示 Degraded；网络恢复后同一 cloudflared PID 自动回到 Ready。
+- [ ] Ready 后 cloudflared 子进程退出会进入 Failed，不自动 respawn 或切换 Quick。
+- [ ] 固定域名失败后不会自动启动 Quick Tunnel。
+- [ ] 点击“启动临时通道”后固定配置仍保留，页面明确显示锁屏通知暂停。
+- [ ] 固定域名重新配对后，Devices 可识别旧 Origin 并允许撤销。
+
+通过标准：固定地址只在完整健康检查通过后显示 Ready；失败后停止自动动作，由用户选择重试、修正配置或手动启用临时通道。
+
 ## 设备撤销
 
 - [ ] 桌面端能列出已配对设备。

@@ -262,6 +262,22 @@ struct RemoteAccessPreferencesDto {
     token_stored: bool,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteAccessDiagnosticsDto {
+    mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    named_failure_kind: Option<String>,
+    retry_count: u8,
+    public_health_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cloudflared_exit_category: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BridgePortMode {
     Flexible,
@@ -1386,13 +1402,21 @@ async fn get_diagnostics_bundle(
     let quick_snapshot = state.quick_tunnel.lock().await.refresh_status().await;
     let mode = *state.active_remote_mode.lock().await;
     let named_failure = state.last_named_failure.lock().await.clone();
+    let named_profile = load_remote_access_preferences(&state)
+        .await
+        .ok()
+        .and_then(|preferences| preferences.named_tunnel);
     let logs = diagnostic_logs(&app).await;
+    let remote_access = remote_access_diagnostics(
+        mode,
+        named_profile.as_ref(),
+        named_snapshot.as_ref(),
+        named_failure.as_ref(),
+    );
     let recent_connection_states = recent_connection_states(
         &bridge_snapshot,
         &quick_snapshot,
-        named_snapshot.as_ref(),
-        named_failure.as_ref(),
-        mode,
+        &remote_access,
         control_diagnostics.as_ref(),
     );
     let tunnel = match mode {
@@ -1616,11 +1640,13 @@ fn named_tunnel_check(snapshot: &NamedTunnelSnapshot) -> DiagnosticCheck {
         ),
         NamedTunnelStatus::Degraded => DiagnosticCheck::degraded(
             "named tunnel degraded",
-            redact_sensitive_text(
+            format!(
+                "status=degraded retry_count={} failure_kind={}",
+                snapshot.retry_attempt,
                 snapshot
-                    .detail
-                    .as_deref()
-                    .unwrap_or("Fixed domain is temporarily unreachable"),
+                    .failure_kind
+                    .map(named_tunnel_failure_kind)
+                    .unwrap_or_else(|| "none".to_string())
             ),
         ),
         NamedTunnelStatus::Failed => DiagnosticCheck::failed(
@@ -1629,7 +1655,17 @@ fn named_tunnel_check(snapshot: &NamedTunnelSnapshot) -> DiagnosticCheck {
                 .map(named_tunnel_failure_kind)
                 .map(|kind| format!("named tunnel failed ({kind})"))
                 .unwrap_or_else(|| "named tunnel failed".to_string()),
-            redact_sensitive_text(snapshot.detail.as_deref().unwrap_or("Named Tunnel failed")),
+            format!(
+                "status=failed retry_count={} cloudflared_exit_category={}",
+                snapshot.retry_attempt,
+                cloudflared_exit_category(
+                    snapshot
+                        .failure_kind
+                        .map(named_tunnel_failure_kind)
+                        .as_deref()
+                )
+                .unwrap_or("none")
+            ),
         ),
         NamedTunnelStatus::VerifyingLocal
         | NamedTunnelStatus::Starting
@@ -1648,43 +1684,81 @@ fn named_tunnel_check(snapshot: &NamedTunnelSnapshot) -> DiagnosticCheck {
 fn named_failure_check(failure: &NamedFailureSnapshot) -> DiagnosticCheck {
     DiagnosticCheck::failed(
         format!("named tunnel failed ({})", failure.failure_kind),
-        redact_sensitive_text(&failure.detail),
+        format!(
+            "failure_kind={} cloudflared_exit_category={}",
+            failure.failure_kind,
+            cloudflared_exit_category(Some(&failure.failure_kind)).unwrap_or("none")
+        ),
     )
+}
+
+fn remote_access_diagnostics(
+    mode: RemoteAccessMode,
+    profile: Option<&NamedTunnelProfile>,
+    named: Option<&NamedTunnelSnapshot>,
+    named_failure: Option<&NamedFailureSnapshot>,
+) -> RemoteAccessDiagnosticsDto {
+    let snapshot_failure_kind = named
+        .and_then(|snapshot| snapshot.failure_kind)
+        .map(named_tunnel_failure_kind);
+    let named_failure_kind = if mode == RemoteAccessMode::NamedFailed {
+        named_failure
+            .map(|failure| failure.failure_kind.clone())
+            .or(snapshot_failure_kind)
+    } else {
+        snapshot_failure_kind.or_else(|| named_failure.map(|failure| failure.failure_kind.clone()))
+    };
+    let public_health_status = if mode == RemoteAccessMode::NamedFailed {
+        "failed"
+    } else {
+        match named.map(|snapshot| snapshot.status) {
+            Some(NamedTunnelStatus::Ready) => "ready",
+            Some(NamedTunnelStatus::Degraded) => "degraded",
+            Some(NamedTunnelStatus::Failed) => "failed",
+            Some(NamedTunnelStatus::VerifyingPublic | NamedTunnelStatus::Retrying) => "checking",
+            Some(
+                NamedTunnelStatus::VerifyingLocal
+                | NamedTunnelStatus::Starting
+                | NamedTunnelStatus::Stopping
+                | NamedTunnelStatus::Stopped,
+            )
+            | None => "not_checked",
+        }
+    };
+
+    RemoteAccessDiagnosticsDto {
+        mode: remote_access_mode(mode).to_string(),
+        hostname: profile.map(|profile| profile.hostname.clone()),
+        local_port: profile.map(|profile| profile.local_port),
+        cloudflared_exit_category: cloudflared_exit_category(named_failure_kind.as_deref())
+            .map(str::to_string),
+        named_failure_kind,
+        retry_count: named.map(|snapshot| snapshot.retry_attempt).unwrap_or(0),
+        public_health_status: public_health_status.to_string(),
+    }
+}
+
+fn cloudflared_exit_category(failure_kind: Option<&str>) -> Option<&'static str> {
+    match failure_kind {
+        Some("child_exited") => Some("unexpected_exit"),
+        Some("token_rejected") => Some("credential_rejected"),
+        _ => None,
+    }
 }
 
 fn recent_connection_states(
     bridge: &BridgeProcessSnapshot,
     quick: &TunnelSnapshot,
-    named: Option<&NamedTunnelSnapshot>,
-    named_failure: Option<&NamedFailureSnapshot>,
-    mode: RemoteAccessMode,
+    remote_access: &RemoteAccessDiagnosticsDto,
     diagnostics: Option<&ControlDiagnosticsDto>,
 ) -> Vec<String> {
     let mut states = vec![format!("bridge={}", bridge_status(bridge.status))];
-    states.push(format!("remote_mode={}", remote_access_mode(mode)));
     states.push(format!("quick_tunnel={}", tunnel_status(quick.status)));
-    if mode == RemoteAccessMode::NamedFailed
-        && let Some(failure) = named_failure
-    {
-        states.push(format!(
-            "named_tunnel=failed failure_kind={} detail={}",
-            failure.failure_kind, failure.detail
-        ));
-    } else if let Some(named) = named {
-        states.push(format!(
-            "named_tunnel={} failure_kind={}",
-            named_tunnel_status(named.status),
-            named
-                .failure_kind
-                .map(named_tunnel_failure_kind)
-                .unwrap_or_else(|| "none".to_string())
-        ));
-    } else if let Some(failure) = named_failure {
-        states.push(format!(
-            "named_tunnel=failed failure_kind={} detail={}",
-            failure.failure_kind, failure.detail
-        ));
-    }
+    states.push(format!(
+        "remote_access={}",
+        serde_json::to_string(remote_access)
+            .unwrap_or_else(|_| "{\"mode\":\"unknown\"}".to_string())
+    ));
     if let Some(diagnostics) = diagnostics {
         states.push(format!(
             "codex={} status={}",
@@ -2369,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_access_named_failure_diagnostic_keeps_port_and_redacts_token() {
+    fn remote_access_named_failure_diagnostic_uses_safe_categories_only() {
         let check = named_failure_check(&NamedFailureSnapshot {
             local_url: Some("http://127.0.0.1:57324".to_string()),
             public_url: Some("https://codex.example.com".to_string()),
@@ -2380,8 +2454,66 @@ mod tests {
         assert_eq!(check.label, "named tunnel failed (local_port_unavailable)");
         assert_eq!(
             check.detail.as_deref(),
-            Some("Local port unavailable: 57324\nAuthorization: [REDACTED]")
+            Some("failure_kind=local_port_unavailable cloudflared_exit_category=none")
         );
+        assert!(!format!("{check:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn remote_access_diagnostics_only_include_non_sensitive_fields() {
+        let profile = NamedTunnelProfile::new("codex.example.com", 57324).unwrap();
+        let sensitive_detail = concat!(
+            "CLOUDFLARE_TUNNEL_TOKEN=cloudflare-secret\n",
+            "token_file_contents=token-file-secret\n",
+            "VAPID_PRIVATE_KEY=vapid-secret\n",
+            "p256dh=push-public-key auth=push-auth-secret"
+        );
+        let named = NamedTunnelSnapshot {
+            status: NamedTunnelStatus::Failed,
+            pid: None,
+            local_url: Some(profile.local_url()),
+            public_url: Some(profile.public_url()),
+            retry_attempt: 3,
+            failure_kind: Some(NamedTunnelFailureKind::ChildExited),
+            detail: Some(sensitive_detail.to_string()),
+        };
+        let failure = NamedFailureSnapshot {
+            local_url: named.local_url.clone(),
+            public_url: named.public_url.clone(),
+            failure_kind: "child_exited".to_string(),
+            detail: sensitive_detail.to_string(),
+        };
+
+        let json = serde_json::to_value(remote_access_diagnostics(
+            RemoteAccessMode::NamedFailed,
+            Some(&profile),
+            Some(&named),
+            Some(&failure),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "mode": "named_failed",
+                "hostname": "codex.example.com",
+                "localPort": 57324,
+                "namedFailureKind": "child_exited",
+                "retryCount": 3,
+                "publicHealthStatus": "failed",
+                "cloudflaredExitCategory": "unexpected_exit"
+            })
+        );
+        let serialized = json.to_string();
+        for secret in [
+            "cloudflare-secret",
+            "token-file-secret",
+            "vapid-secret",
+            "push-public-key",
+            "push-auth-secret",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
     }
 
     #[test]
