@@ -18,6 +18,7 @@ async-trait = "0.1"
 axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
 futures-util = "0.3"
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive", "rc"] }
@@ -31,3 +32,4 @@ tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["compression-br", "compression-gzip", "cors", "fs"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+url = "2"
