@@ -44,6 +44,8 @@ async fn main() -> anyhow::Result<()> {
     let storage = Storage::open(db_path).context("open bridge storage")?;
     let control_token = env::var("CODEX_MOBILE_BRIDGE_CONTROL_TOKEN")
         .unwrap_or_else(|_| Uuid::new_v4().to_string());
+    let instance_id =
+        env::var("CODEX_MOBILE_BRIDGE_INSTANCE_ID").unwrap_or_else(|_| Uuid::new_v4().to_string());
     let mut pairing = PairingManager::new(storage);
     let startup_pairing_token = pairing
         .create_token()
@@ -74,8 +76,9 @@ async fn main() -> anyhow::Result<()> {
         "Local control token for starting device pairing: {control_token}. Keep this token on this machine; it is not exposed by the HTTP API."
     );
     let codex_adapter = cdp_app_server_adapter(&cdp_client).await;
-    let mut state =
-        AppState::new(pairing, EventHub::new(), control_token).with_diagnostics(diagnostics);
+    let mut state = AppState::new(pairing, EventHub::new(), control_token)
+        .with_instance_id(instance_id)
+        .with_diagnostics(diagnostics);
     if let Some(adapter) = codex_adapter {
         state = state.with_codex_adapter(adapter);
     }

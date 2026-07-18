@@ -54,6 +54,7 @@ pub struct AppState {
     refresh_failures: Arc<Mutex<HashMap<String, usize>>>,
     local_assets: Arc<Mutex<LocalAssetRegistry>>,
     control_token: Arc<str>,
+    instance_id: Arc<str>,
     codex_adapter: Option<Arc<dyn CodexAdapter>>,
     diagnostics: Arc<RwLock<DiagnosticsReport>>,
 }
@@ -109,6 +110,7 @@ pub struct HealthResponse {
     status: String,
     connection_state: String,
     version: &'static str,
+    instance_id: Arc<str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -256,9 +258,15 @@ impl AppState {
             refresh_failures: Arc::new(Mutex::new(HashMap::new())),
             local_assets: Arc::new(Mutex::new(LocalAssetRegistry::default())),
             control_token: control_token.into(),
+            instance_id: Arc::<str>::from(Uuid::new_v4().to_string()),
             codex_adapter: None,
             diagnostics: Arc::new(RwLock::new(DiagnosticsReport::default())),
         }
+    }
+
+    pub fn with_instance_id(mut self, instance_id: impl Into<Arc<str>>) -> Self {
+        self.instance_id = instance_id.into();
+        self
     }
 
     pub fn with_codex_adapter(mut self, adapter: Arc<dyn CodexAdapter>) -> Self {
@@ -418,13 +426,17 @@ pub fn build_phone_router_with_static_dir(
     )
 }
 
-async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let diagnostics = state.diagnostics.read().await;
-    Json(HealthResponse {
-        status: diagnostics.status.as_str().to_string(),
-        connection_state: diagnostics.connection_state.as_str().to_string(),
-        version: env!("CARGO_PKG_VERSION"),
-    })
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(HealthResponse {
+            status: diagnostics.status.as_str().to_string(),
+            connection_state: diagnostics.connection_state.as_str().to_string(),
+            version: env!("CARGO_PKG_VERSION"),
+            instance_id: Arc::clone(&state.instance_id),
+        }),
+    )
 }
 
 async fn start_pairing(
@@ -1851,8 +1863,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_returns_connection_state() {
+    async fn health_route_reports_bridge_status() {
         let (_dir, state) = test_state();
+        let state = state.with_instance_id("bridge-instance-test");
         let app = build_router(state);
 
         let response = app
@@ -1861,12 +1874,16 @@ mod tests {
             .expect("request succeeds");
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let payload = response_json(response).await;
+        assert_eq!(payload["instanceId"], json!("bridge-instance-test"));
         assert_eq!(
-            response_json(response).await,
+            payload,
             json!({
                 "status": "degraded",
                 "connectionState": "codex_not_running",
                 "version": env!("CARGO_PKG_VERSION"),
+                "instanceId": "bridge-instance-test",
             })
         );
     }

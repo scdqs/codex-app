@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  type BridgeHealth,
   isServerEnvelope,
   isApiErrorCode,
   isSessionDataEnabled,
@@ -10,6 +11,17 @@ import {
   parseServerEnvelope,
   secondaryStatusText,
 } from "@codex/bridge-protocol";
+
+function bridgeHealth(status: string, connectionState: string): BridgeHealth {
+  return {
+    status,
+    connectionState,
+    instanceId: "bridge-instance-test",
+  };
+}
+
+type IsRequired<T, K extends keyof T> = {} extends Pick<T, K> ? false : true;
+const bridgeInstanceIdIsRequired: IsRequired<BridgeHealth, "instanceId"> = true;
 
 describe("shared bridge protocol", () => {
   it("accepts Rust-compatible server envelopes", () => {
@@ -56,18 +68,23 @@ describe("shared bridge protocol", () => {
   });
 
   it("maps bridge health states to shared user-facing connection states", () => {
-    expect(mapHealthToConnection({ status: "ok", connectionState: "writable" })).toEqual({ label: "Writable" });
-    expect(mapHealthToConnection({ status: "ok", connectionState: "read-only" })).toEqual({ label: "Read-only" });
-    expect(mapHealthToConnection({ status: "degraded", connectionState: "inject_failed" })).toEqual({
+    expect(mapHealthToConnection(bridgeHealth("ok", "writable"))).toEqual({ label: "Writable" });
+    expect(mapHealthToConnection(bridgeHealth("ok", "read-only"))).toEqual({ label: "Read-only" });
+    expect(mapHealthToConnection(bridgeHealth("degraded", "inject_failed"))).toEqual({
       label: "Inject failed",
     });
-    expect(mapHealthToConnection({ status: "degraded", connectionState: "codex_not_running" })).toEqual({
+    expect(mapHealthToConnection(bridgeHealth("degraded", "codex_not_running"))).toEqual({
       label: "ChatGPT/Codex not running",
     });
-    expect(mapHealthToConnection({ status: "degraded", connectionState: "mystery" })).toEqual({
+    expect(mapHealthToConnection(bridgeHealth("degraded", "mystery"))).toEqual({
       label: "Connection error",
       detail: "mystery",
     });
+  });
+
+  it("requires bridge instance identity in health payloads", () => {
+    expect(bridgeInstanceIdIsRequired).toBe(true);
+    expect(bridgeHealth("ok", "writable").instanceId).toBe("bridge-instance-test");
   });
 
   it("keeps secondary text and data-enabled state in one shared module", () => {

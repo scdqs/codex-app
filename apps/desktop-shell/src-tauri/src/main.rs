@@ -10,8 +10,8 @@ use std::{
 use desktop_core::{
     BridgeProcessConfig, BridgeProcessManager, BridgeProcessSnapshot, BridgeProcessStatus,
     CodexLaunchCommand, CodexLaunchConfig, CodexLaunchManager, CodexLaunchOutcome, DiagnosticCheck,
-    DiagnosticLog, DiagnosticsBundleInput, QuickTunnelConfig, QuickTunnelManager, TunnelSnapshot,
-    TunnelStatus, build_diagnostics_bundle,
+    DiagnosticLog, DiagnosticsBundleInput, PortPolicy, QuickTunnelConfig, QuickTunnelManager,
+    TunnelSnapshot, TunnelStatus, build_diagnostics_bundle,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -694,6 +694,7 @@ fn stopped_bridge_snapshot() -> BridgeProcessSnapshot {
         status: BridgeProcessStatus::Stopped,
         pid: None,
         port: None,
+        port_policy: PortPolicy::Flexible,
         health_url: None,
         detail: None,
     }
@@ -928,6 +929,7 @@ mod tests {
             status: BridgeProcessStatus::Failed,
             pid: None,
             port: None,
+            port_policy: PortPolicy::Flexible,
             health_url: None,
             detail: Some("Authorization: Bearer secret".to_string()),
         };

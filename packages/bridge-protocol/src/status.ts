@@ -1,6 +1,7 @@
 export interface BridgeHealth {
   status: string;
   connectionState: string;
+  instanceId: string;
   version?: string;
 }
 

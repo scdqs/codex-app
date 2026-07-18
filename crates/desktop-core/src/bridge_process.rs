@@ -27,11 +27,18 @@ pub enum BridgeProcessStatus {
     Stopping,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortPolicy {
+    Flexible,
+    Fixed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeProcessSnapshot {
     pub status: BridgeProcessStatus,
     pub pid: Option<u32>,
     pub port: Option<u16>,
+    pub port_policy: PortPolicy,
     pub health_url: Option<String>,
     pub detail: Option<String>,
 }
@@ -44,6 +51,7 @@ pub struct BridgeProcessConfig {
     pub pwa_dist_dir: PathBuf,
     pub db_path: Option<PathBuf>,
     pub preferred_port: Option<u16>,
+    pub port_policy: PortPolicy,
     pub bind_ip: IpAddr,
     pub health_ip: IpAddr,
     pub advertised_host: String,
@@ -65,6 +73,7 @@ impl BridgeProcessConfig {
             pwa_dist_dir: pwa_dist_dir.into(),
             db_path: None,
             preferred_port: Some(57324),
+            port_policy: PortPolicy::Flexible,
             bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             health_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             advertised_host: Ipv4Addr::LOCALHOST.to_string(),
@@ -77,6 +86,7 @@ impl BridgeProcessConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeLaunchPlan {
+    pub instance_id: String,
     pub port: u16,
     pub bind_addr: SocketAddr,
     pub health_url: String,
@@ -110,6 +120,8 @@ pub enum BridgeProcessError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("preferred bridge port {port} is unavailable")]
+    PreferredPortUnavailable { port: u16 },
     #[error("failed to spawn bridge sidecar: {0}")]
     Spawn(std::io::Error),
     #[error("bridge sidecar exited before health became ready: {0}")]
@@ -181,7 +193,12 @@ impl BridgeProcessManager {
             .unwrap_or_else(|| self.config.app_data_dir.join("bridge.sqlite"));
         validate_db_writable(&db_path)?;
 
-        let port = choose_port(self.config.bind_ip, self.config.preferred_port)?;
+        let port = choose_port(
+            self.config.bind_ip,
+            self.config.preferred_port,
+            self.config.port_policy,
+        )?;
+        let instance_id = Uuid::new_v4().to_string();
         let bind_addr = SocketAddr::new(self.config.bind_ip, port);
         let control_bridge_url = format!("http://{}:{port}", host_for_url(self.config.health_ip));
         let health_url = format!("{control_bridge_url}/api/health");
@@ -210,9 +227,14 @@ impl BridgeProcessManager {
                 "CODEX_MOBILE_BRIDGE_CONTROL_TOKEN".to_string(),
                 self.control_token.clone(),
             ),
+            (
+                "CODEX_MOBILE_BRIDGE_INSTANCE_ID".to_string(),
+                instance_id.clone(),
+            ),
         ];
 
         Ok(BridgeLaunchPlan {
+            instance_id,
             port,
             bind_addr,
             health_url,
@@ -387,6 +409,7 @@ impl BridgeProcessManager {
             status: self.state.status,
             pid,
             port: self.state.plan.as_ref().map(|plan| plan.port),
+            port_policy: self.config.port_policy,
             health_url: self.state.plan.as_ref().map(|plan| plan.health_url.clone()),
             detail: self.state.detail.clone(),
         }
@@ -451,12 +474,18 @@ fn append_log_file(path: &Path) -> Result<File, BridgeProcessError> {
         })
 }
 
-fn choose_port(bind_ip: IpAddr, preferred_port: Option<u16>) -> Result<u16, BridgeProcessError> {
-    match preferred_port {
-        Some(port) if TcpListener::bind(SocketAddr::new(bind_ip, port)).is_ok() => {
+fn choose_port(
+    bind_ip: IpAddr,
+    preferred_port: Option<u16>,
+    policy: PortPolicy,
+) -> Result<u16, BridgeProcessError> {
+    if let Some(port) = preferred_port {
+        if TcpListener::bind(SocketAddr::new(bind_ip, port)).is_ok() {
             return Ok(port);
         }
-        _ => {}
+        if policy == PortPolicy::Fixed {
+            return Err(BridgeProcessError::PreferredPortUnavailable { port });
+        }
     }
     let listener = TcpListener::bind(SocketAddr::new(bind_ip, 0)).map_err(|source| {
         BridgeProcessError::Io {
@@ -526,6 +555,7 @@ mod tests {
         let occupied_port = listener.local_addr().expect("listener addr").port();
         let mut config = test_config(&temp);
         config.preferred_port = Some(occupied_port);
+        config.port_policy = PortPolicy::Flexible;
         let manager = BridgeProcessManager::new(config);
 
         let plan = manager.prepare_launch_plan().expect("launch plan prepares");
@@ -535,6 +565,41 @@ mod tests {
             plan.env_value("CODEX_MOBILE_BRIDGE_BIND"),
             Some(format!("127.0.0.1:{}", plan.port))
         );
+    }
+
+    #[test]
+    fn launch_plan_rejects_an_occupied_fixed_port() {
+        let temp = TempDir::new().expect("temp dir creates");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("test listener binds");
+        let occupied_port = listener.local_addr().expect("listener addr").port();
+        let mut config = test_config(&temp);
+        config.preferred_port = Some(occupied_port);
+        config.port_policy = PortPolicy::Fixed;
+        let manager = BridgeProcessManager::new(config);
+
+        let error = manager
+            .prepare_launch_plan()
+            .expect_err("fixed occupied port must fail");
+
+        assert!(matches!(
+            error,
+            BridgeProcessError::PreferredPortUnavailable { port } if port == occupied_port
+        ));
+    }
+
+    #[test]
+    fn snapshot_reports_configured_port_policy() {
+        let flexible_temp = TempDir::new().expect("flexible temp dir creates");
+        let flexible_manager = BridgeProcessManager::new(test_config(&flexible_temp));
+
+        assert_eq!(flexible_manager.status().port_policy, PortPolicy::Flexible);
+
+        let fixed_temp = TempDir::new().expect("fixed temp dir creates");
+        let mut fixed_config = test_config(&fixed_temp);
+        fixed_config.port_policy = PortPolicy::Fixed;
+        let fixed_manager = BridgeProcessManager::new(fixed_config);
+
+        assert_eq!(fixed_manager.status().port_policy, PortPolicy::Fixed);
     }
 
     #[test]
@@ -588,6 +653,25 @@ mod tests {
         assert_eq!(
             plan.env_value("CODEX_MOBILE_BRIDGE_DB"),
             Some(plan.db_path.display().to_string())
+        );
+    }
+
+    #[test]
+    fn launch_plan_refreshes_instance_id_for_each_prepare() {
+        let temp = TempDir::new().expect("temp dir creates");
+        let manager = BridgeProcessManager::new(test_config(&temp));
+
+        let first = manager.prepare_launch_plan().expect("first plan prepares");
+        let second = manager.prepare_launch_plan().expect("second plan prepares");
+
+        assert_ne!(first.instance_id, second.instance_id);
+        assert_eq!(
+            first.env_value("CODEX_MOBILE_BRIDGE_INSTANCE_ID"),
+            Some(first.instance_id.clone())
+        );
+        assert_eq!(
+            second.env_value("CODEX_MOBILE_BRIDGE_INSTANCE_ID"),
+            Some(second.instance_id.clone())
         );
     }
 
