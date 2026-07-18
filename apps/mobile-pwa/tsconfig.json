@@ -21,5 +21,6 @@
     "jsx": "react-jsx",
     "types": ["vitest/globals", "vite/client"]
   },
-  "include": ["src", "vite.config.ts", "../../packages/bridge-protocol/src"]
+  "include": ["src", "vite.config.ts", "../../packages/bridge-protocol/src"],
+  "exclude": ["src/service-worker.ts"]
 }

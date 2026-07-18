@@ -46,6 +46,8 @@ export const API_ERROR_CODES = [
   "workspace_required",
   "workspace_not_allowed",
   "workspace_unavailable",
+  "push_unavailable",
+  "invalid_subscription",
 ] as const;
 
 export type ApiErrorCode = (typeof API_ERROR_CODES)[number];
@@ -53,6 +55,10 @@ export type ApiErrorCode = (typeof API_ERROR_CODES)[number];
 export const SESSION_EVENT_TYPES = [
   "message",
   "message_delta",
+  "reasoning_summary",
+  "reasoning_summary_delta",
+  "plan",
+  "plan_delta",
   "tool_call",
   "tool_result",
   "approval_requested",
@@ -62,6 +68,23 @@ export const SESSION_EVENT_TYPES = [
 ] as const;
 
 export type SessionEventType = (typeof SESSION_EVENT_TYPES)[number];
+
+export const ALERT_KINDS = [
+  "completed",
+  "approval_required",
+  "input_required",
+  "error",
+] as const;
+
+export type AlertKind = (typeof ALERT_KINDS)[number];
+
+export interface AlertEvent {
+  eventId: string;
+  kind: AlertKind;
+  threadId: string;
+  threadTitle: string;
+  occurredAt: number;
+}
 
 export interface SessionEvent {
   id: string;
@@ -115,6 +138,7 @@ export interface ApprovalDecision {
 export type ServerEnvelope =
   | { type: "session_snapshot"; payload: SessionSnapshot }
   | { type: "session_event"; payload: SessionEvent }
+  | { type: "alert_event"; payload: AlertEvent }
   | { type: "approval_request"; payload: ApprovalRequest }
   | { type: "approval_resolved"; payload: ApprovalDecision }
   | { type: "error"; payload: { message: string } };
@@ -147,6 +171,8 @@ export function isServerEnvelope(value: unknown): value is ServerEnvelope {
       return isSessionSnapshot(envelope.payload);
     case "session_event":
       return isSessionEvent(envelope.payload);
+    case "alert_event":
+      return isAlertEvent(envelope.payload);
     case "approval_request":
       return isApprovalRequest(envelope.payload);
     case "approval_resolved":
@@ -204,6 +230,21 @@ export function isSessionEvent(value: unknown): value is SessionEvent {
     isJsonValue(event.payload) &&
     typeof event.createdAt === "number" &&
     Number.isFinite(event.createdAt)
+  );
+}
+
+export function isAlertEvent(value: unknown): value is AlertEvent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const event = value as Record<string, unknown>;
+  return (
+    typeof event.eventId === "string" &&
+    includesLiteral(ALERT_KINDS, event.kind) &&
+    typeof event.threadId === "string" &&
+    typeof event.threadTitle === "string" &&
+    typeof event.occurredAt === "number" &&
+    Number.isFinite(event.occurredAt)
   );
 }
 

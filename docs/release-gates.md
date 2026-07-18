@@ -18,6 +18,7 @@
 - stable 不能默认开启 Quick Tunnel。
 - stable 如果还只有 Cloudflare Quick Tunnel，远程访问必须标注为 Beta/实验能力，不能写成“稳定远程连接”。
 - stable 不应暴露 Local Control API 到公网 tunnel。
+- stable 如果启用 Web Push，必须使用 Named Tunnel 固定域名，并完成 iPhone 与 Android 真机锁屏通知 QA。
 
 ## CI 门禁脚本
 
@@ -60,6 +61,17 @@ TAURI_SIGNING_PRIVATE_KEY="..."
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD="..."
 UPDATE_MANIFEST_URL="https://..."
 ```
+
+如果 stable 包含 Web Push，还必须显式设置：
+
+```bash
+ENABLE_WEB_PUSH=true
+STABLE_REMOTE_ACCESS_PROVIDER=named_tunnel
+PUSH_QA_IOS_ACK=true
+PUSH_QA_ANDROID_ACK=true
+```
+
+这些确认表示已完成 `docs/qa/2026-07-18-web-push-device-matrix.md` 的真机测试；Quick Tunnel 和局域网模式不能作为 stable 锁屏通知通道。
 
 如果传入 `RELEASE_ARTIFACT=/path/to/app.dmg`，脚本还会确认文件存在，并阻止 stable 使用文件名包含 `unsigned` 的 DMG。
 

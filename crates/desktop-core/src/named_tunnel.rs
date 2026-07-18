@@ -1,7 +1,5 @@
 use std::{
     collections::VecDeque,
-    fs::OpenOptions,
-    io::Write,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -19,9 +17,8 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, sleep, timeout},
 };
-use uuid::Uuid;
 
-use crate::remote_access_config::NamedTunnelProfile;
+use crate::{SecretFileError, TemporarySecretFile, remote_access_config::NamedTunnelProfile};
 
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -145,12 +142,16 @@ pub enum NamedTunnelError {
     ChildExited,
     #[error("named tunnel process I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    SecretFile(#[from] SecretFileError),
 }
 
 impl NamedTunnelError {
     pub fn failure_kind(&self) -> NamedTunnelFailureKind {
         match self {
-            Self::AlreadyRunning | Self::Io(_) => NamedTunnelFailureKind::InvalidConfiguration,
+            Self::AlreadyRunning | Self::Io(_) | Self::SecretFile(_) => {
+                NamedTunnelFailureKind::InvalidConfiguration
+            }
             Self::TokenMissing => NamedTunnelFailureKind::TokenMissing,
             Self::TokenRejected => NamedTunnelFailureKind::TokenRejected,
             Self::LocalHealthUnavailable => NamedTunnelFailureKind::LocalHealthUnavailable,
@@ -458,9 +459,14 @@ impl NamedTunnelManager {
             }
         };
 
-        let token_file = match TemporarySecretFile::create(&self.config.runtime_dir, token) {
+        let token_file = match TemporarySecretFile::create(
+            &self.config.runtime_dir,
+            "cloudflared-token",
+            token.as_bytes(),
+        ) {
             Ok(file) => file,
             Err(error) => {
+                let error = NamedTunnelError::from(error);
                 self.fail_without_child(&error);
                 return Err(error);
             }
@@ -931,49 +937,6 @@ pub fn named_tunnel_launch_args(token_file: &Path, local_url: &str) -> Vec<Strin
     ]
 }
 
-struct TemporarySecretFile {
-    path: PathBuf,
-}
-
-impl TemporarySecretFile {
-    fn create(runtime_dir: &Path, secret: &str) -> Result<Self, NamedTunnelError> {
-        std::fs::create_dir_all(runtime_dir)?;
-        let path = runtime_dir.join(format!("cloudflared-token-{}", Uuid::new_v4()));
-        Self::create_at_path(path, secret)
-    }
-
-    fn create_at_path(path: PathBuf, secret: &str) -> Result<Self, NamedTunnelError> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&path)?;
-        let write_result = (|| -> Result<(), std::io::Error> {
-            file.write_all(secret.as_bytes())?;
-            file.sync_all()
-        })();
-        if let Err(error) = write_result {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(error.into());
-        }
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TemporarySecretFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1000,8 +963,9 @@ mod tests {
         BridgeHealthIdentity, HttpNamedTunnelHealthProbe, NamedTunnelConfig, NamedTunnelError,
         NamedTunnelFailureKind, NamedTunnelHealthProbe, NamedTunnelManager,
         NamedTunnelProcessLauncher, NamedTunnelStatus, OUTPUT_RING_CAPACITY, ProbeFailure,
-        TemporarySecretFile, error_chain_indicates_dns, named_tunnel_launch_args,
+        error_chain_indicates_dns, named_tunnel_launch_args,
     };
+    use crate::TemporarySecretFile;
 
     struct ScriptedProbe {
         results: Mutex<VecDeque<Result<BridgeHealthIdentity, ProbeFailure>>>,
@@ -1235,7 +1199,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path;
         {
-            let file = TemporarySecretFile::create(dir.path(), "secret-token-value").unwrap();
+            let file =
+                TemporarySecretFile::create(dir.path(), "cloudflared-token", b"secret-token-value")
+                    .unwrap();
             path = file.path().to_path_buf();
             assert_eq!(
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1251,7 +1217,7 @@ mod tests {
         let path = dir.path().join("existing-token-file");
         fs::write(&path, "existing-secret").unwrap();
 
-        assert!(TemporarySecretFile::create_at_path(path.clone(), "new-secret").is_err());
+        assert!(TemporarySecretFile::create_at_path(path.clone(), b"new-secret").is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "existing-secret");
     }
 

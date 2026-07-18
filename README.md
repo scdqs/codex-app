@@ -2,7 +2,7 @@
 
 Codex Mobile Bridge 是一个 macOS 桌面桥接应用，让手机继续操作电脑上正在运行的 ChatGPT/Codex Desktop 任务。它不直接调用模型 API，也不替代桌面 Agent；电脑负责执行任务，手机负责查看会话、补充消息、创建会话和处理审批。
 
-当前版本：`v0.1.5 Beta`
+当前版本：`v0.1.7 Beta`
 
 ## 适用场景
 
@@ -15,11 +15,15 @@ Codex Mobile Bridge 是一个 macOS 桌面桥接应用，让手机继续操作�
 - 自动检测并启动新版 `ChatGPT.app`，同时兼容旧版 `Codex.app`，排除 `ChatGPT Classic`。
 - 通过 CDP 和 app-server RPC 读取真实桌面会话并回写消息。
 - 手机 PWA 查看会话列表和完整消息流，最新消息保持在底部。
+- 按规范化工作目录展示“项目 → 会话”两层结构；项目折叠和会话置顶保存在当前手机。
+- 通过 app-server 实时通知流增量展示最终回答、思考摘要、计划和执行进度；HTTP 游标同步负责断线恢复。
 - 向现有会话发送文本和图片附件。
 - 从手机创建新会话，并从 Bridge 提供的安全工作目录列表中选择工作空间。
 - 查看并处理 Bridge 能捕获到的审批请求。
 - 长期设备配对、自动恢复会话和桌面端撤销设备。
 - 三种访问方式：局域网、Cloudflare 固定域名、Quick Tunnel 临时通道。
+- 四类任务提醒：完成、等待审批、等待输入和错误；前台提供不同提示音与可用时的震动。
+- Cloudflare 固定 HTTPS 域名下支持直接 Web Push、锁屏系统通知、订阅修复和通知点击回到对应会话。
 - 固定域名 Token 写入 macOS Keychain，诊断信息会脱敏。
 
 ## 当前限制
@@ -27,7 +31,9 @@ Codex Mobile Bridge 是一个 macOS 桌面桥接应用，让手机继续操作�
 - 当前只实现 macOS，已验证的内部 DMG 为 Apple Silicon 架构。
 - 电脑必须开机，ChatGPT/Codex Desktop 和 Bridge Service 必须保持运行。
 - 手机端目前是 PWA，不是 App Store 或 Android 原生应用。
-- Web Push、锁屏后台通知和多状态提示音仍属于后续功能，不能把设计文档当成已实现能力。
+- 手机只展示 ChatGPT/Codex Desktop 或 provider 已提供的思考摘要和结构化执行过程，不暴露或伪造模型隐藏的完整 chain-of-thought。
+- Quick Tunnel 和局域网只支持页面前台提醒；可靠锁屏通知需要固定 HTTPS 域名。
+- iPhone 必须把 PWA 添加到主屏幕并从主屏幕打开后，才能请求系统通知权限；锁屏声音和震动最终由 iOS 控制。
 - 已配对手机在 MVP 中被视为可信本机用户，复杂权限分级尚未实现。
 - 当前内部 DMG 使用 ad-hoc 签名，没有 Apple Developer ID 签名和 notarization，不属于 stable 公共发行包。
 - CLI adapter、Windows 和 Linux 支持尚未实现。
@@ -128,10 +134,22 @@ sudo /opt/homebrew/bin/cloudflared service uninstall
 ## 手机端行为
 
 - 会话列表来自 ChatGPT/Codex Desktop 的真实 threads，不是独立云端数据库。
+- Bridge 会有界遍历 `thread/list` 分页，因此较早创建但最近仍在运行或置顶的会话不会因只读取第一页而缺失。
+- 会话按 canonical `cwd` 分组为项目；手机端折叠和置顶是本地偏好，不依赖 Desktop 私有 UI store。
 - 当前会话只请求有界事件窗口，并通过游标加载更早历史，避免大线程每次传输全部消息。
-- HTTP 轮询结果是当前消息窗口的权威快照；仅保留尚未被服务端回显的本地 pending 消息，以避免重复显示。
+- app-server 实时通知经认证 WebSocket 增量到达；HTTP 游标结果仍是恢复和校准依据，仅保留尚未被服务端回显的本地 pending 消息。
+- 思考区域只展示 Desktop 可展示的 reasoning summary；最终回答、计划和工具状态使用独立事件类型，避免混在一起。
 - 新建会话必须选择 Bridge 返回且当前仍可用的工作目录，手机不能任意浏览整个 Mac 文件系统。
 - 图片附件通过受认证的本地资源代理传递，诊断和事件响应不会暴露完整本机路径。
+
+## 手机提醒
+
+- 在 Settings 中可以分别开关完成、等待审批、等待输入和错误提醒，并试听四种前台提示音。
+- 固定 HTTPS 模式可启用系统通知；状态会显示 `Active`、`Not enabled`、`Blocked`、`Needs repair` 或 `Unavailable`。
+- `Repair notifications` 会清理浏览器与 Bridge 的旧订阅后重新注册；`Disable alerts` 会先关闭服务端总开关，再尝试清理两侧订阅。
+- 页面可见时普通 push 只转发到页面，并与 WebSocket 使用同一个 `eventId` 去重；后台或锁屏时由 Service Worker 显示系统通知。
+- 点击系统通知会聚焦或打开 PWA，并在会话列表加载后选择对应 thread；会话已不存在时会显示明确提示。
+- Quick Tunnel 地址不稳定，不会请求或复用 PushSubscription，也不会承诺锁屏通知。
 
 ## 安全边界
 
@@ -139,6 +157,8 @@ sudo /opt/homebrew/bin/cloudflared service uninstall
 - 会话 API、图片资源和 WebSocket 都要求已配对设备的 session。
 - Local Control API 不会挂载到手机公网路由。
 - Tunnel Token 存在 macOS Keychain；启动 `cloudflared` 时通过权限受限的临时 token 文件传入，不出现在命令行参数和诊断中。
+- VAPID 私钥存在 macOS Keychain，只通过一次性 `0600` 文件交给 sidecar 并在读取后删除；PushSubscription 与 outbox 绑定已配对设备。
+- Web Push payload 只含事件类别、thread ID/标题和时间，不含消息正文、CWD、工具参数或错误详情。
 - 固定域名和 Quick Tunnel 互斥，关闭远程访问应真正停止由 Bridge 管理的 Connector。
 - 当前没有账号体系或审批风险分级。请只配对可信设备，并在设备丢失时立即从桌面端撤销。
 - 不要直接把 `57324` 端口映射到公网。
@@ -232,6 +252,7 @@ target/release/bundle/dmg/
 
 - 内部人工 QA：[docs/dogfood-qa-checklist.md](docs/dogfood-qa-checklist.md)
 - 发布门禁：[docs/release-gates.md](docs/release-gates.md)
+- Web Push 真机矩阵：[docs/qa/2026-07-18-web-push-device-matrix.md](docs/qa/2026-07-18-web-push-device-matrix.md)
 - 固定域名实现计划：[docs/superpowers/plans/2026-07-18-fixed-domain-named-tunnel.md](docs/superpowers/plans/2026-07-18-fixed-domain-named-tunnel.md)
 - GitHub Actions 的 `Desktop build` workflow 可生成 dev/beta DMG。
 - stable 版本必须具备 Developer ID 签名、Apple notarization 和 updater metadata。

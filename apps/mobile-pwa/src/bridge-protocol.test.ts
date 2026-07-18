@@ -40,6 +40,23 @@ describe("shared bridge protocol", () => {
     expect(parseServerEnvelope(JSON.stringify(envelope))).toEqual(envelope);
   });
 
+  it("accepts all four Rust-compatible alert event kinds", () => {
+    for (const kind of ["completed", "approval_required", "input_required", "error"] as const) {
+      expect(
+        isServerEnvelope({
+          type: "alert_event",
+          payload: {
+            eventId: `event-${kind}`,
+            kind,
+            threadId: "thread-1",
+            threadTitle: "Task",
+            occurredAt: 1_784_349_000_000,
+          },
+        }),
+      ).toBe(true);
+    }
+  });
+
   it("rejects unknown enum values before UI code consumes them", () => {
     expect(isSessionStatus("waiting")).toBe(false);
     expect(isSessionEventType("tool")).toBe(false);
@@ -55,6 +72,10 @@ describe("shared bridge protocol", () => {
     expect(isSessionStatus("waiting_for_approval")).toBe(true);
     expect(isSessionStatus("error")).toBe(true);
     expect(isSessionEventType("message_delta")).toBe(true);
+    expect(isSessionEventType("reasoning_summary")).toBe(true);
+    expect(isSessionEventType("reasoning_summary_delta")).toBe(true);
+    expect(isSessionEventType("plan")).toBe(true);
+    expect(isSessionEventType("plan_delta")).toBe(true);
     expect(isSessionEventType("approval_requested")).toBe(true);
   });
 
@@ -64,6 +85,8 @@ describe("shared bridge protocol", () => {
     expect(isApiErrorCode("workspace_required")).toBe(true);
     expect(isApiErrorCode("workspace_not_allowed")).toBe(true);
     expect(isApiErrorCode("invalid_pairing_token")).toBe(true);
+    expect(isApiErrorCode("push_unavailable")).toBe(true);
+    expect(isApiErrorCode("invalid_subscription")).toBe(true);
     expect(isApiErrorCode("unknown_error")).toBe(false);
   });
 

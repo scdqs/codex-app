@@ -19,8 +19,8 @@ use desktop_core::{
     CodexLaunchOutcome, DiagnosticCheck, DiagnosticLog, DiagnosticsBundleInput, KeyringSecretStore,
     NamedTunnelConfig, NamedTunnelFailureKind, NamedTunnelManager, NamedTunnelProfile,
     NamedTunnelSnapshot, NamedTunnelStatus, PortPolicy, QuickTunnelConfig, QuickTunnelManager,
-    RemoteAccessConfigStore, RemoteAccessPreferences, SecretStore, TunnelSnapshot, TunnelStatus,
-    build_diagnostics_bundle, redact_sensitive_text,
+    RemoteAccessConfigStore, RemoteAccessPreferences, SecretStore, TemporarySecretFile,
+    TunnelSnapshot, TunnelStatus, VapidKeyManager, build_diagnostics_bundle, redact_sensitive_text,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -116,6 +116,8 @@ struct ShellState {
     named_tunnel: Mutex<Option<NamedTunnelManager>>,
     remote_preferences: Mutex<RemoteAccessConfigStore>,
     secret_store: Arc<dyn SecretStore>,
+    vapid_keys: VapidKeyManager,
+    pending_vapid_secret: Mutex<Option<TemporarySecretFile>>,
     active_remote_mode: Mutex<RemoteAccessMode>,
     remote_access_operation: Mutex<()>,
     last_named_failure: Mutex<Option<NamedFailureSnapshot>>,
@@ -130,12 +132,15 @@ impl ShellState {
         remote_preferences: RemoteAccessConfigStore,
         secret_store: Arc<dyn SecretStore>,
     ) -> Self {
+        let vapid_keys = VapidKeyManager::new(Arc::clone(&secret_store));
         Self {
             bridge: Mutex::new(None),
             quick_tunnel: Mutex::new(QuickTunnelManager::new(QuickTunnelConfig::default())),
             named_tunnel: Mutex::new(None),
             remote_preferences: Mutex::new(remote_preferences),
             secret_store,
+            vapid_keys,
+            pending_vapid_secret: Mutex::new(None),
             active_remote_mode: Mutex::new(RemoteAccessMode::None),
             remote_access_operation: Mutex::new(()),
             last_named_failure: Mutex::new(None),
@@ -318,6 +323,17 @@ struct ControlDiagnosticsDto {
     status: String,
     connection_state: String,
     detail: Option<String>,
+    #[serde(default)]
+    push_subscriptions: Vec<PushSubscriptionDiagnosticDto>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PushSubscriptionDiagnosticDto {
+    subscription_state: String,
+    endpoint_host: String,
+    last_success_at: Option<u64>,
+    last_error_category: Option<String>,
 }
 
 #[tauri::command]
@@ -407,6 +423,7 @@ async fn save_named_tunnel_profile(
         clear_pairing_link_for_source(&state, PairingLinkSource::NamedTunnel).await;
         *state.active_remote_mode.lock().await = RemoteAccessMode::None;
         *state.last_named_failure.lock().await = None;
+        let _ = sync_active_bridge_remote_access_context(&state).await;
     }
 
     state
@@ -443,6 +460,7 @@ async fn delete_named_tunnel_profile(state: State<'_, ShellState>) -> Result<(),
         *state.active_remote_mode.lock().await = RemoteAccessMode::None;
     }
     *state.last_named_failure.lock().await = None;
+    let _ = sync_active_bridge_remote_access_context(&state).await;
     Ok(())
 }
 
@@ -477,9 +495,9 @@ async fn start_bridge(
     } else {
         BridgePortMode::Flexible
     };
-    ensure_bridge_for_mode(&app, &state, port_mode)
-        .await
-        .map(Into::into)
+    let snapshot = ensure_bridge_for_mode(&app, &state, port_mode).await?;
+    let _ = sync_active_bridge_remote_access_context(&state).await;
+    Ok(snapshot.into())
 }
 
 #[tauri::command]
@@ -585,6 +603,7 @@ async fn rotate_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnaps
             let _ = state.quick_tunnel.lock().await.stop().await;
             *state.active_remote_mode.lock().await = RemoteAccessMode::None;
             clear_pairing_link_for_source(&state, PairingLinkSource::QuickTunnel).await;
+            let _ = sync_active_bridge_remote_access_context(&state).await;
             return Err("Quick Tunnel public URL is not available".to_string());
         }
     };
@@ -594,6 +613,7 @@ async fn rotate_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnaps
             let _ = state.quick_tunnel.lock().await.stop().await;
             *state.active_remote_mode.lock().await = RemoteAccessMode::None;
             clear_pairing_link_for_source(&state, PairingLinkSource::QuickTunnel).await;
+            let _ = sync_active_bridge_remote_access_context(&state).await;
             return Err(error);
         }
     };
@@ -603,6 +623,7 @@ async fn rotate_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnaps
         Some(PairingLinkSource::QuickTunnel),
     )
     .await;
+    let _ = sync_bridge_remote_access_context(&state, "quick", Some(public_url)).await;
     Ok(snapshot.into())
 }
 
@@ -620,6 +641,7 @@ async fn stop_quick_tunnel(state: State<'_, ShellState>) -> Result<TunnelSnapsho
         *state.active_remote_mode.lock().await = RemoteAccessMode::None;
     }
     clear_pairing_link_for_source(&state, PairingLinkSource::QuickTunnel).await;
+    let _ = sync_active_bridge_remote_access_context(&state).await;
     Ok(snapshot.into())
 }
 
@@ -668,6 +690,7 @@ async fn stop_named_tunnel(state: State<'_, ShellState>) -> Result<NamedTunnelSn
     }
     *state.last_named_failure.lock().await = None;
     clear_pairing_link_for_source(&state, PairingLinkSource::NamedTunnel).await;
+    let _ = sync_active_bridge_remote_access_context(&state).await;
     Ok(snapshot.into())
 }
 
@@ -747,6 +770,7 @@ async fn start_temporary_tunnel(
         }
     };
     activate_quick_remote_access(&state, current, pairing_link).await;
+    let _ = sync_bridge_remote_access_context(&state, "quick", Some(public_url)).await;
     Ok(snapshot.into())
 }
 
@@ -888,6 +912,7 @@ async fn start_named_tunnel_inner(
             )
             .await;
             record_named_failure_from_snapshot(state, &failed_snapshot, &detail).await;
+            let _ = sync_active_bridge_remote_access_context(state).await;
             return Err(detail);
         }
     };
@@ -937,6 +962,7 @@ async fn start_named_tunnel_inner(
     )
     .await;
     *state.last_named_failure.lock().await = None;
+    let _ = sync_bridge_remote_access_context(state, "named", Some(public_url)).await;
     Ok(snapshot.into())
 }
 
@@ -975,6 +1001,7 @@ async fn start_quick_access(
         }
     };
     activate_quick_remote_access(state, current, pairing_link).await;
+    let _ = sync_bridge_remote_access_context(state, "quick", Some(public_url)).await;
     Ok(snapshot.into())
 }
 
@@ -988,6 +1015,7 @@ async fn stop_remote_access_inner(state: &ShellState) -> Result<(), String> {
     *state.last_named_failure.lock().await = None;
     clear_pairing_link_for_source(state, PairingLinkSource::NamedTunnel).await;
     clear_pairing_link_for_source(state, PairingLinkSource::QuickTunnel).await;
+    let _ = sync_bridge_remote_access_context(state, "local", None).await;
     Ok(())
 }
 
@@ -1000,7 +1028,12 @@ async fn ensure_bridge_for_mode(
     let current = bridge.as_ref().map(BridgeProcessManager::status);
     let needs_rebuild = match (current.as_ref(), mode) {
         (Some(snapshot), BridgePortMode::Fixed(port)) => {
-            snapshot.port != Some(port) || snapshot.port_policy != PortPolicy::Fixed
+            snapshot.port != Some(port)
+                || snapshot.port_policy != PortPolicy::Fixed
+                || !matches!(
+                    snapshot.status,
+                    BridgeProcessStatus::Ready | BridgeProcessStatus::Degraded
+                )
         }
         (Some(snapshot), BridgePortMode::Flexible) => {
             snapshot.port_policy != PortPolicy::Flexible
@@ -1015,27 +1048,51 @@ async fn ensure_bridge_for_mode(
         if let Some(manager) = bridge.as_mut() {
             let _ = manager.stop().await;
         }
-        let mut config = bridge_config(app)?;
-        match mode {
-            BridgePortMode::Flexible => config.port_policy = PortPolicy::Flexible,
-            BridgePortMode::Fixed(port) => {
-                config.preferred_port = Some(port);
-                config.port_policy = PortPolicy::Fixed;
-            }
-        }
-        *bridge = Some(BridgeProcessManager::new(config));
+        *bridge = Some(build_bridge_manager_for_mode(app, state, mode).await?);
     }
     let manager = bridge.as_mut().expect("bridge manager exists");
     if !matches!(
         manager.status().status,
         BridgeProcessStatus::Ready | BridgeProcessStatus::Degraded
     ) {
-        manager
-            .start()
-            .await
-            .map_err(|error| map_bridge_start_error(error.to_string(), mode))?;
+        let start_result = manager.start().await;
+        drop(state.pending_vapid_secret.lock().await.take());
+        start_result.map_err(|error| map_bridge_start_error(error.to_string(), mode))?;
     }
     Ok(manager.status())
+}
+
+async fn build_bridge_manager_for_mode(
+    app: &AppHandle,
+    state: &ShellState,
+    mode: BridgePortMode,
+) -> Result<BridgeProcessManager, String> {
+    let mut config = bridge_config(app)?;
+    match mode {
+        BridgePortMode::Flexible => config.port_policy = PortPolicy::Flexible,
+        BridgePortMode::Fixed(port) => {
+            config.preferred_port = Some(port);
+            config.port_policy = PortPolicy::Fixed;
+        }
+    }
+
+    let vapid = state
+        .vapid_keys
+        .load_or_create()
+        .map_err(|error| redact_sensitive_text(&error.to_string()))?;
+    let secret_file = TemporarySecretFile::create(
+        &config.app_data_dir.join("runtime"),
+        "vapid-key",
+        vapid.private_key_base64.as_bytes(),
+    )
+    .map_err(|error| redact_sensitive_text(&error.to_string()))?;
+    config.extra_env.push((
+        "CODEX_MOBILE_BRIDGE_VAPID_KEY_FILE".to_string(),
+        secret_file.path().display().to_string(),
+    ));
+    drop(state.pending_vapid_secret.lock().await.replace(secret_file));
+
+    Ok(BridgeProcessManager::new(config))
 }
 
 async fn ensure_named_manager(
@@ -1179,6 +1236,7 @@ async fn fail_remote_action(
     let detail = redact_sensitive_text(detail);
     set_transition_mode(state, current, action, ActionResult::Failed).await;
     record_named_failure(state, profile, failure_kind, &detail).await;
+    let _ = sync_active_bridge_remote_access_context(state).await;
     detail
 }
 
@@ -1316,6 +1374,7 @@ async fn apply_named_runtime_snapshot(state: &ShellState, snapshot: &NamedTunnel
         }
         _ => {}
     }
+    let _ = sync_active_bridge_remote_access_context(state).await;
 }
 
 async fn refresh_named_runtime(
@@ -1497,6 +1556,68 @@ async fn control_get_url(url: String, token: String) -> Result<Value, String> {
         .json()
         .await
         .map_err(|error| error.to_string())
+}
+
+async fn sync_bridge_remote_access_context(
+    state: &ShellState,
+    mode: &str,
+    public_origin: Option<&str>,
+) -> Result<(), String> {
+    let request = {
+        let bridge = state.bridge.lock().await;
+        bridge.as_ref().and_then(|manager| {
+            control_request_parts_from_manager(manager, "/api/control/remote-access").ok()
+        })
+    };
+    let Some((url, token)) = request else {
+        return Ok(());
+    };
+    reqwest::Client::new()
+        .put(url)
+        .header(CONTROL_TOKEN_HEADER, token)
+        .json(&serde_json::json!({
+            "mode": mode,
+            "publicOrigin": public_origin,
+        }))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn sync_active_bridge_remote_access_context(state: &ShellState) -> Result<(), String> {
+    let active_mode = *state.active_remote_mode.lock().await;
+    let public_origin = match active_mode {
+        RemoteAccessMode::Quick => state
+            .quick_tunnel
+            .lock()
+            .await
+            .status()
+            .session
+            .map(|session| session.public_url),
+        RemoteAccessMode::Named => {
+            let mut named_tunnel = state.named_tunnel.lock().await;
+            named_tunnel
+                .as_mut()
+                .and_then(|manager| manager.status().public_url)
+        }
+        RemoteAccessMode::None | RemoteAccessMode::NamedFailed => None,
+    };
+    let (mode, public_origin) = bridge_remote_access_context(active_mode, public_origin);
+    sync_bridge_remote_access_context(state, mode, public_origin.as_deref()).await
+}
+
+fn bridge_remote_access_context(
+    active_mode: RemoteAccessMode,
+    public_origin: Option<String>,
+) -> (&'static str, Option<String>) {
+    match (active_mode, public_origin) {
+        (RemoteAccessMode::Quick, Some(origin)) => ("quick", Some(origin)),
+        (RemoteAccessMode::Named, Some(origin)) => ("named", Some(origin)),
+        _ => ("local", None),
+    }
 }
 
 async fn control_request_parts(
@@ -1764,6 +1885,13 @@ fn recent_connection_states(
             "codex={} status={}",
             diagnostics.connection_state, diagnostics.status
         ));
+        if !diagnostics.push_subscriptions.is_empty() {
+            states.push(format!(
+                "push_subscriptions={}",
+                serde_json::to_string(&diagnostics.push_subscriptions)
+                    .unwrap_or_else(|_| "[]".to_string())
+            ));
+        }
     }
     states
 }
@@ -2803,5 +2931,34 @@ mod tests {
         );
         assert_eq!(*state.last_pairing_link.lock().await, None);
         assert_eq!(*state.last_pairing_source.lock().await, None);
+    }
+
+    #[test]
+    fn bridge_remote_access_context_requires_a_live_public_origin() {
+        assert_eq!(
+            bridge_remote_access_context(
+                RemoteAccessMode::Named,
+                Some("https://codex.example.com".into())
+            ),
+            ("named", Some("https://codex.example.com".into()))
+        );
+        assert_eq!(
+            bridge_remote_access_context(
+                RemoteAccessMode::Quick,
+                Some("https://temporary.example.com".into())
+            ),
+            ("quick", Some("https://temporary.example.com".into()))
+        );
+        assert_eq!(
+            bridge_remote_access_context(RemoteAccessMode::Named, None),
+            ("local", None)
+        );
+        assert_eq!(
+            bridge_remote_access_context(
+                RemoteAccessMode::NamedFailed,
+                Some("https://stale.example.com".into())
+            ),
+            ("local", None)
+        );
     }
 }

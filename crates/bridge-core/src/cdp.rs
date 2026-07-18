@@ -1,17 +1,27 @@
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async_with_config,
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
     tungstenite::{Message, protocol::WebSocketConfig},
 };
 
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_millis(1_500);
 const CDP_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const CDP_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const CODEX_NOTIFICATION_BINDING: &str = "__codexMobileBridgeNotification";
+
+const CODEX_NOTIFICATION_SUBSCRIBE_EXPRESSION: &str = r#"(async () => {
+  const bridge = globalThis.__codexMobileBridge;
+  if (!bridge || typeof bridge.subscribeNotifications !== "function") {
+    throw new Error("Codex mobile notification bridge is not injected");
+  }
+  return bridge.subscribeNotifications("__codexMobileBridgeNotification");
+})()"#;
 
 #[derive(Debug, Clone)]
 pub struct CdpClient {
@@ -31,6 +41,18 @@ pub struct CdpTarget {
     pub web_socket_debugger_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devtools_frontend_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CdpNotification {
+    pub method: String,
+    pub params: Value,
+}
+
+pub struct CdpNotificationStream {
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    pending: VecDeque<CdpNotification>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -178,6 +200,131 @@ impl CdpClient {
     }
 }
 
+impl CdpNotificationStream {
+    pub async fn connect(target: &CdpTarget) -> Result<Self, CdpError> {
+        let websocket_url = target.web_socket_debugger_url.as_deref().ok_or_else(|| {
+            CdpError::MissingWebSocketUrl {
+                target_id: target.id.clone(),
+            }
+        })?;
+        let (socket, _response) =
+            connect_async_with_config(websocket_url, Some(cdp_websocket_config()), false).await?;
+        let mut stream = Self {
+            socket,
+            pending: VecDeque::new(),
+        };
+
+        stream.send_command(1, "Runtime.enable", json!({})).await?;
+        stream
+            .send_command(
+                2,
+                "Runtime.addBinding",
+                json!({ "name": CODEX_NOTIFICATION_BINDING }),
+            )
+            .await?;
+        stream
+            .send_command(
+                3,
+                "Runtime.evaluate",
+                json!({
+                    "expression": CODEX_NOTIFICATION_SUBSCRIBE_EXPRESSION,
+                    "awaitPromise": true,
+                    "returnByValue": true,
+                }),
+            )
+            .await?;
+
+        Ok(stream)
+    }
+
+    pub async fn next_notification(&mut self) -> Result<Option<CdpNotification>, CdpError> {
+        if let Some(notification) = self.pending.pop_front() {
+            return Ok(Some(notification));
+        }
+
+        while let Some(message) = self.socket.next().await {
+            match message? {
+                Message::Text(text) => {
+                    if let Some(notification) = notification_from_binding(&text)? {
+                        return Ok(Some(notification));
+                    }
+                }
+                Message::Ping(payload) => {
+                    self.socket.send(Message::Pong(payload)).await?;
+                }
+                Message::Close(_) => return Ok(None),
+                _ => {}
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn send_command(&mut self, id: u64, method: &str, params: Value) -> Result<(), CdpError> {
+        self.socket
+            .send(Message::Text(
+                json!({ "id": id, "method": method, "params": params }).to_string(),
+            ))
+            .await?;
+
+        while let Some(message) = self.socket.next().await {
+            match message? {
+                Message::Text(text) => {
+                    if let Some(notification) = notification_from_binding(&text)? {
+                        self.pending.push_back(notification);
+                        continue;
+                    }
+                    let value: Value = serde_json::from_str(&text)?;
+                    if value.get("id").and_then(Value::as_u64) != Some(id) {
+                        continue;
+                    }
+                    if let Some(error) = value.get("error") {
+                        return Err(CdpError::Protocol {
+                            code: error
+                                .get("code")
+                                .and_then(Value::as_i64)
+                                .unwrap_or_default(),
+                            message: error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown CDP protocol error")
+                                .to_string(),
+                        });
+                    }
+                    if let Some(exception) = value.pointer("/result/exceptionDetails") {
+                        return Err(CdpError::RuntimeException(exception.to_string()));
+                    }
+                    return Ok(());
+                }
+                Message::Ping(payload) => {
+                    self.socket.send(Message::Pong(payload)).await?;
+                }
+                Message::Close(_) => return Err(CdpError::WebSocketClosed),
+                _ => {}
+            }
+        }
+
+        Err(CdpError::WebSocketClosed)
+    }
+}
+
+fn notification_from_binding(text: &str) -> Result<Option<CdpNotification>, CdpError> {
+    let value: Value = serde_json::from_str(text)?;
+    if value.get("method").and_then(Value::as_str) != Some("Runtime.bindingCalled")
+        || value.pointer("/params/name").and_then(Value::as_str) != Some(CODEX_NOTIFICATION_BINDING)
+    {
+        return Ok(None);
+    }
+
+    let payload = value
+        .pointer("/params/payload")
+        .and_then(Value::as_str)
+        .ok_or(CdpError::MalformedResponse(
+            "Runtime.bindingCalled missing payload",
+        ))?;
+    Ok(Some(serde_json::from_str(payload)?))
+}
+
 fn cdp_websocket_config() -> WebSocketConfig {
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(CDP_MAX_MESSAGE_BYTES);
@@ -246,6 +393,7 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
   if (
     globalThis.__codexMobileBridge &&
     typeof globalThis.__codexMobileBridge.rpc === "function" &&
+    typeof globalThis.__codexMobileBridge.subscribeNotifications === "function" &&
     globalThis.__codexMobileBridge.supportsMobileStartConversation === true &&
     globalThis.__codexMobileBridge.supportsMobileApprovals === true &&
     globalThis.__codexMobileBridge.supportsNativeApprovalRequestIds === true
@@ -259,7 +407,26 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
     "item/permissions/requestApproval",
     "mcpServer/elicitation/request",
   ]);
+  const NOTIFICATION_METHODS = [
+    "thread/started",
+    "thread/status/changed",
+    "turn/started",
+    "turn/completed",
+    "turn/failed",
+    "item/started",
+    "item/completed",
+    "item/agentMessage/delta",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/plan/delta",
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "mcpServer/elicitation/request",
+    "item/tool/requestUserInput",
+  ];
   let cachedAppServerManager = null;
+  let notificationUnsubscribers = [];
 
   const findScopeNode = () => {
     const root = globalThis.__codexRoot?._internalRoot?.current;
@@ -486,6 +653,35 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
     throw new Error(`Pending Codex approval not found: ${params?.approvalId || "unknown"}`);
   };
 
+  const subscribeNotifications = (bindingName) => {
+    const manager = findAppServerManager();
+    const emit = globalThis[bindingName];
+    if (!manager || typeof manager.addNotificationCallback !== "function") {
+      throw new Error("ChatGPT notification manager is unavailable");
+    }
+    if (typeof emit !== "function") {
+      throw new Error("Codex mobile CDP notification binding is unavailable");
+    }
+
+    for (const unsubscribe of notificationUnsubscribers) {
+      try {
+        unsubscribe();
+      } catch (_error) {
+        // A renderer reload may invalidate the previous callback set.
+      }
+    }
+    notificationUnsubscribers = NOTIFICATION_METHODS.map((method) =>
+      manager.addNotificationCallback(method, (notification) => {
+        const params =
+          notification && typeof notification === "object" && "params" in notification
+            ? notification.params
+            : notification;
+        emit(JSON.stringify({ method, params: params || {} }));
+      })
+    );
+    return true;
+  };
+
   const installDirectClientBridge = (client) => {
     if (!client || typeof client.sendRequest !== "function") {
       return false;
@@ -495,6 +691,7 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
       supportsMobileStartConversation: false,
       supportsMobileApprovals: false,
       supportsNativeApprovalRequestIds: false,
+      subscribeNotifications,
       rpc: async (request) => {
         if (request?.method === "codex-mobile/start-conversation") {
           throw new Error("Codex mobile start-conversation requires a host bridge");
@@ -514,6 +711,7 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
       supportsMobileStartConversation: true,
       supportsMobileApprovals: true,
       supportsNativeApprovalRequestIds: true,
+      subscribeNotifications,
       rpc: async (request) => {
         if (!request || typeof request.method !== "string") {
           throw new Error("Invalid Codex mobile bridge request");
@@ -922,6 +1120,16 @@ mod tests {
     }
 
     #[test]
+    fn bridge_script_subscribes_to_public_notification_summaries() {
+        assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("subscribeNotifications"));
+        assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("addNotificationCallback"));
+        assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("item/agentMessage/delta"));
+        assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("item/reasoning/summaryTextDelta"));
+        assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("item/plan/delta"));
+        assert!(!CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("item/reasoning/textDelta"));
+    }
+
+    #[test]
     fn reports_missing_target_as_degraded() {
         let targets = vec![target(
             "page-1",
@@ -959,6 +1167,95 @@ mod tests {
             .expect("response parses"),
             Some(json!("ok"))
         );
+    }
+
+    #[tokio::test]
+    async fn notification_stream_installs_runtime_binding_and_yields_notifications() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test websocket binds");
+        let address = listener.local_addr().expect("test websocket address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("websocket accepts");
+            let mut socket = accept_async(stream)
+                .await
+                .expect("websocket handshake succeeds");
+
+            for (id, expected_method) in [
+                (1, "Runtime.enable"),
+                (2, "Runtime.addBinding"),
+                (3, "Runtime.evaluate"),
+            ] {
+                let request = socket
+                    .next()
+                    .await
+                    .expect("CDP request arrives")
+                    .expect("CDP request is valid");
+                let request: Value = serde_json::from_str(request.to_text().expect("text request"))
+                    .expect("request JSON parses");
+                assert_eq!(request["id"], json!(id));
+                assert_eq!(request["method"], json!(expected_method));
+                if expected_method == "Runtime.addBinding" {
+                    assert_eq!(request["params"]["name"], json!(CODEX_NOTIFICATION_BINDING));
+                }
+                if expected_method == "Runtime.evaluate" {
+                    assert!(
+                        request["params"]["expression"]
+                            .as_str()
+                            .expect("expression")
+                            .contains("subscribeNotifications")
+                    );
+                }
+                socket
+                    .send(Message::Text(json!({ "id": id, "result": {} }).to_string()))
+                    .await
+                    .expect("CDP response writes");
+            }
+
+            let payload = json!({
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "delta": "hello"
+                }
+            });
+            socket
+                .send(Message::Text(
+                    json!({
+                        "method": "Runtime.bindingCalled",
+                        "params": {
+                            "name": CODEX_NOTIFICATION_BINDING,
+                            "payload": payload.to_string()
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .expect("binding notification writes");
+        });
+        let target = CdpTarget {
+            id: "notification-stream".to_string(),
+            target_type: "page".to_string(),
+            title: "ChatGPT".to_string(),
+            url: "app://-/index.html".to_string(),
+            web_socket_debugger_url: Some(format!("ws://{address}")),
+            devtools_frontend_url: None,
+        };
+
+        let mut stream = CdpNotificationStream::connect(&target)
+            .await
+            .expect("notification stream connects");
+        let notification = stream
+            .next_notification()
+            .await
+            .expect("notification reads")
+            .expect("notification is present");
+
+        assert_eq!(notification.method, "item/agentMessage/delta");
+        assert_eq!(notification.params["delta"], json!("hello"));
+        server.await.expect("websocket server finishes");
     }
 
     #[tokio::test]

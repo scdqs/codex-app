@@ -47,6 +47,7 @@ pub struct BridgeProcessSnapshot {
 pub struct BridgeProcessConfig {
     pub sidecar_binary: PathBuf,
     pub sidecar_args: Vec<String>,
+    pub extra_env: Vec<(String, String)>,
     pub app_data_dir: PathBuf,
     pub pwa_dist_dir: PathBuf,
     pub db_path: Option<PathBuf>,
@@ -69,6 +70,7 @@ impl BridgeProcessConfig {
         Self {
             sidecar_binary: sidecar_binary.into(),
             sidecar_args: Vec::new(),
+            extra_env: Vec::new(),
             app_data_dir: app_data_dir.into(),
             pwa_dist_dir: pwa_dist_dir.into(),
             db_path: None,
@@ -206,7 +208,7 @@ impl BridgeProcessManager {
         let pairing_start_url = format!("{control_bridge_url}/api/control/pairing/start");
         let stdout_log = log_dir.join("bridge-sidecar.stdout.log");
         let stderr_log = log_dir.join("bridge-sidecar.stderr.log");
-        let env = vec![
+        let mut env = vec![
             (
                 "CODEX_MOBILE_BRIDGE_BIND".to_string(),
                 bind_addr.to_string(),
@@ -232,6 +234,7 @@ impl BridgeProcessManager {
                 instance_id.clone(),
             ),
         ];
+        env.extend(self.config.extra_env.iter().cloned());
 
         Ok(BridgeLaunchPlan {
             instance_id,
@@ -654,6 +657,25 @@ mod tests {
             plan.env_value("CODEX_MOBILE_BRIDGE_DB"),
             Some(plan.db_path.display().to_string())
         );
+    }
+
+    #[test]
+    fn launch_plan_includes_only_the_vapid_secret_file_path() {
+        let temp = TempDir::new().expect("temp dir creates");
+        let mut config = test_config(&temp);
+        config.extra_env.push((
+            "CODEX_MOBILE_BRIDGE_VAPID_KEY_FILE".into(),
+            "/tmp/vapid-secret".into(),
+        ));
+        let manager = BridgeProcessManager::new(config);
+
+        let plan = manager.prepare_launch_plan().expect("launch plan prepares");
+
+        assert_eq!(
+            plan.env_value("CODEX_MOBILE_BRIDGE_VAPID_KEY_FILE"),
+            Some("/tmp/vapid-secret".into())
+        );
+        assert!(!format!("{plan:?}").contains("private-base64-value"));
     }
 
     #[test]

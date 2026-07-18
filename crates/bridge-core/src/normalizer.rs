@@ -45,67 +45,168 @@ impl Normalizer {
             .collect()
     }
 
-    pub fn event_from_raw_notification(notification: &CodexRawEvent) -> SessionEvent {
+    pub fn event_from_raw_notification(notification: &CodexRawEvent) -> Option<SessionEvent> {
         let thread_id = thread_id_from_value(&notification.params).unwrap_or_default();
         let created_at = timestamp_field(
             &notification.params,
             &["createdAt", "created_at", "timestamp", "time"],
         )
         .unwrap_or_default();
-        let raw = notification.params.clone();
         let method = notification.method.as_str();
 
-        if method.contains("delta") {
-            let text = text_from_value(&notification.params).unwrap_or_default();
-            return SessionEvent {
-                id: event_id(&thread_id, &notification.params, "delta"),
+        let delta_type = match method {
+            "item/agentMessage/delta" => Some((SessionEventType::MessageDelta, "assistant")),
+            "item/reasoning/summaryTextDelta" => {
+                Some((SessionEventType::ReasoningSummaryDelta, "reasoning"))
+            }
+            "item/plan/delta" => Some((SessionEventType::PlanDelta, "plan")),
+            "item/reasoning/textDelta" => return None,
+            _ => None,
+        };
+        if let Some((event_type, role)) = delta_type {
+            let text = delta_text_from_value(&notification.params).unwrap_or_default();
+            return Some(SessionEvent {
+                id: item_event_id(&thread_id, &notification.params, "delta"),
                 thread_id,
-                event_type: SessionEventType::MessageDelta,
+                event_type,
                 payload: json!({
-                    "role": "assistant",
+                    "role": role,
                     "text": text,
-                    "raw": raw,
+                    "raw": notification.params,
                 }),
                 created_at,
+            });
+        }
+
+        if method == "item/reasoning/summaryPartAdded" {
+            return Some(SessionEvent {
+                id: item_event_id(&thread_id, &notification.params, "reasoning-summary"),
+                thread_id,
+                event_type: SessionEventType::ReasoningSummary,
+                payload: json!({
+                    "role": "reasoning",
+                    "text": summary_part_text(&notification.params).unwrap_or_default(),
+                    "raw": notification.params,
+                }),
+                created_at,
+            });
+        }
+
+        if matches!(method, "item/started" | "item/completed")
+            && let Some(item) = notification.params.get("item")
+        {
+            let turn = CodexTurn {
+                id: string_field(&notification.params, &["turnId", "turn_id"]),
+                thread_id: Some(thread_id.clone()),
+                created_at: Some(created_at),
+                updated_at: Some(created_at),
+                raw: json!({ "items": [item] }),
             };
+            let mut event = event_from_item(&thread_id, 0, 0, item, &turn);
+            if method == "item/completed" && event.event_type == SessionEventType::ToolCall {
+                event.event_type = SessionEventType::ToolResult;
+            }
+            return Some(event);
         }
 
         if method == "turn/started" {
-            return SessionEvent {
+            return Some(SessionEvent {
                 id: event_id(&thread_id, &notification.params, "turn-started"),
                 thread_id,
                 event_type: SessionEventType::StatusChanged,
                 payload: json!({
                     "status": "running",
-                    "raw": raw,
+                    "raw": notification.params,
                 }),
                 created_at,
-            };
+            });
+        }
+
+        if method == "turn/completed" {
+            return Some(status_event(
+                thread_id,
+                &notification.params,
+                "turn-completed",
+                SessionStatus::Idle,
+                created_at,
+            ));
+        }
+
+        if method == "turn/failed" {
+            return Some(status_event(
+                thread_id,
+                &notification.params,
+                "turn-failed",
+                SessionStatus::Error,
+                created_at,
+            ));
+        }
+
+        if matches!(
+            method,
+            "item/commandExecution/requestApproval"
+                | "item/fileChange/requestApproval"
+                | "item/permissions/requestApproval"
+                | "mcpServer/elicitation/request"
+        ) {
+            return Some(status_event(
+                thread_id,
+                &notification.params,
+                "approval-required",
+                SessionStatus::WaitingForApproval,
+                created_at,
+            ));
+        }
+
+        if method == "item/tool/requestUserInput" {
+            return Some(status_event(
+                thread_id,
+                &notification.params,
+                "input-required",
+                SessionStatus::WaitingForInput,
+                created_at,
+            ));
         }
 
         if let Some(status) = status_from_value(&notification.params) {
-            return SessionEvent {
+            return Some(SessionEvent {
                 id: event_id(&thread_id, &notification.params, "status"),
                 thread_id,
                 event_type: SessionEventType::StatusChanged,
                 payload: json!({
                     "status": status,
-                    "raw": raw,
+                    "raw": notification.params,
                 }),
                 created_at,
-            };
+            });
         }
 
-        SessionEvent {
+        Some(SessionEvent {
             id: event_id(&thread_id, &notification.params, "unknown"),
             thread_id,
             event_type: SessionEventType::StatusChanged,
             payload: json!({
                 "method": notification.method,
-                "raw": raw,
+                "raw": notification.params,
             }),
             created_at,
-        }
+        })
+    }
+}
+
+fn status_event(
+    thread_id: String,
+    params: &Value,
+    suffix: &str,
+    status: SessionStatus,
+    created_at: u64,
+) -> SessionEvent {
+    SessionEvent {
+        id: event_id(&thread_id, params, suffix),
+        thread_id,
+        event_type: SessionEventType::StatusChanged,
+        payload: json!({ "status": status, "raw": params }),
+        created_at,
     }
 }
 
@@ -125,9 +226,9 @@ fn event_from_item(
     turn: &CodexTurn,
 ) -> SessionEvent {
     let role = role_from_item(item);
-    let event_type = event_type_for_role(&role);
+    let event_type = event_type_for_role(role);
     let attachments = image_attachments_from_value(item);
-    let text = text_from_value(item)
+    let text = text_for_item(item, event_type)
         .map(|text| scrub_attachment_paths_from_text(&text, &attachments))
         .unwrap_or_default();
     let created_at = timestamp_field(item, &["createdAt", "created_at", "timestamp"])
@@ -194,6 +295,8 @@ fn turn_items(value: &Value) -> Vec<Value> {
 
 fn event_type_for_role(role: &str) -> SessionEventType {
     match role {
+        "reasoning" => SessionEventType::ReasoningSummary,
+        "plan" => SessionEventType::Plan,
         "tool" => SessionEventType::ToolCall,
         "tool_result" => SessionEventType::ToolResult,
         "unknown" => SessionEventType::Error,
@@ -225,10 +328,49 @@ fn role_from_item(item: &Value) -> &'static str {
         "user" | "usermessage" | "user_message" | "input_text" | "input" => "user",
         "assistant" | "agent" | "codex" | "agentmessage" | "agent_message" | "assistantmessage"
         | "assistant_message" | "output_text" | "output" => "assistant",
-        "toolcall" | "tool_call" | "function_call" => "tool",
+        "reasoning" | "reasoning_summary" | "reasoningsummary" => "reasoning",
+        "plan" | "plan_update" | "planupdate" => "plan",
+        "toolcall" | "tool_call" | "function_call" | "commandexecution" | "command_execution"
+        | "filechange" | "file_change" | "mcptoolcall" | "mcp_tool_call" | "dynamictoolcall"
+        | "dynamic_tool_call" | "websearch" | "web_search" => "tool",
         "toolresult" | "tool_result" | "function_call_output" => "tool_result",
         _ => "unknown",
     }
+}
+
+fn text_for_item(item: &Value, event_type: SessionEventType) -> Option<String> {
+    match event_type {
+        SessionEventType::ReasoningSummary => reasoning_summary_text(item),
+        _ => text_from_value(item),
+    }
+}
+
+fn reasoning_summary_text(item: &Value) -> Option<String> {
+    for key in ["summary", "summaryText", "summary_text"] {
+        if let Some(summary) = item.get(key)
+            && let Some(text) = text_from_value(summary)
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn delta_text_from_value(value: &Value) -> Option<String> {
+    string_field(value, &["delta", "text", "summaryText", "summary_text"]).or_else(|| {
+        value
+            .pointer("/part/text")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
+}
+
+fn summary_part_text(value: &Value) -> Option<String> {
+    value
+        .get("part")
+        .or_else(|| value.get("summaryPart"))
+        .and_then(text_from_value)
+        .or_else(|| delta_text_from_value(value))
 }
 
 fn status_from_value(value: &Value) -> Option<SessionStatus> {
@@ -349,6 +491,25 @@ fn event_id(thread_id: &str, value: &Value, suffix: &str) -> String {
         .unwrap_or_else(|| "item".to_string());
 
     format!("{thread_id}:{turn_id}:{item_id}:{suffix}")
+}
+
+fn item_event_id(thread_id: &str, value: &Value, suffix: &str) -> String {
+    let turn_id = string_field(value, &["turnId", "turn_id"]).or_else(|| {
+        value
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    });
+    let item_id = string_field(value, &["itemId", "item_id"]).or_else(|| {
+        value
+            .pointer("/item/id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    });
+    match (turn_id, item_id) {
+        (Some(turn_id), Some(item_id)) => format!("{turn_id}:{item_id}"),
+        _ => event_id(thread_id, value, suffix),
+    }
 }
 
 fn text_from_value(value: &Value) -> Option<String> {
@@ -566,15 +727,100 @@ mod tests {
             }),
         };
 
-        let event = Normalizer::event_from_raw_notification(&notification);
+        let event = Normalizer::event_from_raw_notification(&notification)
+            .expect("assistant delta is public");
 
-        assert_eq!(event.id, "thread-1:turn-1:item-1:delta");
+        assert_eq!(event.id, "turn-1:item-1");
         assert_eq!(event.thread_id, "thread-1");
         assert_eq!(event.event_type, SessionEventType::MessageDelta);
         assert_eq!(event.payload["role"], json!("assistant"));
         assert_eq!(event.payload["text"], json!("hello"));
         assert_eq!(event.payload["raw"]["delta"], json!("hello"));
         assert_eq!(event.created_at, 1_725_000_000_000);
+    }
+
+    #[test]
+    fn separates_reasoning_summary_and_plan_deltas_without_hidden_reasoning() {
+        let summary = Normalizer::event_from_raw_notification(&CodexRawEvent {
+            method: "item/reasoning/summaryTextDelta".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "reasoning-1",
+                "delta": "Checking the implementation"
+            }),
+        })
+        .expect("summary delta is public");
+        let plan = Normalizer::event_from_raw_notification(&CodexRawEvent {
+            method: "item/plan/delta".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "plan-1",
+                "delta": "Run focused tests"
+            }),
+        })
+        .expect("plan delta is public");
+        let hidden = Normalizer::event_from_raw_notification(&CodexRawEvent {
+            method: "item/reasoning/textDelta".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "reasoning-1",
+                "delta": "private chain of thought"
+            }),
+        });
+
+        assert_eq!(summary.id, "turn-1:reasoning-1");
+        assert_eq!(summary.event_type, SessionEventType::ReasoningSummaryDelta);
+        assert_eq!(
+            summary.payload["text"],
+            json!("Checking the implementation")
+        );
+        assert_eq!(plan.event_type, SessionEventType::PlanDelta);
+        assert_eq!(plan.payload["text"], json!("Run focused tests"));
+        assert!(hidden.is_none());
+    }
+
+    #[test]
+    fn normalizes_historical_reasoning_summary_and_plan_items() {
+        let turns = vec![CodexTurn {
+            id: Some("turn-1".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            created_at: Some(1_725_000_000_000),
+            updated_at: None,
+            raw: json!({
+                "items": [
+                    {
+                        "id": "reasoning-1",
+                        "type": "reasoning",
+                        "summary": [{ "type": "summary_text", "text": "Reviewed the bridge boundary" }],
+                        "content": [{ "type": "reasoning_text", "text": "private chain of thought" }]
+                    },
+                    {
+                        "id": "plan-1",
+                        "type": "plan",
+                        "content": "Run the regression suite"
+                    }
+                ]
+            }),
+        }];
+
+        let events = Normalizer::events_from_turns("thread-1", &turns);
+
+        assert_eq!(events[0].event_type, SessionEventType::ReasoningSummary);
+        assert_eq!(
+            events[0].payload["text"],
+            json!("Reviewed the bridge boundary")
+        );
+        assert!(
+            !events[0].payload["text"]
+                .as_str()
+                .unwrap()
+                .contains("private")
+        );
+        assert_eq!(events[1].event_type, SessionEventType::Plan);
+        assert_eq!(events[1].payload["text"], json!("Run the regression suite"));
     }
 
     #[test]

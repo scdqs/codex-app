@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashSet,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -9,6 +12,10 @@ use crate::{
     cdp::{CdpClient, CdpTarget},
     protocol::ApprovalDecision,
 };
+
+const THREAD_LIST_PAGE_SIZE: u32 = 100;
+const MAX_THREAD_LIST_PAGES: usize = 20;
+const MAX_THREAD_LIST_ITEMS: usize = THREAD_LIST_PAGE_SIZE as usize * MAX_THREAD_LIST_PAGES;
 
 #[async_trait]
 pub trait CodexAdapter: Send + Sync {
@@ -269,15 +276,51 @@ where
     T: JsonRpcTransport,
 {
     async fn list_threads(&self) -> Result<Vec<CodexThread>, CodexRpcError> {
-        let result = self.call("thread/list", json!({})).await?;
-        let items = extract_array(&result, &["data", "threads", "items"]).ok_or(
-            CodexRpcError::InvalidResponse {
-                method: "thread/list",
-                reason: "missing thread array",
-            },
-        )?;
+        let mut threads = Vec::new();
+        let mut seen_thread_ids = HashSet::new();
+        let mut seen_cursors = HashSet::new();
+        let mut cursor: Option<String> = None;
 
-        items.iter().map(map_thread).collect::<Result<Vec<_>, _>>()
+        for _ in 0..MAX_THREAD_LIST_PAGES {
+            let mut params = json!({
+                "limit": THREAD_LIST_PAGE_SIZE,
+                "sortKey": "recency_at",
+                "sortDirection": "desc",
+            });
+            if let Some(cursor) = cursor.as_deref() {
+                params["cursor"] = json!(cursor);
+            }
+
+            let result = self.call("thread/list", params).await?;
+            let items = extract_array(&result, &["data", "threads", "items"]).ok_or(
+                CodexRpcError::InvalidResponse {
+                    method: "thread/list",
+                    reason: "missing thread array",
+                },
+            )?;
+
+            for item in items {
+                let thread = map_thread(item)?;
+                if seen_thread_ids.insert(thread.id.clone()) {
+                    threads.push(thread);
+                    if threads.len() == MAX_THREAD_LIST_ITEMS {
+                        return Ok(threads);
+                    }
+                }
+            }
+
+            let Some(next_cursor) = cursor_field(&result, &["nextCursor", "next_cursor"])
+                .filter(|next_cursor| !next_cursor.is_empty())
+            else {
+                break;
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                break;
+            }
+            cursor = Some(next_cursor);
+        }
+
+        Ok(threads)
     }
 
     async fn resume_thread(&self, thread_id: &str) -> Result<Option<CodexThread>, CodexRpcError> {
@@ -469,7 +512,10 @@ fn map_thread(value: &Value) -> Result<CodexThread, CodexRpcError> {
         model_provider: string_field(value, &["modelProvider", "model_provider"]),
         preview: string_field(value, &["preview", "summary"]),
         created_at: number_field(value, &["createdAt", "created_at"]),
-        updated_at: number_field(value, &["updatedAt", "updated_at"]),
+        updated_at: number_field(
+            value,
+            &["recencyAt", "recency_at", "updatedAt", "updated_at"],
+        ),
         raw: value.clone(),
     })
 }
@@ -648,6 +694,77 @@ mod tests {
         assert_eq!(threads[0].cwd.as_deref(), Some("/repo"));
         assert_eq!(threads[0].model_provider.as_deref(), Some("OpenAI"));
         assert_eq!(threads[0].updated_at, Some(1_725_000_000_000));
+    }
+
+    #[tokio::test]
+    async fn adapter_paginates_thread_list_and_deduplicates_threads() {
+        let transport = RecordingTransport::new(vec![
+            json!({
+                "data": [
+                    { "id": "thread-new", "updatedAt": 300_u64 },
+                    { "id": "thread-shared", "updatedAt": 200_u64 }
+                ],
+                "nextCursor": "older-cursor"
+            }),
+            json!({
+                "data": [
+                    { "id": "thread-shared", "updatedAt": 200_u64 },
+                    { "id": "thread-old", "updatedAt": 100_u64 }
+                ]
+            }),
+        ]);
+        let requests = transport.requests();
+        let client = AppServerJsonRpcClient::new(transport);
+
+        let threads = client.list_threads().await.expect("thread pages map");
+
+        assert_eq!(
+            threads
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thread-new", "thread-shared", "thread-old"]
+        );
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].params,
+            json!({
+                "limit": 100,
+                "sortKey": "recency_at",
+                "sortDirection": "desc"
+            })
+        );
+        assert_eq!(
+            requests[1].params,
+            json!({
+                "limit": 100,
+                "sortKey": "recency_at",
+                "sortDirection": "desc",
+                "cursor": "older-cursor"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn adapter_stops_thread_pagination_when_cursor_repeats() {
+        let transport = RecordingTransport::new(vec![
+            json!({
+                "data": [{ "id": "thread-1" }],
+                "nextCursor": "loop-cursor"
+            }),
+            json!({
+                "data": [{ "id": "thread-2" }],
+                "nextCursor": "loop-cursor"
+            }),
+        ]);
+        let requests = transport.requests();
+        let client = AppServerJsonRpcClient::new(transport);
+
+        let threads = client.list_threads().await.expect("cursor loop is bounded");
+
+        assert_eq!(threads.len(), 2);
+        assert_eq!(requests.lock().expect("requests lock").len(), 2);
     }
 
     #[tokio::test]

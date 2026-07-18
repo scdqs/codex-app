@@ -15,6 +15,7 @@ import {
   AlertTriangle,
   Bot,
   Check,
+  ChevronDown,
   ChevronRight,
   CircleDot,
   Clock3,
@@ -22,9 +23,11 @@ import {
   FilePenLine,
   ImagePlus,
   Menu,
+  Pin,
   Plus,
   RefreshCw,
   Send,
+  Settings as SettingsIcon,
   ShieldAlert,
   TerminalSquare,
   UserRound,
@@ -38,6 +41,8 @@ import {
   type ConnectionLabel,
   type ConnectionViewState,
   type ApprovalDecision,
+  type AlertEvent,
+  type AlertKind,
   type ApprovalKind,
   type ApprovalRequest,
   type DecisionKind,
@@ -45,6 +50,7 @@ import {
   type ServerEnvelope,
   type SessionEvent,
   type SessionSnapshot,
+  type SessionStatus,
   type WorkspaceOption,
 } from "@codex/bridge-protocol";
 import {
@@ -68,7 +74,50 @@ import {
   type SessionEventPage,
   type SessionEventPageOptions,
 } from "./api";
-import { createDeviceSession, loadSession, saveSession, type DeviceSession } from "./storage";
+import { groupSessionsByProject } from "./project-view";
+import {
+  createDeviceSession,
+  loadProjectViewPreferences,
+  loadSession,
+  saveProjectViewPreferences,
+  saveSession,
+  type DeviceSession,
+  type ProjectViewPreferences,
+} from "./storage";
+import {
+  deletePushSubscription,
+  getNotificationSettings,
+  getPushPublicKey,
+  putNotificationSettings,
+  savePushSubscription,
+  sendTestAlert,
+  type DeviceNotificationSettings,
+  type NotificationCapabilities,
+  type NotificationSettingsResponse,
+  type PushSubscriptionState,
+} from "./notifications/api";
+import {
+  browserForegroundCapabilities,
+  type ForegroundCapabilities,
+} from "./notifications/capabilities";
+import {
+  createForegroundAlertPlayer,
+  type ForegroundAlertPlayer,
+} from "./notifications/foreground-alert-player";
+import { NotificationSettingsPage } from "./notifications/NotificationSettingsPage";
+import { NotificationOnboardingSheet } from "./notifications/NotificationOnboardingSheet";
+import {
+  dismissNotificationOnboarding,
+  hasDismissedNotificationOnboarding,
+} from "./notifications/onboarding-storage";
+import {
+  PushSubscriptionController,
+  type SystemNotificationState,
+} from "./notifications/push-subscription-controller";
+import {
+  isAlertClientMessage,
+  isOpenThreadMessage,
+} from "./notifications/push-protocol";
 
 const pairingAttempts = new Map<string, Promise<DeviceSession>>();
 const SESSION_LIST_REFRESH_MS = 5_000;
@@ -81,6 +130,25 @@ const TRANSIENT_FAILURES_BEFORE_NEW_LINK = 3;
 const MAX_DRAFT_IMAGE_ATTACHMENTS = 4;
 const MAX_DRAFT_IMAGE_BYTES = 8 * 1024 * 1024;
 const SUPPORTED_DRAFT_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const DEFAULT_NOTIFICATION_SETTINGS: DeviceNotificationSettings = {
+  enabled: false,
+  alertKinds: {
+    completed: true,
+    approvalRequired: true,
+    inputRequired: true,
+    error: true,
+  },
+  soundEnabled: true,
+  vibrationEnabled: true,
+};
+const DEFAULT_NOTIFICATION_CAPABILITIES: NotificationCapabilities = {
+  deliveryMode: "foreground_only",
+  fixedHttps: false,
+  systemNotifications: false,
+  foregroundSound: typeof window !== "undefined" && ("AudioContext" in window || "webkitAudioContext" in window),
+  foregroundVibration: typeof navigator !== "undefined" && typeof navigator.vibrate === "function",
+  vibrationControlledBySystem: false,
+};
 
 interface DraftImageAttachment {
   id: string;
@@ -105,6 +173,7 @@ interface RefreshedDeviceSession {
 }
 
 function App() {
+  const [view, setView] = useState<"workbench" | "settings">("workbench");
   const [selectedThreadId, setSelectedThreadId] = useState("");
   const [draft, setDraft] = useState("");
   const [draftImages, setDraftImages] = useState<DraftImageAttachment[]>([]);
@@ -128,6 +197,30 @@ function App() {
   const [eventSyncByThread, setEventSyncByThread] = useState<Record<string, SessionEventSyncState>>({});
   const [liveApprovals, setLiveApprovals] = useState<ApprovalRequest[]>([]);
   const [socketReconnectNonce, setSocketReconnectNonce] = useState(0);
+  const [notificationSettings, setNotificationSettings] = useState<DeviceNotificationSettings>(
+    DEFAULT_NOTIFICATION_SETTINGS,
+  );
+  const [notificationCapabilities, setNotificationCapabilities] = useState<NotificationCapabilities>(
+    DEFAULT_NOTIFICATION_CAPABILITIES,
+  );
+  const [browserNotificationCapabilities, setBrowserNotificationCapabilities] =
+    useState<ForegroundCapabilities>(() => browserForegroundCapabilities(false));
+  const [pushSubscriptionState, setPushSubscriptionState] = useState<PushSubscriptionState>(
+    "unavailable",
+  );
+  const [systemNotificationState, setSystemNotificationState] =
+    useState<SystemNotificationState>("unavailable");
+  const [notificationBusy, setNotificationBusy] = useState(false);
+  const [notificationError, setNotificationError] = useState("");
+  const [showNotificationOnboarding, setShowNotificationOnboarding] = useState(false);
+  const [soundBlocked, setSoundBlocked] = useState(false);
+  const [pendingNotificationThreadId, setPendingNotificationThreadId] = useState<string | null>(
+    readNotificationThreadIdFromUrl,
+  );
+  const [notificationDeepLinkError, setNotificationDeepLinkError] = useState("");
+  const [projectViewPreferences, setProjectViewPreferences] = useState<ProjectViewPreferences>(
+    loadProjectViewPreferences,
+  );
   const [sending, setSending] = useState(false);
   const [decidingApprovalIds, setDecidingApprovalIds] = useState<Record<string, DecisionKind>>({});
   const sessionMenuButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -139,6 +232,11 @@ function App() {
   const eventSyncByThreadRef = useRef<Record<string, SessionEventSyncState>>({});
   const draftImagesRef = useRef<DraftImageAttachment[]>([]);
   const newSessionImagesRef = useRef<DraftImageAttachment[]>([]);
+  const notificationSettingsRef = useRef(notificationSettings);
+  const alertPlayerRef = useRef<ForegroundAlertPlayer | null>(null);
+  if (!alertPlayerRef.current) {
+    alertPlayerRef.current = createForegroundAlertPlayer();
+  }
   const canSyncSessionData =
     Boolean(deviceSession) &&
     (isSessionDataEnabled(connection.label) ||
@@ -159,6 +257,14 @@ function App() {
     (connection.label === "Connected" || connection.label === "Writable") &&
     Boolean(deviceSession) &&
     sessionDataLoaded;
+  const collapsedProjectIds = useMemo(
+    () => new Set(projectViewPreferences.collapsedProjectIds),
+    [projectViewPreferences.collapsedProjectIds],
+  );
+  const pinnedThreadIds = useMemo(
+    () => new Set(projectViewPreferences.pinnedThreadIds),
+    [projectViewPreferences.pinnedThreadIds],
+  );
 
   const statusText = useMemo(() => {
     if (pendingCount > 0) {
@@ -180,6 +286,42 @@ function App() {
     setEventSyncByThread({});
     setLiveApprovals([]);
     setSelectedThreadId("");
+    setSystemNotificationState("unavailable");
+    setPushSubscriptionState("unavailable");
+  }
+
+  function updateProjectViewPreferences(
+    update: (current: ProjectViewPreferences) => ProjectViewPreferences,
+  ) {
+    setProjectViewPreferences((current) => {
+      const next = update(current);
+      saveProjectViewPreferences(next);
+      return next;
+    });
+  }
+
+  function handleToggleProject(projectId: string) {
+    updateProjectViewPreferences((current) => {
+      const collapsed = new Set(current.collapsedProjectIds);
+      if (collapsed.has(projectId)) {
+        collapsed.delete(projectId);
+      } else {
+        collapsed.add(projectId);
+      }
+      return { ...current, collapsedProjectIds: [...collapsed] };
+    });
+  }
+
+  function handleTogglePinnedThread(threadId: string) {
+    updateProjectViewPreferences((current) => {
+      const pinned = new Set(current.pinnedThreadIds);
+      if (pinned.has(threadId)) {
+        pinned.delete(threadId);
+      } else {
+        pinned.add(threadId);
+      }
+      return { ...current, pinnedThreadIds: [...pinned] };
+    });
   }
 
   async function refreshActiveSession(activeSession: DeviceSession): Promise<RefreshedDeviceSession> {
@@ -572,6 +714,101 @@ function App() {
   }, [deviceSession]);
 
   useEffect(() => {
+    notificationSettingsRef.current = notificationSettings;
+  }, [notificationSettings]);
+
+  useEffect(() => {
+    if (!deviceSession) {
+      setShowNotificationOnboarding(false);
+      return;
+    }
+    let cancelled = false;
+    void getNotificationSettings(deviceSession)
+      .then(async (response) => {
+        if (cancelled) {
+          return;
+        }
+        const browserCapabilities = browserForegroundCapabilities(response.capabilities.fixedHttps);
+        setNotificationSettings(response.settings);
+        setPushSubscriptionState(response.subscriptionState);
+        setBrowserNotificationCapabilities(browserCapabilities);
+        setNotificationCapabilities({
+          ...response.capabilities,
+          foregroundSound:
+            response.capabilities.foregroundSound && browserCapabilities.foregroundSound,
+          foregroundVibration:
+            response.capabilities.foregroundVibration && browserCapabilities.foregroundVibration,
+        });
+        const systemState = await createPushSubscriptionController(deviceSession).inspect(
+          browserCapabilities,
+          response.subscriptionState,
+        );
+        if (cancelled) {
+          return;
+        }
+        setSystemNotificationState(systemState);
+        setNotificationError("");
+        setShowNotificationOnboarding(
+          !hasDismissedNotificationOnboarding(deviceSession.deviceId),
+        );
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setNotificationError(
+            error instanceof Error ? error.message : "Unable to load notification settings",
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceSession]);
+
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) {
+      return;
+    }
+    function handleServiceWorkerMessage(event: MessageEvent) {
+      if (isAlertClientMessage(event.data)) {
+        handleForegroundAlert(
+          event.data.payload,
+          alertPlayerRef.current,
+          notificationSettingsRef.current,
+          setSoundBlocked,
+        );
+        return;
+      }
+      if (isOpenThreadMessage(event.data)) {
+        setNotificationDeepLinkError("");
+        setPendingNotificationThreadId(event.data.threadId);
+      }
+    }
+    navigator.serviceWorker.addEventListener("message", handleServiceWorkerMessage);
+    return () => {
+      navigator.serviceWorker.removeEventListener("message", handleServiceWorkerMessage);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!liveSessions || !pendingNotificationThreadId) {
+      return;
+    }
+    const target = liveSessions.find(
+      (session) => session.threadId === pendingNotificationThreadId,
+    );
+    if (target) {
+      setSelectedThreadId(target.threadId);
+      setView("workbench");
+      setIsSessionDrawerOpen(false);
+      setNotificationDeepLinkError("");
+    } else {
+      setNotificationDeepLinkError("Session is no longer available");
+    }
+    setPendingNotificationThreadId(null);
+    clearNotificationThreadParamFromUrl();
+  }, [liveSessions, pendingNotificationThreadId]);
+
+  useEffect(() => {
     if (!deviceSession || !isSessionDataEnabled(connection.label) || typeof WebSocket === "undefined") {
       return;
     }
@@ -582,7 +819,20 @@ function App() {
       if (!envelope) {
         return;
       }
-      handleServerEnvelope(envelope, setLiveSessions, setEventsByThread, setLiveApprovals);
+      handleServerEnvelope(
+        envelope,
+        setLiveSessions,
+        setEventsByThread,
+        setLiveApprovals,
+        (alert) => {
+          handleForegroundAlert(
+            alert,
+            alertPlayerRef.current,
+            notificationSettingsRef.current,
+            setSoundBlocked,
+          );
+        },
+      );
     };
 
     return () => {
@@ -861,6 +1111,7 @@ function App() {
   }
 
   function handleSelectSession(threadId: string) {
+    setNotificationDeepLinkError("");
     setSelectedThreadId(threadId);
     handleCloseSessionDrawer();
   }
@@ -953,8 +1204,219 @@ function App() {
     setNewSessionAttachmentError("");
   }
 
+  async function handleSaveNotificationSettings(next: DeviceNotificationSettings) {
+    if (!deviceSession || notificationBusy) {
+      return;
+    }
+    setNotificationBusy(true);
+    setNotificationError("");
+    try {
+      const response = await putNotificationSettings(deviceSession, next);
+      await applyNotificationResponse(deviceSession, response);
+    } catch (error) {
+      setNotificationError(
+        error instanceof Error ? error.message : "Unable to save notification settings",
+      );
+    } finally {
+      setNotificationBusy(false);
+    }
+  }
+
+  async function applyNotificationResponse(
+    activeSession: DeviceSession,
+    response: NotificationSettingsResponse,
+  ) {
+    const browserCapabilities = browserForegroundCapabilities(response.capabilities.fixedHttps);
+    setNotificationSettings(response.settings);
+    setPushSubscriptionState(response.subscriptionState);
+    setBrowserNotificationCapabilities(browserCapabilities);
+    setNotificationCapabilities({
+      ...response.capabilities,
+      foregroundSound:
+        response.capabilities.foregroundSound && browserCapabilities.foregroundSound,
+      foregroundVibration:
+        response.capabilities.foregroundVibration && browserCapabilities.foregroundVibration,
+    });
+    setSystemNotificationState(
+      await createPushSubscriptionController(activeSession).inspect(
+        browserCapabilities,
+        response.subscriptionState,
+      ),
+    );
+  }
+
+  function handleOpenSettings() {
+    setIsSessionDrawerOpen(false);
+    setView("settings");
+  }
+
+  async function handlePreviewAlert(kind: AlertKind) {
+    try {
+      await alertPlayerRef.current?.preview(kind);
+      setSoundBlocked(false);
+    } catch {
+      setSoundBlocked(true);
+    }
+  }
+
+  async function handleSendTestAlert() {
+    if (!deviceSession) {
+      return;
+    }
+    setNotificationBusy(true);
+    setNotificationError("");
+    try {
+      await alertPlayerRef.current?.unlock();
+      await sendTestAlert(deviceSession);
+    } catch (error) {
+      setNotificationError(error instanceof Error ? error.message : "Unable to send test alert");
+    } finally {
+      setNotificationBusy(false);
+    }
+  }
+
+  async function handleEnableSystemNotifications() {
+    const activeSession = deviceSession;
+    if (!activeSession || notificationBusy) {
+      return;
+    }
+    setNotificationBusy(true);
+    setNotificationError("");
+    try {
+      try {
+        await alertPlayerRef.current?.unlock();
+      } catch {
+        setSoundBlocked(true);
+      }
+      const controller = createPushSubscriptionController(activeSession);
+      await controller.enable(browserNotificationCapabilities);
+      const response = await putNotificationSettings(activeSession, {
+        ...notificationSettings,
+        enabled: true,
+      });
+      await applyNotificationResponse(activeSession, response);
+      await sendTestAlert(activeSession);
+    } catch (error) {
+      setNotificationError(notificationActionError(error));
+      setSystemNotificationState(
+        await createPushSubscriptionController(activeSession).inspect(
+          browserNotificationCapabilities,
+          pushSubscriptionState,
+        ),
+      );
+    } finally {
+      setNotificationBusy(false);
+    }
+  }
+
+  async function handleRepairSystemNotifications() {
+    const activeSession = deviceSession;
+    if (!activeSession || notificationBusy) {
+      return;
+    }
+    setNotificationBusy(true);
+    setNotificationError("");
+    try {
+      const controller = createPushSubscriptionController(activeSession);
+      await controller.repair(browserNotificationCapabilities);
+      const response = await putNotificationSettings(activeSession, {
+        ...notificationSettings,
+        enabled: true,
+      });
+      await applyNotificationResponse(activeSession, response);
+      await sendTestAlert(activeSession);
+    } catch (error) {
+      setNotificationError(notificationActionError(error));
+      setSystemNotificationState("needs_repair");
+    } finally {
+      setNotificationBusy(false);
+    }
+  }
+
+  async function handleDisableAlerts() {
+    const activeSession = deviceSession;
+    if (!activeSession || notificationBusy) {
+      return;
+    }
+    setNotificationBusy(true);
+    setNotificationError("");
+    try {
+      const response = await putNotificationSettings(activeSession, {
+        ...notificationSettings,
+        enabled: false,
+      });
+      await applyNotificationResponse(activeSession, response);
+      try {
+        await createPushSubscriptionController(activeSession).disable();
+        setPushSubscriptionState(
+          response.subscriptionState === "unavailable" ? "unavailable" : "not_enabled",
+        );
+        setSystemNotificationState(
+          response.subscriptionState === "unavailable" ? "unavailable" : "not_enabled",
+        );
+      } catch (error) {
+        setNotificationError(notificationActionError(error));
+        setSystemNotificationState("needs_repair");
+      }
+    } catch (error) {
+      setNotificationError(notificationActionError(error));
+    } finally {
+      setNotificationBusy(false);
+    }
+  }
+
+  async function handleEnableNotificationOnboarding() {
+    const activeSession = deviceSession;
+    if (!activeSession || notificationBusy) {
+      return;
+    }
+    setNotificationBusy(true);
+    setNotificationError("");
+    try {
+      await alertPlayerRef.current?.unlock();
+    } catch {
+      setSoundBlocked(true);
+    }
+    try {
+      if (browserNotificationCapabilities.fixedHttps) {
+        await createPushSubscriptionController(activeSession).enable(
+          browserNotificationCapabilities,
+        );
+      }
+      const response = await putNotificationSettings(activeSession, {
+        ...DEFAULT_NOTIFICATION_SETTINGS,
+        enabled: true,
+      });
+      await applyNotificationResponse(activeSession, response);
+      dismissNotificationOnboarding(activeSession.deviceId);
+      setShowNotificationOnboarding(false);
+      try {
+        await sendTestAlert(activeSession);
+      } catch {
+        setNotificationError("Alerts were enabled, but the test alert could not be sent");
+      }
+    } catch (error) {
+      setNotificationError(notificationActionError(error));
+    } finally {
+      setNotificationBusy(false);
+    }
+  }
+
+  function handleDismissNotificationOnboarding() {
+    if (deviceSession) {
+      dismissNotificationOnboarding(deviceSession.deviceId);
+    }
+    setShowNotificationOnboarding(false);
+  }
+
   return (
     <main className="app-shell" aria-label="Codex mobile workbench">
+      {notificationDeepLinkError ? (
+        <p className="notification-deep-link-error" role="alert">
+          {notificationDeepLinkError}
+        </p>
+      ) : null}
+      <div className="app-view workbench-app-view" hidden={view !== "workbench"}>
       <ConnectionBar
         bridgeVersion={bridgeVersion}
         connection={connection}
@@ -979,6 +1441,10 @@ function App() {
         <section className="session-grid" aria-label="Sessions and detail">
           <div className="desktop-session-panel">
             <SessionList
+              collapsedProjectIds={collapsedProjectIds}
+              onTogglePinned={handleTogglePinnedThread}
+              onToggleProject={handleToggleProject}
+              pinnedThreadIds={pinnedThreadIds}
               sessions={sessions}
               selectedThreadId={selectedSession?.threadId ?? ""}
               onSelect={setSelectedThreadId}
@@ -999,13 +1465,18 @@ function App() {
       </section>
 
       <SessionDrawer
+        collapsedProjectIds={collapsedProjectIds}
         isOpen={isSessionDrawerOpen}
         newSessionDisabled={!canCreateSession || sending}
         onCreateSession={handleOpenNewSession}
         sessions={sessions}
         selectedThreadId={selectedSession?.threadId ?? ""}
         onClose={handleCloseSessionDrawer}
+        onOpenSettings={handleOpenSettings}
         onSelect={handleSelectSession}
+        onTogglePinned={handleTogglePinnedThread}
+        onToggleProject={handleToggleProject}
+        pinnedThreadIds={pinnedThreadIds}
       />
 
       <NewSessionSheet
@@ -1041,6 +1512,47 @@ function App() {
         onRemoveAttachment={handleRemoveDraftImage}
         onSubmit={handleSubmit}
       />
+      </div>
+
+      <div className="settings-app-view" hidden={view !== "settings"}>
+        <NotificationSettingsPage
+          busy={notificationBusy}
+          browserCapabilities={browserNotificationCapabilities}
+          capabilities={notificationCapabilities}
+          error={notificationError}
+          onBack={() => setView("workbench")}
+          onChange={(settings) => void handleSaveNotificationSettings(settings)}
+          onDisableAlerts={() => void handleDisableAlerts()}
+          onEnableSystemNotifications={() => void handleEnableSystemNotifications()}
+          onPreview={(kind) => void handlePreviewAlert(kind)}
+          onRepairSystemNotifications={() => void handleRepairSystemNotifications()}
+          onSendTest={() => void handleSendTestAlert()}
+          settings={notificationSettings}
+          systemNotificationState={systemNotificationState}
+        />
+      </div>
+
+      {soundBlocked ? (
+        <button
+          className="sound-unlock-prompt"
+          onClick={() => void alertPlayerRef.current?.unlock().then(() => setSoundBlocked(false))}
+          type="button"
+        >
+          Tap to enable sound
+        </button>
+      ) : null}
+
+      {showNotificationOnboarding ? (
+        <NotificationOnboardingSheet
+          busy={notificationBusy}
+          error={notificationError}
+          fixedHttps={notificationCapabilities.fixedHttps}
+          isIos={browserNotificationCapabilities.isIos}
+          onEnable={() => void handleEnableNotificationOnboarding()}
+          onNotNow={handleDismissNotificationOnboarding}
+          standalone={browserNotificationCapabilities.standalone}
+        />
+      ) : null}
     </main>
   );
 }
@@ -1177,19 +1689,29 @@ function ApprovalQueue({
 }
 
 function SessionDrawer({
+  collapsedProjectIds,
   isOpen,
   newSessionDisabled,
   onClose,
   onCreateSession,
+  onOpenSettings,
   onSelect,
+  onTogglePinned,
+  onToggleProject,
+  pinnedThreadIds,
   selectedThreadId,
   sessions,
 }: {
+  collapsedProjectIds: ReadonlySet<string>;
   isOpen: boolean;
   newSessionDisabled: boolean;
   onClose: () => void;
   onCreateSession: () => void;
+  onOpenSettings: () => void;
   onSelect: (threadId: string) => void;
+  onTogglePinned: (threadId: string) => void;
+  onToggleProject: (projectId: string) => void;
+  pinnedThreadIds: ReadonlySet<string>;
   selectedThreadId: string;
   sessions: SessionSnapshot[];
 }) {
@@ -1240,13 +1762,30 @@ function SessionDrawer({
               <Plus size={14} aria-hidden="true" />
               New
             </button>
+            <button
+              className="icon-button"
+              onClick={onOpenSettings}
+              title="Settings"
+              type="button"
+              aria-label="Open settings"
+            >
+              <SettingsIcon size={16} aria-hidden="true" />
+            </button>
             <span>{sessions.length}</span>
             <button ref={closeButtonRef} className="icon-button" onClick={onClose} type="button" aria-label="Close sessions">
               <X size={16} aria-hidden="true" />
             </button>
           </div>
         </div>
-        <SessionList sessions={sessions} selectedThreadId={selectedThreadId} onSelect={onSelect} />
+        <SessionList
+          collapsedProjectIds={collapsedProjectIds}
+          onSelect={onSelect}
+          onTogglePinned={onTogglePinned}
+          onToggleProject={onToggleProject}
+          pinnedThreadIds={pinnedThreadIds}
+          sessions={sessions}
+          selectedThreadId={selectedThreadId}
+        />
       </aside>
     </div>
   );
@@ -1429,15 +1968,27 @@ function NewSessionSheet({
 }
 
 function SessionList({
+  collapsedProjectIds,
   onSelect,
+  onTogglePinned,
+  onToggleProject,
+  pinnedThreadIds,
   selectedThreadId,
   sessions: sessionItems,
 }: {
+  collapsedProjectIds: ReadonlySet<string>;
   onSelect: (threadId: string) => void;
+  onTogglePinned: (threadId: string) => void;
+  onToggleProject: (projectId: string) => void;
+  pinnedThreadIds: ReadonlySet<string>;
   selectedThreadId: string;
   sessions: SessionSnapshot[];
 }) {
   const headingId = useId();
+  const projectGroups = useMemo(
+    () => groupSessionsByProject(sessionItems, pinnedThreadIds),
+    [pinnedThreadIds, sessionItems],
+  );
 
   return (
     <section className="session-list-panel" aria-labelledby={headingId}>
@@ -1451,30 +2002,69 @@ function SessionList({
             No live sessions yet. Use the newest pairing URL from the bridge terminal.
           </div>
         ) : null}
-        {sessionItems.map((session) => {
-          const selected = session.threadId === selectedThreadId;
+        {projectGroups.map((project) => {
+          const collapsed = collapsedProjectIds.has(project.id);
           return (
-            <button
-              aria-current={selected ? "true" : undefined}
-              className="session-row"
-              key={session.threadId}
-              onClick={() => onSelect(session.threadId)}
-              type="button"
-            >
-              <span className={`session-state ${session.status}`} aria-hidden="true">
-                <CircleDot size={14} />
-              </span>
-              <span className="session-row-body">
-                <span className="session-title-line">
-                  <strong>{session.title}</strong>
-                  {session.pendingApprovalIds.length > 0 ? (
-                    <span className="pending-pill">{session.pendingApprovalIds.length}</span>
-                  ) : null}
-                </span>
-                <span>{session.preview}</span>
-              </span>
-              <ChevronRight size={15} aria-hidden="true" />
-            </button>
+            <section className="session-project" key={project.id} aria-label={`${project.label} project`}>
+              <button
+                aria-expanded={!collapsed}
+                className="session-project-toggle"
+                onClick={() => onToggleProject(project.id)}
+                title={project.cwd ?? project.label}
+                type="button"
+              >
+                {collapsed ? <ChevronRight size={14} aria-hidden="true" /> : <ChevronDown size={14} aria-hidden="true" />}
+                <strong>{project.label}</strong>
+                <span>{project.sessions.length}</span>
+              </button>
+              {!collapsed ? (
+                <div className="session-project-threads" role="list">
+                  {project.sessions.map((session) => {
+                    const selected = session.threadId === selectedThreadId;
+                    const pinned = pinnedThreadIds.has(session.threadId);
+                    return (
+                      <div
+                        className={`session-row${selected ? " selected" : ""}`}
+                        key={session.threadId}
+                        role="listitem"
+                      >
+                        <button
+                          aria-label={session.title}
+                          aria-current={selected ? "true" : undefined}
+                          className="session-row-select"
+                          onClick={() => onSelect(session.threadId)}
+                          type="button"
+                        >
+                          <span className={`session-state ${session.status}`} aria-hidden="true">
+                            <CircleDot size={14} />
+                          </span>
+                          <span className="session-row-body">
+                            <span className="session-title-line">
+                              <strong>{session.title}</strong>
+                              {session.pendingApprovalIds.length > 0 ? (
+                                <span className="pending-pill">{session.pendingApprovalIds.length}</span>
+                              ) : null}
+                            </span>
+                            <span>{session.preview}</span>
+                          </span>
+                          <ChevronRight size={15} aria-hidden="true" />
+                        </button>
+                        <button
+                          aria-label={`${pinned ? "Unpin" : "Pin"} ${session.title}`}
+                          aria-pressed={pinned}
+                          className={`session-pin-button${pinned ? " pinned" : ""}`}
+                          onClick={() => onTogglePinned(session.threadId)}
+                          title={pinned ? "Unpin on this phone" : "Pin on this phone"}
+                          type="button"
+                        >
+                          <Pin size={13} aria-hidden="true" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </section>
           );
         })}
       </div>
@@ -1635,7 +2225,12 @@ function SessionDetail({
           </div>
         ) : null}
         {sessionEvents.map((event) => (
-          <EventRow assetSession={assetSession} event={event} key={event.id} />
+          <EventRow
+            assetSession={assetSession}
+            event={event}
+            key={event.id}
+            sessionStatus={session.status}
+          />
         ))}
       </div>
     </section>
@@ -1645,12 +2240,25 @@ function SessionDetail({
 function EventRow({
   assetSession,
   event,
+  sessionStatus,
 }: {
   assetSession: DeviceSession | null;
   event: SessionEvent;
+  sessionStatus: SessionStatus;
 }) {
   const attachments = payloadImageAttachments(event.payload);
   const actor = eventActor(event);
+
+  if (event.type === "reasoning_summary" || event.type === "reasoning_summary_delta") {
+    return (
+      <article className="event-row system reasoning-event">
+        <span className="event-icon" aria-hidden="true">
+          <Clock3 size={14} />
+        </span>
+        <ReasoningBlock event={event} sessionStatus={sessionStatus} />
+      </article>
+    );
+  }
 
   return (
     <article className={`event-row ${actor}`}>
@@ -1679,10 +2287,47 @@ function EventRow({
   );
 }
 
+function ReasoningBlock({
+  event,
+  sessionStatus,
+}: {
+  event: SessionEvent;
+  sessionStatus: SessionStatus;
+}) {
+  const [open, setOpen] = useState(sessionStatus === "running");
+
+  useEffect(() => {
+    if (sessionStatus === "running") {
+      setOpen(true);
+    }
+  }, [sessionStatus]);
+
+  return (
+    <details
+      className="reasoning-block"
+      onToggle={(toggleEvent) => setOpen(toggleEvent.currentTarget.open)}
+      open={open}
+    >
+      <summary>
+        <span>Thinking</span>
+        <time dateTime={new Date(event.createdAt).toISOString()}>{formatEventTime(event.createdAt)}</time>
+      </summary>
+      <div className="reasoning-body">
+        <MessageBody text={payloadText(event.payload)} />
+      </div>
+    </details>
+  );
+}
+
 type EventActor = "assistant" | "system" | "user";
 
 function eventActor(event: SessionEvent): EventActor {
-  if (event.type !== "message" || !event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) {
+  if (
+    !matchesMessageEvent(event.type) ||
+    !event.payload ||
+    typeof event.payload !== "object" ||
+    Array.isArray(event.payload)
+  ) {
     return "system";
   }
 
@@ -1700,7 +2345,13 @@ function eventIcon(event: SessionEvent, actor: EventActor) {
   if (actor === "assistant") {
     return <Bot size={14} />;
   }
-  return event.type === "tool_call" ? <TerminalSquare size={14} /> : <Clock3 size={14} />;
+  if (event.type === "tool_call") {
+    return <TerminalSquare size={14} />;
+  }
+  if (event.type === "plan" || event.type === "plan_delta") {
+    return <Command size={14} />;
+  }
+  return <Clock3 size={14} />;
 }
 
 function eventKindLabel(event: SessionEvent, actor: EventActor) {
@@ -1710,7 +2361,14 @@ function eventKindLabel(event: SessionEvent, actor: EventActor) {
   if (actor === "assistant") {
     return "Codex";
   }
+  if (event.type === "plan" || event.type === "plan_delta") {
+    return "Plan";
+  }
   return event.type.replace("_", " ");
+}
+
+function matchesMessageEvent(type: SessionEvent["type"]): boolean {
+  return type === "message" || type === "message_delta";
 }
 
 function formatEventTime(timestamp: number) {
@@ -2333,6 +2991,16 @@ export function mergeSessionEvents(events: SessionEvent[]): SessionEvent[] {
 export function appendOrMergeSessionEvent(events: SessionEvent[], event: SessionEvent): SessionEvent[] {
   const existingIndex = events.findIndex((existing) => existing.id === event.id);
   if (existingIndex !== -1) {
+    const baseType = baseEventTypeForDelta(event.type);
+    if (baseType && canAppendStreamDelta(events[existingIndex], baseType)) {
+      const delta = deltaText(event.payload);
+      if (!delta) {
+        return events;
+      }
+      const nextEvents = [...events];
+      nextEvents[existingIndex] = streamedEvent(events[existingIndex], baseType, delta, event.createdAt);
+      return nextEvents;
+    }
     if (isSameSessionEvent(events[existingIndex], event)) {
       return events;
     }
@@ -2355,7 +3023,8 @@ export function appendOrMergeSessionEvent(events: SessionEvent[], event: Session
     }
   }
 
-  if (event.type !== "message_delta") {
+  const baseType = baseEventTypeForDelta(event.type);
+  if (!baseType) {
     return [...events, event];
   }
 
@@ -2368,17 +3037,10 @@ export function appendOrMergeSessionEvent(events: SessionEvent[], event: Session
   if (
     candidate &&
     candidate.threadId === event.threadId &&
-    (candidate.type === "message_delta" || isAssistantMessage(candidate))
+    canAppendStreamDelta(candidate, baseType)
   ) {
     const nextEvents = [...events];
-    nextEvents[nextEvents.length - 1] = {
-      ...candidate,
-      payload: {
-        role: "assistant",
-        text: `${payloadText(candidate.payload)}${delta}`,
-      },
-      createdAt: event.createdAt,
-    };
+    nextEvents[nextEvents.length - 1] = streamedEvent(candidate, baseType, delta, event.createdAt);
     return nextEvents;
   }
 
@@ -2386,9 +3048,64 @@ export function appendOrMergeSessionEvent(events: SessionEvent[], event: Session
     ...events,
     {
       ...event,
-      payload: { role: "assistant", text: delta },
+      type: baseType,
+      payload: { role: streamingRole(baseType), text: delta },
     },
   ];
+}
+
+type StreamingBaseEventType = "message" | "reasoning_summary" | "plan";
+
+function baseEventTypeForDelta(type: SessionEvent["type"]): StreamingBaseEventType | null {
+  switch (type) {
+    case "message_delta":
+      return "message";
+    case "reasoning_summary_delta":
+      return "reasoning_summary";
+    case "plan_delta":
+      return "plan";
+    default:
+      return null;
+  }
+}
+
+function eventFamily(type: SessionEvent["type"]): StreamingBaseEventType | null {
+  return baseEventTypeForDelta(type) ??
+    (type === "message" || type === "reasoning_summary" || type === "plan" ? type : null);
+}
+
+function canAppendStreamDelta(event: SessionEvent, type: StreamingBaseEventType): boolean {
+  if (type === "message") {
+    return isAssistantMessage(event);
+  }
+  return eventFamily(event.type) === type;
+}
+
+function streamingRole(type: StreamingBaseEventType): "assistant" | "reasoning" | "plan" {
+  if (type === "reasoning_summary") {
+    return "reasoning";
+  }
+  if (type === "plan") {
+    return "plan";
+  }
+  return "assistant";
+}
+
+function streamedEvent(
+  current: SessionEvent,
+  type: StreamingBaseEventType,
+  delta: string,
+  createdAt: number,
+): SessionEvent {
+  return {
+    ...current,
+    type,
+    payload: {
+      role: streamingRole(type),
+      text: `${payloadText(current.payload)}${delta}`,
+    },
+    createdAt,
+  };
 }
 
 function isSameSessionEvent(left: SessionEvent, right: SessionEvent): boolean {
@@ -2785,6 +3502,7 @@ function handleServerEnvelope(
   setLiveSessions: Dispatch<SetStateAction<SessionSnapshot[] | null>>,
   setEventsByThread: Dispatch<SetStateAction<Record<string, SessionEvent[]>>>,
   setApprovals: Dispatch<SetStateAction<ApprovalRequest[]>>,
+  onAlert: (event: AlertEvent) => void,
 ): void {
   switch (envelope.type) {
     case "session_snapshot":
@@ -2797,6 +3515,9 @@ function handleServerEnvelope(
           appendOrMergeSessionEvent(current[envelope.payload.threadId] ?? [], envelope.payload),
         ),
       }));
+      break;
+    case "alert_event":
+      onAlert(envelope.payload);
       break;
     case "approval_request":
       setApprovals((current) => upsertApproval(current, envelope.payload));
@@ -2846,6 +3567,54 @@ function clearPairingParamsFromUrl(): void {
   if (changed) {
     window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
   }
+}
+
+function readNotificationThreadIdFromUrl(): string | null {
+  const threadId = new URL(window.location.href).searchParams.get("threadId");
+  return threadId && threadId.length <= 256 ? threadId : null;
+}
+
+function clearNotificationThreadParamFromUrl(): void {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("threadId")) {
+    return;
+  }
+  url.searchParams.delete("threadId");
+  window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+}
+
+function createPushSubscriptionController(session: DeviceSession): PushSubscriptionController {
+  return new PushSubscriptionController({
+    permission: () =>
+      typeof Notification === "undefined" ? "default" : Notification.permission,
+    requestPermission: () => Notification.requestPermission(),
+    getPublicKey: () => getPushPublicKey(session),
+    getSubscription: async () =>
+      (await navigator.serviceWorker.ready).pushManager.getSubscription(),
+    subscribe: async (options) =>
+      (await navigator.serviceWorker.ready).pushManager.subscribe(options),
+    saveSubscription: ({ origin, subscription }) =>
+      savePushSubscription(session, origin, subscription),
+    deleteServerSubscription: () => deletePushSubscription(session),
+    origin: () => window.location.origin,
+  });
+}
+
+function handleForegroundAlert(
+  alert: AlertEvent,
+  player: ForegroundAlertPlayer | null,
+  settings: DeviceNotificationSettings,
+  setSoundBlocked: Dispatch<SetStateAction<boolean>>,
+): void {
+  void player?.handle(alert, settings).then((result) => {
+    if (result.soundBlocked) {
+      setSoundBlocked(true);
+    }
+  });
+}
+
+function notificationActionError(error: unknown): string {
+  return error instanceof Error ? error.message : "Unable to update notifications";
 }
 
 function connectionClass(label: ConnectionLabel): string {

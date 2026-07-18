@@ -133,6 +133,12 @@ pub fn redact_sensitive_text(text: &str) -> String {
     redacted = redact_assignment_value(&redacted, "VAPID_PRIVATE_KEY");
     redacted = redact_assignment_value(&redacted, "VAPID_SECRET");
     redacted = redact_assignment_value(&redacted, "vapid-private-key");
+    redacted = redact_after_marker_with_replacement(
+        &redacted,
+        "CODEX_MOBILE_BRIDGE_VAPID_KEY_FILE=",
+        false,
+        REDACTED_PATH,
+    );
     redacted = redact_assignment_value(&redacted, "OPENAI_API_KEY");
     redacted = redact_assignment_value(&redacted, "ANTHROPIC_API_KEY");
     redacted = redact_after_marker(&redacted, "--token ", false);
@@ -147,9 +153,48 @@ pub fn redact_sensitive_text(text: &str) -> String {
     redacted = redact_after_marker(&redacted, "\"p256dh\": \"", false);
     redacted = redact_after_marker(&redacted, "\"auth\":\"", false);
     redacted = redact_after_marker(&redacted, "\"auth\": \"", false);
+    redacted = redact_push_endpoints(&redacted);
     redacted = redact_api_key_like_tokens(&redacted);
     redacted = redact_uuid_like_tokens(&redacted);
     redact_local_paths(&redacted)
+}
+
+fn redact_push_endpoints(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for (marker, quoted) in [
+        ("endpoint=", false),
+        ("\"endpoint\":\"", true),
+        ("\"endpoint\": \"", true),
+    ] {
+        redacted = redact_endpoint_after_marker(&redacted, marker, quoted);
+    }
+    redacted
+}
+
+fn redact_endpoint_after_marker(text: &str, marker: &str, quoted: bool) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(index) = remaining.find(marker) {
+        let value_start = index + marker.len();
+        output.push_str(&remaining[..value_start]);
+        let value = &remaining[value_start..];
+        let value_end = if quoted {
+            value.find('"').unwrap_or(value.len())
+        } else {
+            value.find(char::is_whitespace).unwrap_or(value.len())
+        };
+        let endpoint = &value[..value_end];
+        let host = url::Url::parse(endpoint)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "invalid-endpoint".to_string());
+        output.push_str("https://");
+        output.push_str(&host);
+        output.push_str("/[REDACTED]");
+        remaining = &value[value_end..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 fn redact_header_value(text: &str, header_name: &str) -> String {
@@ -365,6 +410,29 @@ mod tests {
             assert!(!redacted.contains(secret));
         }
         assert!(redacted.contains(REDACTED_SECRET));
+    }
+
+    #[test]
+    fn redacts_vapid_and_subscription_material() {
+        let input = concat!(
+            "CODEX_MOBILE_BRIDGE_VAPID_KEY_FILE=/Users/damon/vapid-secret\n",
+            "VAPID_PRIVATE_KEY=private-base64-value\n",
+            "p256dh=public-client-key auth=client-auth-secret\n",
+            "endpoint=https://fcm.googleapis.com/fcm/send/private-path?token=private-query"
+        );
+
+        let redacted = redact_sensitive_text(input);
+
+        for secret in [
+            "private-base64-value",
+            "public-client-key",
+            "client-auth-secret",
+            "private-path",
+            "private-query",
+        ] {
+            assert!(!redacted.contains(secret));
+        }
+        assert!(redacted.contains("fcm.googleapis.com"));
     }
 
     #[test]

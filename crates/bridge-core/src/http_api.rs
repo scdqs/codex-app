@@ -15,9 +15,12 @@ use axum::{
     http::{HeaderMap, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -29,17 +32,31 @@ use tower_http::{
 use uuid::Uuid;
 
 use crate::{
+    alert_detector::detect_alerts,
     approval::ApprovalDetector,
-    codex_rpc::{CodexAdapter, CodexRpcError, UserImageAttachment},
+    codex_rpc::{
+        CodexAdapter, CodexPendingApproval, CodexRawEvent, CodexRpcError, UserImageAttachment,
+    },
     diagnostics::DiagnosticsReport,
     event_hub::EventHub,
     local_assets::LocalAssetRegistry,
     normalizer::Normalizer,
+    notification_dispatcher::NotificationDispatcher,
+    notification_store::{
+        AlertKindSettings, DeviceNotificationSettings, NotificationStore,
+        PushSubscriptionDiagnostic, PushSubscriptionRecord,
+    },
     pairing::{DEFAULT_PAIRING_TOKEN_TTL_MS, PairingError, PairingManager},
     protocol::{
-        ApiErrorCode, ApprovalDecision, ApprovalKind, ApprovalRequest, DecisionKind,
-        ServerEnvelope, SessionEvent, SessionEventType, SessionSnapshot, SessionStatus,
+        AlertEvent, AlertKind, ApiErrorCode, ApprovalDecision, ApprovalKind, ApprovalRequest,
+        DecisionKind, ServerEnvelope, SessionEvent, SessionEventType, SessionSnapshot,
+        SessionStatus,
     },
+    public_access::{
+        DeliveryMode, NotificationCapabilities, PublicAccessContext, PublicAccessMode,
+        PublicAccessState, SubscriptionState,
+    },
+    vapid::VapidRuntimeKey,
     workspace::{WorkspaceValidationError, validate_workspace, workspace_options},
 };
 
@@ -57,6 +74,10 @@ pub struct AppState {
     instance_id: Arc<str>,
     codex_adapter: Option<Arc<dyn CodexAdapter>>,
     diagnostics: Arc<RwLock<DiagnosticsReport>>,
+    notification_store: Arc<Mutex<NotificationStore>>,
+    notification_dispatcher: NotificationDispatcher,
+    public_access: PublicAccessState,
+    vapid_key: Option<Arc<VapidRuntimeKey>>,
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +123,45 @@ const CLIENT_MESSAGE_ID_HEADER: &str = "x-codex-client-message-id";
 #[derive(Debug, Clone)]
 struct AuthenticatedDevice {
     device_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct NotificationSettingsInput {
+    enabled: bool,
+    alert_kinds: AlertKindSettings,
+    sound_enabled: bool,
+    vibration_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationSettingsResponse {
+    settings: NotificationSettingsInput,
+    capabilities: NotificationCapabilities,
+    subscription_state: SubscriptionState,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PushPublicKeyResponse {
+    public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PushSubscriptionRequest {
+    origin: String,
+    endpoint: String,
+    keys: PushSubscriptionKeysRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PushSubscriptionKeysRequest {
+    p256dh: String,
+    auth: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,12 +304,26 @@ struct ErrorResponse {
     error: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlDiagnosticsResponse {
+    #[serde(flatten)]
+    diagnostics: DiagnosticsReport,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    push_subscriptions: Vec<PushSubscriptionDiagnostic>,
+}
+
 impl AppState {
     pub fn new(
         pairing: PairingManager,
         event_hub: EventHub,
         control_token: impl Into<Arc<str>>,
     ) -> Self {
+        let notification_store = Arc::new(Mutex::new(
+            NotificationStore::open_in_memory().expect("in-memory notification store initializes"),
+        ));
+        let notification_dispatcher =
+            NotificationDispatcher::new(Arc::clone(&notification_store), event_hub.clone());
         Self {
             pairing: Arc::new(Mutex::new(pairing)),
             event_hub,
@@ -263,6 +337,10 @@ impl AppState {
             instance_id: Arc::<str>::from(Uuid::new_v4().to_string()),
             codex_adapter: None,
             diagnostics: Arc::new(RwLock::new(DiagnosticsReport::default())),
+            notification_store,
+            notification_dispatcher,
+            public_access: PublicAccessState::default(),
+            vapid_key: None,
         }
     }
 
@@ -283,6 +361,34 @@ impl AppState {
         }
     }
 
+    pub fn with_notification_store(
+        mut self,
+        notification_store: Arc<Mutex<NotificationStore>>,
+    ) -> Self {
+        self.notification_store = Arc::clone(&notification_store);
+        self.notification_dispatcher =
+            NotificationDispatcher::new(notification_store, self.event_hub.clone());
+        self
+    }
+
+    pub fn with_public_access(mut self, public_access: PublicAccessState) -> Self {
+        self.public_access = public_access;
+        self
+    }
+
+    pub fn with_vapid_key(mut self, vapid_key: Arc<VapidRuntimeKey>) -> Self {
+        self.vapid_key = Some(vapid_key);
+        self
+    }
+
+    pub fn with_push_runtime(mut self, wake: Arc<Notify>) -> Self {
+        self.notification_dispatcher = self
+            .notification_dispatcher
+            .clone()
+            .with_push_runtime(self.public_access.clone(), wake);
+        self
+    }
+
     pub fn with_local_asset_registry(self, registry: LocalAssetRegistry) -> Self {
         Self {
             local_assets: Arc::new(Mutex::new(registry)),
@@ -297,6 +403,132 @@ impl AppState {
     pub async fn publish_session_event(&self, event: SessionEvent) -> usize {
         self.record_session_event(event.clone()).await;
         self.event_hub.publish(ServerEnvelope::SessionEvent(event))
+    }
+
+    pub async fn apply_codex_notification(
+        &self,
+        notification: CodexRawEvent,
+    ) -> Option<SessionEvent> {
+        let mut event = Normalizer::event_from_raw_notification(&notification)?;
+        if event.thread_id.is_empty() {
+            return None;
+        }
+        if event.created_at == 0 {
+            event.created_at = current_time_ms();
+        }
+
+        let approval_id = self
+            .record_live_approval(&notification, &event.thread_id, event.created_at)
+            .await;
+        if let Some(snapshot) = self
+            .update_snapshot_from_live_event(&event, approval_id.as_deref())
+            .await
+        {
+            self.process_snapshot_alerts(&snapshot).await;
+        }
+
+        let event = self.register_local_assets_for_event(event).await;
+        let event = session_event_for_mobile(event);
+        self.publish_session_event(event.clone()).await;
+        Some(event)
+    }
+
+    async fn record_live_approval(
+        &self,
+        notification: &CodexRawEvent,
+        thread_id: &str,
+        created_at: u64,
+    ) -> Option<String> {
+        if !matches!(
+            notification.method.as_str(),
+            "item/commandExecution/requestApproval"
+                | "item/fileChange/requestApproval"
+                | "item/permissions/requestApproval"
+                | "mcpServer/elicitation/request"
+        ) {
+            return None;
+        }
+        let request_id = ["requestId", "request_id", "id"]
+            .iter()
+            .find_map(|key| notification.params.get(*key))
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| value.as_u64().map(|value| value.to_string()))
+            })?;
+        let pending = CodexPendingApproval {
+            thread_id: thread_id.to_string(),
+            request_id,
+            method: notification.method.clone(),
+            params: notification.params.clone(),
+        };
+        let mut approval = ApprovalDetector::detect_pending(&pending, created_at)?;
+        approval.raw = None;
+        let approval_id = approval.id.clone();
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), approval.clone());
+        self.event_hub
+            .publish(ServerEnvelope::ApprovalRequest(approval));
+        Some(approval_id)
+    }
+
+    async fn update_snapshot_from_live_event(
+        &self,
+        event: &SessionEvent,
+        approval_id: Option<&str>,
+    ) -> Option<SessionSnapshot> {
+        let status = live_status_for_event(event);
+        if status.is_none() && approval_id.is_none() {
+            return None;
+        }
+        let mut snapshot = self
+            .event_hub
+            .snapshot_for_thread(&event.thread_id)
+            .await
+            .unwrap_or_else(|| SessionSnapshot {
+                thread_id: event.thread_id.clone(),
+                title: event.thread_id.clone(),
+                cwd: None,
+                model_provider: None,
+                preview: None,
+                updated_at: event.created_at,
+                status: SessionStatus::Idle,
+                pending_approval_ids: Vec::new(),
+            });
+        if let Some(status) = status {
+            snapshot.status = status;
+        }
+        if let Some(approval_id) = approval_id
+            && !snapshot
+                .pending_approval_ids
+                .iter()
+                .any(|current| current == approval_id)
+        {
+            snapshot.pending_approval_ids.push(approval_id.to_string());
+        }
+        snapshot.updated_at = snapshot.updated_at.max(event.created_at);
+        self.event_hub.set_snapshot(snapshot.clone()).await;
+        Some(snapshot)
+    }
+
+    async fn process_snapshot_alerts(&self, snapshot: &SessionSnapshot) {
+        let events = {
+            let store = self.notification_store.lock().await;
+            let Ok(previous) = store.alert_state_for_thread(&snapshot.thread_id) else {
+                return;
+            };
+            let result = detect_alerts(previous.as_ref(), snapshot, &snapshot.pending_approval_ids);
+            if !result.ignored_as_stale && store.save_alert_state(&result.next_state).is_err() {
+                return;
+            }
+            result.events
+        };
+        for event in events {
+            let _ = self.notification_dispatcher.dispatch(event).await;
+        }
     }
 
     async fn record_session_event(&self, event: SessionEvent) {
@@ -350,6 +582,33 @@ impl AppState {
     }
 }
 
+fn live_status_for_event(event: &SessionEvent) -> Option<SessionStatus> {
+    if event.event_type == SessionEventType::StatusChanged {
+        return event
+            .payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|status| match status {
+                "idle" => Some(SessionStatus::Idle),
+                "running" => Some(SessionStatus::Running),
+                "waiting_for_input" => Some(SessionStatus::WaitingForInput),
+                "waiting_for_approval" => Some(SessionStatus::WaitingForApproval),
+                "error" => Some(SessionStatus::Error),
+                _ => None,
+            });
+    }
+
+    match event.event_type {
+        SessionEventType::MessageDelta
+        | SessionEventType::ReasoningSummaryDelta
+        | SessionEventType::PlanDelta
+        | SessionEventType::ToolCall
+        | SessionEventType::ToolResult => Some(SessionStatus::Running),
+        SessionEventType::Error => Some(SessionStatus::Error),
+        _ => None,
+    }
+}
+
 pub fn build_router(state: AppState) -> Router {
     phone_routes(state.clone())
         .merge(control_routes(state.clone()))
@@ -375,6 +634,16 @@ fn phone_routes(state: AppState) -> Router<AppState> {
         .route("/api/sessions/:thread_id/events", get(list_session_events))
         .route("/api/sessions/:thread_id/messages", post(send_message))
         .route("/api/approvals", get(list_approvals))
+        .route(
+            "/api/notification-settings",
+            get(get_notification_settings).put(put_notification_settings),
+        )
+        .route("/api/notifications/test", post(send_test_notification))
+        .route("/api/push/public-key", get(get_push_public_key))
+        .route(
+            "/api/push/subscription",
+            post(save_push_subscription).delete(delete_push_subscription),
+        )
         .route(
             "/api/approvals/:approval_id/decision",
             post(decide_approval),
@@ -405,6 +674,7 @@ fn control_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/api/control/pairing/start", post(start_pairing))
         .route("/api/control/diagnostics", get(control_diagnostics))
+        .route("/api/control/remote-access", put(set_public_access_context))
         .route("/api/control/devices", get(list_devices))
         .route("/api/control/devices/:id", delete(revoke_device))
         .route("/api/control/dev/approvals", post(trigger_dev_approval))
@@ -453,9 +723,42 @@ async fn start_pairing(
     }))
 }
 
-async fn control_diagnostics(State(state): State<AppState>) -> Json<DiagnosticsReport> {
+async fn control_diagnostics(State(state): State<AppState>) -> Json<ControlDiagnosticsResponse> {
     let diagnostics = state.diagnostics.read().await;
-    Json(diagnostics.clone())
+    let push_subscriptions = state
+        .notification_store
+        .lock()
+        .await
+        .push_subscription_diagnostics()
+        .unwrap_or_default();
+    Json(ControlDiagnosticsResponse {
+        diagnostics: diagnostics.clone(),
+        push_subscriptions,
+    })
+}
+
+async fn set_public_access_context(
+    State(state): State<AppState>,
+    Json(context): Json<PublicAccessContext>,
+) -> Result<StatusCode, ApiError> {
+    let previous = state.public_access.current().await;
+    state
+        .public_access
+        .update(context.clone())
+        .await
+        .map_err(|_| ApiError::BadRequest("invalid remote access context"))?;
+    if previous.mode == PublicAccessMode::Named
+        && (context.mode != PublicAccessMode::Named
+            || previous.public_origin != context.public_origin)
+    {
+        state
+            .notification_store
+            .lock()
+            .await
+            .fail_pending_deliveries("public_access_changed", current_time_ms())
+            .map_err(|_| ApiError::Internal("notification outbox unavailable"))?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn refresh_session(
@@ -569,10 +872,272 @@ async fn revoke_device(
     State(state): State<AppState>,
     Path(device_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let pairing = state.pairing.lock().await;
-    pairing.revoke_device(&device_id)?;
+    {
+        let pairing = state.pairing.lock().await;
+        pairing.revoke_device(&device_id)?;
+    }
+    state.event_hub.disconnect_device(device_id.clone());
+    state
+        .notification_store
+        .lock()
+        .await
+        .delete_device_notification_data(&device_id)
+        .map_err(|_| ApiError::Internal("notification cleanup failed"))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_notification_settings(
+    State(state): State<AppState>,
+    Extension(device): Extension<AuthenticatedDevice>,
+    headers: HeaderMap,
+) -> Result<Json<NotificationSettingsResponse>, ApiError> {
+    notification_settings_response(&state, &device.device_id, &headers)
+        .await
+        .map(Json)
+}
+
+async fn put_notification_settings(
+    State(state): State<AppState>,
+    Extension(device): Extension<AuthenticatedDevice>,
+    headers: HeaderMap,
+    Json(input): Json<NotificationSettingsInput>,
+) -> Result<Json<NotificationSettingsResponse>, ApiError> {
+    state
+        .notification_store
+        .lock()
+        .await
+        .save_settings(&DeviceNotificationSettings {
+            device_id: device.device_id.clone(),
+            enabled: input.enabled,
+            alert_kinds: input.alert_kinds,
+            sound_enabled: input.sound_enabled,
+            vibration_enabled: input.vibration_enabled,
+            updated_at: current_time_ms(),
+        })
+        .map_err(|_| ApiError::Internal("notification settings unavailable"))?;
+
+    notification_settings_response(&state, &device.device_id, &headers)
+        .await
+        .map(Json)
+}
+
+async fn send_test_notification(
+    State(state): State<AppState>,
+    Extension(device): Extension<AuthenticatedDevice>,
+) -> Result<(StatusCode, Json<AlertEvent>), ApiError> {
+    let event = AlertEvent {
+        event_id: format!("test-alert-{}", Uuid::new_v4()),
+        kind: AlertKind::Completed,
+        thread_id: "notification-test".to_string(),
+        thread_title: "Codex Mobile Bridge".to_string(),
+        occurred_at: current_time_ms(),
+    };
+    state
+        .notification_dispatcher
+        .dispatch_test_to_device(&device.device_id, event.clone())
+        .await
+        .map_err(|_| ApiError::Internal("test notification unavailable"))?;
+    Ok((StatusCode::ACCEPTED, Json(event)))
+}
+
+async fn get_push_public_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<PushPublicKeyResponse>, ApiError> {
+    require_named_push_origin(&state, &headers).await?;
+    let vapid_key = state.vapid_key.as_ref().ok_or(ApiError::PushUnavailable)?;
+    Ok(Json(PushPublicKeyResponse {
+        public_key: vapid_key.public_key_base64().to_string(),
+    }))
+}
+
+async fn save_push_subscription(
+    State(state): State<AppState>,
+    Extension(device): Extension<AuthenticatedDevice>,
+    headers: HeaderMap,
+    Json(request): Json<PushSubscriptionRequest>,
+) -> Result<StatusCode, ApiError> {
+    if state.vapid_key.is_none() {
+        return Err(ApiError::PushUnavailable);
+    }
+    let named_origin = require_named_push_origin(&state, &headers).await?;
+    if request.origin != named_origin
+        || normalized_http_origin(&request.origin).as_deref() != Some(named_origin.as_str())
+    {
+        return Err(ApiError::PushUnavailable);
+    }
+    validate_push_subscription(&request)?;
+    state
+        .notification_store
+        .lock()
+        .await
+        .save_subscription(&PushSubscriptionRecord {
+            device_id: device.device_id,
+            origin: request.origin,
+            endpoint: request.endpoint,
+            p256dh: request.keys.p256dh,
+            auth: request.keys.auth,
+            created_at: current_time_ms(),
+            last_success_at: None,
+            invalidated_at: None,
+        })
+        .map_err(|_| ApiError::Internal("push subscription unavailable"))?;
+    Ok(StatusCode::CREATED)
+}
+
+async fn delete_push_subscription(
+    State(state): State<AppState>,
+    Extension(device): Extension<AuthenticatedDevice>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .notification_store
+        .lock()
+        .await
+        .delete_subscription(&device.device_id)
+        .map_err(|_| ApiError::Internal("push subscription cleanup failed"))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn notification_settings_response(
+    state: &AppState,
+    device_id: &str,
+    headers: &HeaderMap,
+) -> Result<NotificationSettingsResponse, ApiError> {
+    let settings = state
+        .notification_store
+        .lock()
+        .await
+        .settings_for_device(device_id)
+        .map_err(|_| ApiError::Internal("notification settings unavailable"))?;
+    let context = state.public_access.current().await;
+    let mut capabilities = state.public_access.notification_capabilities().await;
+    let request_origin = effective_request_origin(headers);
+    let named_request = context.mode == PublicAccessMode::Named
+        && context.public_origin.as_deref() == request_origin.as_deref()
+        && request_origin
+            .as_deref()
+            .is_some_and(|origin| origin.starts_with("https://"));
+    capabilities.fixed_https = named_request;
+    let push_available = named_request && state.vapid_key.is_some();
+    if push_available {
+        capabilities.delivery_mode = DeliveryMode::WebPush;
+        capabilities.system_notifications = true;
+    } else {
+        capabilities.delivery_mode = DeliveryMode::ForegroundOnly;
+        capabilities.system_notifications = false;
+    }
+    let subscription_state = if !push_available {
+        SubscriptionState::Unavailable
+    } else {
+        match state
+            .notification_store
+            .lock()
+            .await
+            .subscription_for_device(device_id)
+            .map_err(|_| ApiError::Internal("push subscription unavailable"))?
+        {
+            None => SubscriptionState::NotEnabled,
+            Some(subscription)
+                if subscription.invalidated_at.is_none()
+                    && subscription.origin == request_origin.clone().unwrap_or_default() =>
+            {
+                SubscriptionState::Active
+            }
+            Some(_) => SubscriptionState::NeedsRepair,
+        }
+    };
+
+    Ok(NotificationSettingsResponse {
+        settings: NotificationSettingsInput {
+            enabled: settings.enabled,
+            alert_kinds: settings.alert_kinds,
+            sound_enabled: settings.sound_enabled,
+            vibration_enabled: settings.vibration_enabled,
+        },
+        capabilities,
+        subscription_state,
+    })
+}
+
+async fn require_named_push_origin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, ApiError> {
+    let context = state.public_access.current().await;
+    let request_origin = effective_request_origin(headers);
+    match (context.mode, context.public_origin, request_origin) {
+        (PublicAccessMode::Named, Some(public_origin), Some(request_origin))
+            if public_origin == request_origin && public_origin.starts_with("https://") =>
+        {
+            Ok(public_origin)
+        }
+        _ => Err(ApiError::PushUnavailable),
+    }
+}
+
+fn validate_push_subscription(request: &PushSubscriptionRequest) -> Result<(), ApiError> {
+    if request.endpoint.len() > 4096
+        || request.keys.p256dh.len() > 512
+        || request.keys.auth.len() > 512
+    {
+        return Err(ApiError::InvalidSubscription);
+    }
+    let endpoint = url::Url::parse(&request.endpoint).map_err(|_| ApiError::InvalidSubscription)?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(ApiError::InvalidSubscription);
+    }
+    let p256dh = URL_SAFE_NO_PAD
+        .decode(&request.keys.p256dh)
+        .map_err(|_| ApiError::InvalidSubscription)?;
+    let auth = URL_SAFE_NO_PAD
+        .decode(&request.keys.auth)
+        .map_err(|_| ApiError::InvalidSubscription)?;
+    if p256dh.len() != 65 || auth.len() != 16 {
+        return Err(ApiError::InvalidSubscription);
+    }
+    Ok(())
+}
+
+fn effective_request_origin(headers: &HeaderMap) -> Option<String> {
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(normalized_http_origin)
+    {
+        return Some(origin);
+    }
+    let protocol = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "http" | "https"))?;
+    let host = headers.get(header::HOST)?.to_str().ok()?.trim();
+    normalized_http_origin(&format!("{protocol}://{host}"))
+}
+
+fn normalized_http_origin(value: &str) -> Option<String> {
+    if value.trim() != value {
+        return None;
+    }
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    let origin = parsed.origin().ascii_serialization();
+    (value.trim_end_matches('/') == origin).then_some(origin)
 }
 
 async fn list_sessions(
@@ -1543,15 +2108,19 @@ fn is_dev_approval_id(approval_id: &str) -> bool {
     approval_id.starts_with("dev-approval-")
 }
 
-async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| websocket_stream(state.event_hub, socket))
+async fn ws_handler(
+    State(state): State<AppState>,
+    Extension(device): Extension<AuthenticatedDevice>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| websocket_stream(state.event_hub, device.device_id, socket))
 }
 
-async fn websocket_stream(event_hub: EventHub, socket: WebSocket) {
+async fn websocket_stream(event_hub: EventHub, device_id: String, socket: WebSocket) {
     let (mut sender, mut receiver) = socket.split();
     tokio::spawn(async move { while receiver.next().await.is_some() {} });
 
-    let mut subscriber = event_hub.subscribe().await;
+    let mut subscriber = event_hub.subscribe_for_device(device_id).await;
     while let Ok(envelope) = subscriber.recv().await {
         let Ok(serialized) = serde_json::to_string(&envelope) else {
             continue;
@@ -1578,13 +2147,16 @@ async fn require_bearer_auth(
 
 async fn require_websocket_auth(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
     let token = bearer_token_from_headers(request.headers())
         .or_else(|| token_from_query(request.uri().query().unwrap_or_default()))
         .ok_or(ApiError::Unauthorized)?;
-    authenticate_token(&state, token).await?;
+    let device_id = authenticate_token(&state, token).await?;
+    request
+        .extensions_mut()
+        .insert(AuthenticatedDevice { device_id });
 
     Ok(next.run(request).await)
 }
@@ -1675,6 +2247,8 @@ enum ApiError {
     UnsupportedMediaType(&'static str),
     Internal(&'static str),
     AdapterUnavailable,
+    PushUnavailable,
+    InvalidSubscription,
     Workspace(ApiErrorCode, &'static str),
     Pairing(PairingError),
     Adapter(CodexRpcError),
@@ -1747,6 +2321,16 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_GATEWAY,
                 ApiErrorCode::AdapterError,
                 "desktop adapter is unavailable".to_string(),
+            ),
+            Self::PushUnavailable => (
+                StatusCode::CONFLICT,
+                ApiErrorCode::PushUnavailable,
+                "push notifications are unavailable for this origin".to_string(),
+            ),
+            Self::InvalidSubscription => (
+                StatusCode::BAD_REQUEST,
+                ApiErrorCode::InvalidSubscription,
+                "push subscription is invalid".to_string(),
             ),
             Self::Workspace(code, message) => (StatusCode::BAD_REQUEST, code, message.to_string()),
             Self::Pairing(PairingError::InvalidToken | PairingError::TokenAlreadyUsed) => (
@@ -1830,6 +2414,7 @@ mod tests {
         collections::HashMap as StdHashMap,
         path::PathBuf,
         sync::{Arc, Mutex as StdMutex},
+        time::Duration,
     };
     use tempfile::{TempDir, tempdir};
     use tower::ServiceExt;
@@ -1870,6 +2455,30 @@ mod tests {
         let state = AppState::new(pairing, EventHub::new(), TEST_CONTROL_TOKEN);
 
         (dir, state)
+    }
+
+    fn test_vapid_key() -> Arc<VapidRuntimeKey> {
+        let dir = tempfile::tempdir().expect("tempdir creates");
+        let path = dir.path().join("vapid-key");
+        std::fs::write(&path, URL_SAFE_NO_PAD.encode([1_u8; 32])).expect("fixture writes");
+        Arc::new(VapidRuntimeKey::from_secret_file(&path).expect("test VAPID key loads"))
+    }
+
+    fn authenticated_origin_request(
+        method: Method,
+        uri: &str,
+        token: &str,
+        origin: &str,
+        body: Body,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::ORIGIN, origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .expect("authenticated request builds")
     }
 
     async fn response_json(response: Response) -> Value {
@@ -2183,6 +2792,63 @@ mod tests {
                 "detail": "app-server bridge module was not found",
             })
         );
+    }
+
+    #[tokio::test]
+    async fn control_diagnostics_expose_push_endpoint_host_only() {
+        let (_dir, state) = test_state();
+        let store = Arc::new(Mutex::new(
+            NotificationStore::open_in_memory().expect("notification store opens"),
+        ));
+        store
+            .lock()
+            .await
+            .save_subscription(&PushSubscriptionRecord {
+                device_id: "phone-1".to_string(),
+                origin: "https://codex.example.com".to_string(),
+                endpoint: "https://fcm.googleapis.com/fcm/send/private-path?token=secret"
+                    .to_string(),
+                p256dh: "client-public-key".to_string(),
+                auth: "client-auth-secret".to_string(),
+                created_at: 10,
+                last_success_at: Some(20),
+                invalidated_at: None,
+            })
+            .expect("subscription saves");
+        let app = build_control_router(state.with_notification_store(store));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/control/diagnostics")
+                    .header(BRIDGE_CONTROL_TOKEN_HEADER, TEST_CONTROL_TOKEN)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        assert_eq!(
+            value["pushSubscriptions"],
+            json!([{
+                "subscriptionState": "active",
+                "endpointHost": "fcm.googleapis.com",
+                "lastSuccessAt": 20,
+                "lastErrorCategory": null
+            }])
+        );
+        let serialized = value.to_string();
+        for secret in [
+            "private-path",
+            "secret",
+            "client-public-key",
+            "client-auth-secret",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
     }
 
     #[tokio::test]
@@ -2514,7 +3180,32 @@ mod tests {
     async fn control_routes_accept_control_token_for_device_management() {
         let (_dir, state) = test_state();
         pair_device(&state).await;
-        let app = build_control_router(state);
+        {
+            let store = state.notification_store.lock().await;
+            store
+                .save_settings(&DeviceNotificationSettings {
+                    device_id: "phone-1".into(),
+                    enabled: true,
+                    alert_kinds: AlertKindSettings::default(),
+                    sound_enabled: true,
+                    vibration_enabled: true,
+                    updated_at: 1,
+                })
+                .expect("notification settings save");
+            store
+                .save_subscription(&PushSubscriptionRecord {
+                    device_id: "phone-1".into(),
+                    origin: "https://codex.example.com".into(),
+                    endpoint: "https://push.example/device".into(),
+                    p256dh: "fixture-public-key".into(),
+                    auth: "fixture-auth".into(),
+                    created_at: 1,
+                    last_success_at: None,
+                    invalidated_at: None,
+                })
+                .expect("push subscription saves");
+        }
+        let app = build_control_router(state.clone());
 
         let list_response = app
             .clone()
@@ -2547,6 +3238,19 @@ mod tests {
             .expect("request succeeds");
 
         assert_eq!(revoke_response.status(), StatusCode::NO_CONTENT);
+        let store = state.notification_store.lock().await;
+        assert_eq!(
+            store
+                .settings_for_device("phone-1")
+                .expect("settings query"),
+            DeviceNotificationSettings::defaults_for("phone-1")
+        );
+        assert!(
+            store
+                .subscription_for_device("phone-1")
+                .expect("subscription query")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3928,7 +4632,7 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_millis(20), subscriber.recv()).await;
         assert!(matches!(
             unexpected,
-            Err(_) | Ok(Err(tokio::sync::broadcast::error::RecvError::Closed))
+            Err(_) | Ok(Err(crate::event_hub::EventReceiveError::Closed))
         ));
     }
 
@@ -4336,6 +5040,641 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body[0]["id"], json!("event-1"));
         assert_eq!(body[0]["payload"]["text"], json!("published"));
+    }
+
+    #[tokio::test]
+    async fn app_state_applies_live_notification_to_snapshot_and_sanitized_event() {
+        let (_dir, state) = test_state();
+        let mut subscriber = state.event_hub().subscribe().await;
+
+        let event = state
+            .apply_codex_notification(CodexRawEvent {
+                method: "item/reasoning/summaryTextDelta".to_string(),
+                params: json!({
+                    "threadId": "thread-live",
+                    "turnId": "turn-live",
+                    "itemId": "reasoning-live",
+                    "delta": "Reviewing the live bridge",
+                    "createdAt": 1_725_000_000,
+                    "privatePath": "/Users/example/private"
+                }),
+            })
+            .await
+            .expect("public notification produces an event");
+
+        assert_eq!(event.event_type, SessionEventType::ReasoningSummaryDelta);
+        assert!(event.payload.get("raw").is_none());
+        match subscriber.recv().await.expect("snapshot broadcasts first") {
+            ServerEnvelope::SessionSnapshot(snapshot) => {
+                assert_eq!(snapshot.thread_id, "thread-live");
+                assert_eq!(snapshot.status, SessionStatus::Running);
+                assert_eq!(snapshot.updated_at, 1_725_000_000_000);
+            }
+            envelope => panic!("expected snapshot, got {envelope:?}"),
+        }
+        assert_eq!(
+            subscriber.recv().await.expect("event broadcasts second"),
+            ServerEnvelope::SessionEvent(event)
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_settings_are_isolated_by_device_and_origin() {
+        let (_dir, state) = test_state();
+        let (token_a, token_b) = {
+            let mut pairing = state.pairing.lock().await;
+            let pairing_a = pairing.create_token().expect("pairing A creates");
+            let token_a = pairing
+                .register_device(&pairing_a, "phone-a", "Phone A", "secret-a")
+                .expect("phone A pairs")
+                .session_token;
+            let pairing_b = pairing.create_token().expect("pairing B creates");
+            let token_b = pairing
+                .register_device(&pairing_b, "phone-b", "Phone B", "secret-b")
+                .expect("phone B pairs")
+                .session_token;
+            (token_a, token_b)
+        };
+        state
+            .public_access
+            .update(PublicAccessContext {
+                mode: PublicAccessMode::Named,
+                public_origin: Some("https://codex.example.com".to_string()),
+            })
+            .await
+            .expect("named access updates");
+        let app = build_router(state);
+        let input = json!({
+            "enabled": true,
+            "alertKinds": {
+                "completed": true,
+                "approvalRequired": false,
+                "inputRequired": true,
+                "error": true
+            },
+            "soundEnabled": false,
+            "vibrationEnabled": true
+        });
+
+        let put_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/notification-settings")
+                    .header(header::AUTHORIZATION, format!("Bearer {token_a}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::HOST, "codex.example.com")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::from(input.to_string()))
+                    .expect("PUT request builds"),
+            )
+            .await
+            .expect("PUT succeeds");
+        assert_eq!(put_response.status(), StatusCode::OK);
+        let put_body = response_json(put_response).await;
+        assert_eq!(put_body["settings"]["enabled"], json!(true));
+        assert_eq!(put_body["capabilities"]["fixedHttps"], json!(true));
+
+        let phone_b = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/notification-settings")
+                    .header(header::AUTHORIZATION, format!("Bearer {token_b}"))
+                    .header(header::HOST, "192.168.1.10:57324")
+                    .header("x-forwarded-proto", "http")
+                    .body(Body::empty())
+                    .expect("GET request builds"),
+            )
+            .await
+            .expect("GET succeeds");
+        let phone_b = response_json(phone_b).await;
+        assert_eq!(phone_b["settings"]["enabled"], json!(false));
+        assert_eq!(phone_b["capabilities"]["fixedHttps"], json!(false));
+        assert_eq!(
+            phone_b["capabilities"]["deliveryMode"],
+            json!("foreground_only")
+        );
+
+        let invalid = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/notification-settings")
+                    .header(header::AUTHORIZATION, format!("Bearer {token_a}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "enabled": false,
+                            "alertKinds": {
+                                "completed": true,
+                                "approvalRequired": true,
+                                "inputRequired": true
+                            },
+                            "soundEnabled": true,
+                            "vibrationEnabled": true
+                        })
+                        .to_string(),
+                    ))
+                    .expect("invalid PUT request builds"),
+            )
+            .await
+            .expect("invalid PUT returns response");
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn push_public_key_is_only_available_from_the_named_https_origin() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let vapid_key = test_vapid_key();
+        let expected_public_key = vapid_key.public_key_base64().to_string();
+        let state = state.with_vapid_key(vapid_key);
+        let app = build_router(state.clone());
+
+        state
+            .public_access
+            .update(PublicAccessContext {
+                mode: PublicAccessMode::Quick,
+                public_origin: Some("https://temp.trycloudflare.com".into()),
+            })
+            .await
+            .expect("quick access updates");
+        let quick = app
+            .clone()
+            .oneshot(authenticated_origin_request(
+                Method::GET,
+                "/api/push/public-key",
+                &session_token,
+                "https://temp.trycloudflare.com",
+                Body::empty(),
+            ))
+            .await
+            .expect("quick response returns");
+        assert_eq!(quick.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(quick).await["code"],
+            json!("push_unavailable")
+        );
+
+        state
+            .public_access
+            .update(PublicAccessContext {
+                mode: PublicAccessMode::Named,
+                public_origin: Some("https://codex.example.com".into()),
+            })
+            .await
+            .expect("named access updates");
+        let named = app
+            .clone()
+            .oneshot(authenticated_origin_request(
+                Method::GET,
+                "/api/push/public-key",
+                &session_token,
+                "https://codex.example.com",
+                Body::empty(),
+            ))
+            .await
+            .expect("named response returns");
+        assert_eq!(named.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(named).await["publicKey"],
+            json!(expected_public_key)
+        );
+
+        let lan = app
+            .oneshot(authenticated_origin_request(
+                Method::GET,
+                "/api/push/public-key",
+                &session_token,
+                "http://192.168.1.10:57324",
+                Body::empty(),
+            ))
+            .await
+            .expect("LAN response returns");
+        assert_eq!(lan.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn push_subscription_is_validated_replaced_isolated_and_deleted_per_device() {
+        let (_dir, state) = test_state();
+        let (token_a, token_b) = {
+            let mut pairing = state.pairing.lock().await;
+            let pairing_a = pairing.create_token().expect("pairing A creates");
+            let token_a = pairing
+                .register_device(&pairing_a, "phone-a", "Phone A", "secret-a")
+                .expect("phone A pairs")
+                .session_token;
+            let pairing_b = pairing.create_token().expect("pairing B creates");
+            let token_b = pairing
+                .register_device(&pairing_b, "phone-b", "Phone B", "secret-b")
+                .expect("phone B pairs")
+                .session_token;
+            (token_a, token_b)
+        };
+        state
+            .public_access
+            .update(PublicAccessContext {
+                mode: PublicAccessMode::Named,
+                public_origin: Some("https://codex.example.com".into()),
+            })
+            .await
+            .expect("named access updates");
+        let state = state.with_vapid_key(test_vapid_key());
+        let app = build_router(state.clone());
+        let keys = json!({
+            "p256dh": URL_SAFE_NO_PAD.encode([2_u8; 65]),
+            "auth": URL_SAFE_NO_PAD.encode([3_u8; 16]),
+        });
+        let subscription = |endpoint: &str| {
+            json!({
+                "origin": "https://codex.example.com",
+                "endpoint": endpoint,
+                "keys": keys.clone(),
+            })
+        };
+
+        for (token, endpoint) in [
+            (&token_a, "https://push.example/phone-a/one?topic=release"),
+            (&token_a, "https://push.example/phone-a/two"),
+            (&token_b, "https://push.example/phone-b"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authenticated_origin_request(
+                    Method::POST,
+                    "/api/push/subscription",
+                    token,
+                    "https://codex.example.com",
+                    Body::from(subscription(endpoint).to_string()),
+                ))
+                .await
+                .expect("subscription response returns");
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+        {
+            let store = state.notification_store.lock().await;
+            assert_eq!(
+                store
+                    .active_subscription("phone-a")
+                    .expect("phone A subscription loads")
+                    .expect("phone A subscription exists")
+                    .endpoint,
+                "https://push.example/phone-a/two"
+            );
+            assert!(
+                store
+                    .active_subscription("phone-b")
+                    .expect("phone B subscription loads")
+                    .is_some()
+            );
+        }
+
+        let mismatch = app
+            .clone()
+            .oneshot(authenticated_origin_request(
+                Method::POST,
+                "/api/push/subscription",
+                &token_a,
+                "https://other.example.com",
+                Body::from(subscription("https://push.example/mismatch").to_string()),
+            ))
+            .await
+            .expect("mismatch response returns");
+        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+
+        let invalid_endpoint = app
+            .clone()
+            .oneshot(authenticated_origin_request(
+                Method::POST,
+                "/api/push/subscription",
+                &token_a,
+                "https://codex.example.com",
+                Body::from(subscription("http://push.example/not-secure").to_string()),
+            ))
+            .await
+            .expect("invalid endpoint response returns");
+        assert_eq!(invalid_endpoint.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(invalid_endpoint).await["code"],
+            json!("invalid_subscription")
+        );
+
+        let invalid_key = app
+            .clone()
+            .oneshot(authenticated_origin_request(
+                Method::POST,
+                "/api/push/subscription",
+                &token_a,
+                "https://codex.example.com",
+                Body::from(
+                    json!({
+                        "origin": "https://codex.example.com",
+                        "endpoint": "https://push.example/device",
+                        "keys": { "p256dh": "short", "auth": "short" },
+                    })
+                    .to_string(),
+                ),
+            ))
+            .await
+            .expect("invalid key response returns");
+        assert_eq!(invalid_key.status(), StatusCode::BAD_REQUEST);
+
+        let deleted = app
+            .oneshot(authenticated_origin_request(
+                Method::DELETE,
+                "/api/push/subscription",
+                &token_a,
+                "https://codex.example.com",
+                Body::empty(),
+            ))
+            .await
+            .expect("delete response returns");
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        let store = state.notification_store.lock().await;
+        assert!(
+            store
+                .subscription_for_device("phone-a")
+                .expect("phone A subscription queries")
+                .is_none()
+        );
+        assert!(
+            store
+                .active_subscription("phone-b")
+                .expect("phone B subscription queries")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_settings_report_real_push_subscription_state() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        state
+            .public_access
+            .update(PublicAccessContext {
+                mode: PublicAccessMode::Named,
+                public_origin: Some("https://codex.example.com".into()),
+            })
+            .await
+            .expect("named access updates");
+        let state = state.with_vapid_key(test_vapid_key());
+        let app = build_router(state.clone());
+
+        let not_enabled = app
+            .clone()
+            .oneshot(authenticated_origin_request(
+                Method::GET,
+                "/api/notification-settings",
+                &session_token,
+                "https://codex.example.com",
+                Body::empty(),
+            ))
+            .await
+            .expect("settings response returns");
+        let not_enabled = response_json(not_enabled).await;
+        assert_eq!(
+            not_enabled["capabilities"]["deliveryMode"],
+            json!("web_push")
+        );
+        assert_eq!(
+            not_enabled["capabilities"]["systemNotifications"],
+            json!(true)
+        );
+        assert_eq!(not_enabled["subscriptionState"], json!("not_enabled"));
+
+        state
+            .notification_store
+            .lock()
+            .await
+            .save_subscription(&PushSubscriptionRecord {
+                device_id: "phone-1".into(),
+                origin: "https://codex.example.com".into(),
+                endpoint: "https://push.example/device".into(),
+                p256dh: URL_SAFE_NO_PAD.encode([2_u8; 65]),
+                auth: URL_SAFE_NO_PAD.encode([3_u8; 16]),
+                created_at: 1,
+                last_success_at: None,
+                invalidated_at: None,
+            })
+            .expect("subscription saves");
+        let active = app
+            .clone()
+            .oneshot(authenticated_origin_request(
+                Method::GET,
+                "/api/notification-settings",
+                &session_token,
+                "https://codex.example.com",
+                Body::empty(),
+            ))
+            .await
+            .expect("active settings response returns");
+        assert_eq!(
+            response_json(active).await["subscriptionState"],
+            json!("active")
+        );
+
+        state
+            .notification_store
+            .lock()
+            .await
+            .invalidate_subscription("phone-1", 20)
+            .expect("subscription invalidates");
+        let repair = app
+            .clone()
+            .oneshot(authenticated_origin_request(
+                Method::GET,
+                "/api/notification-settings",
+                &session_token,
+                "https://codex.example.com",
+                Body::empty(),
+            ))
+            .await
+            .expect("repair settings response returns");
+        assert_eq!(
+            response_json(repair).await["subscriptionState"],
+            json!("needs_repair")
+        );
+
+        let lan = app
+            .oneshot(authenticated_origin_request(
+                Method::GET,
+                "/api/notification-settings",
+                &session_token,
+                "http://192.168.1.10:57324",
+                Body::empty(),
+            ))
+            .await
+            .expect("LAN settings response returns");
+        let lan = response_json(lan).await;
+        assert_eq!(lan["subscriptionState"], json!("unavailable"));
+        assert_eq!(
+            lan["capabilities"]["deliveryMode"],
+            json!("foreground_only")
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_test_targets_only_the_authenticated_device() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let mut phone = state.event_hub.subscribe_for_device("phone-1").await;
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/notifications/test")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("test alert request builds"),
+            )
+            .await
+            .expect("test alert request succeeds");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            phone.recv().await.expect("phone receives test alert"),
+            ServerEnvelope::AlertEvent(AlertEvent {
+                kind: AlertKind::Completed,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn notifications_test_uses_force_push_without_duplicate_websocket_in_named_mode() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        state
+            .public_access
+            .update(PublicAccessContext {
+                mode: PublicAccessMode::Named,
+                public_origin: Some("https://codex.example.com".into()),
+            })
+            .await
+            .expect("named access updates");
+        state
+            .notification_store
+            .lock()
+            .await
+            .save_subscription(&PushSubscriptionRecord {
+                device_id: "phone-1".into(),
+                origin: "https://codex.example.com".into(),
+                endpoint: "https://push.example/device".into(),
+                p256dh: URL_SAFE_NO_PAD.encode([2_u8; 65]),
+                auth: URL_SAFE_NO_PAD.encode([3_u8; 16]),
+                created_at: 1,
+                last_success_at: None,
+                invalidated_at: None,
+            })
+            .expect("subscription saves");
+        let state = state
+            .with_vapid_key(test_vapid_key())
+            .with_push_runtime(Arc::new(Notify::new()));
+        let mut phone = state.event_hub.subscribe_for_device("phone-1").await;
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/notifications/test")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("test alert request builds"),
+            )
+            .await
+            .expect("test alert request succeeds");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = response_json(response).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), phone.recv())
+                .await
+                .is_err()
+        );
+        let delivery = state
+            .notification_store
+            .lock()
+            .await
+            .delivery_for(
+                body["eventId"].as_str().expect("event ID is present"),
+                "phone-1",
+            )
+            .expect("delivery loads")
+            .expect("delivery exists");
+        let payload: crate::web_push::PushPayload =
+            serde_json::from_str(&delivery.payload_json).expect("payload parses");
+        assert!(payload.force_system_notification);
+    }
+
+    #[tokio::test]
+    async fn leaving_named_mode_fails_pending_push_deliveries() {
+        let (_dir, state) = test_state();
+        state
+            .public_access
+            .update(PublicAccessContext {
+                mode: PublicAccessMode::Named,
+                public_origin: Some("https://codex.example.com".into()),
+            })
+            .await
+            .expect("named access updates");
+        state
+            .notification_store
+            .lock()
+            .await
+            .enqueue_delivery(&crate::notification_store::NotificationDelivery {
+                event_id: "event-1".into(),
+                device_id: "phone-1".into(),
+                payload_json: "{}".into(),
+                status: crate::notification_store::DeliveryStatus::Pending,
+                attempt_count: 1,
+                next_attempt_at: 10,
+                last_error_category: Some("push_retryable".into()),
+                updated_at: 1,
+            })
+            .expect("delivery enqueues");
+        let app = build_control_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/control/remote-access")
+                    .header(BRIDGE_CONTROL_TOKEN_HEADER, TEST_CONTROL_TOKEN)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "mode": "quick",
+                            "publicOrigin": "https://temp.trycloudflare.com"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("remote access request builds"),
+            )
+            .await
+            .expect("remote access response returns");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let delivery = state
+            .notification_store
+            .lock()
+            .await
+            .delivery_for("event-1", "phone-1")
+            .expect("delivery loads")
+            .expect("delivery exists");
+        assert_eq!(
+            delivery.status,
+            crate::notification_store::DeliveryStatus::Failed
+        );
+        assert_eq!(
+            delivery.last_error_category.as_deref(),
+            Some("public_access_changed")
+        );
     }
 
     async fn first_asset_src(response: Response) -> String {

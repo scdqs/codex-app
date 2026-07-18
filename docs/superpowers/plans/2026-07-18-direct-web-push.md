@@ -1681,7 +1681,7 @@ git commit -m "feat: enable lock-screen push notifications"
 - Modify: `apps/mobile-pwa/package.json`
 - Modify: `apps/mobile-pwa/package-lock.json`
 
-- [ ] **Step 1: 写 push secret 脱敏测试**
+- [x] **Step 1: 写 push secret 脱敏测试**
 
 ```rust
 #[test]
@@ -1701,7 +1701,7 @@ fn redacts_vapid_and_subscription_material() {
 }
 ```
 
-- [ ] **Step 2: 实现 endpoint host-only 诊断**
+- [x] **Step 2: 实现 endpoint host-only 诊断**
 
 `redact_sensitive_text` 增加 VAPID/private/subscription markers。不要只依靠通用 token 规则；显式处理 `VAPID_PRIVATE_KEY`、`p256dh`、`auth`、`endpoint`。诊断 DTO 只返回：
 
@@ -1716,7 +1716,7 @@ fn redacts_vapid_and_subscription_material() {
 
 不得返回 endpoint path/query、keys、payload JSON 或 VAPID key。
 
-- [ ] **Step 3: 加强 stable release gate**
+- [x] **Step 3: 加强 stable release gate**
 
 当 `ENABLE_WEB_PUSH=true` 且 channel stable：
 
@@ -1731,7 +1731,7 @@ fn redacts_vapid_and_subscription_material() {
 
 新增 shell 测试或直接在计划执行时验证缺失/满足变量两种分支。更新 `docs/release-gates.md` 的变量说明。
 
-- [ ] **Step 4: 创建真机 QA 矩阵**
+- [x] **Step 4: 创建真机 QA 矩阵**
 
 `docs/qa/2026-07-18-web-push-device-matrix.md` 使用表格记录：设备/OS/浏览器或 PWA/Origin/四类通知/点击 deep-link/声音/震动/结果/日期。至少要求：
 
@@ -1744,7 +1744,7 @@ fn redacts_vapid_and_subscription_material() {
 - 设备撤销后不再收到通知；
 - Quick Tunnel 不创建 PushSubscription。
 
-- [ ] **Step 5: 更新 dogfood 清单**
+- [x] **Step 5: 更新 dogfood 清单**
 
 ```markdown
 - [ ] iPhone 已添加到主屏幕后才能请求通知权限；Safari 普通标签页不误报可用。
@@ -1759,7 +1759,7 @@ fn redacts_vapid_and_subscription_material() {
 - [ ] Bridge 重启恢复 pending outbox，不重复生成 AlertEvent。
 ```
 
-- [ ] **Step 6: 统一升级版本到 0.1.7**
+- [x] **Step 6: 统一升级版本到 0.1.7**
 
 更新 `VERSION`、内部 Cargo/package/Tauri 版本和 package-lock 顶层版本。
 
