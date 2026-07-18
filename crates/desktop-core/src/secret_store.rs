@@ -66,17 +66,25 @@ impl SecretStore for MemorySecretStore {
     fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
         self.values
             .lock()
-            .unwrap()
+            .map_err(|_| SecretStoreError::Backend("memory secret store mutex poisoned".into()))?
             .insert(key.to_string(), value.to_string());
         Ok(())
     }
 
     fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
-        Ok(self.values.lock().unwrap().get(key).cloned())
+        Ok(self
+            .values
+            .lock()
+            .map_err(|_| SecretStoreError::Backend("memory secret store mutex poisoned".into()))?
+            .get(key)
+            .cloned())
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
-        self.values.lock().unwrap().remove(key);
+        self.values
+            .lock()
+            .map_err(|_| SecretStoreError::Backend("memory secret store mutex poisoned".into()))?
+            .remove(key);
         Ok(())
     }
 }
@@ -84,6 +92,7 @@ impl SecretStore for MemorySecretStore {
 #[cfg(test)]
 mod tests {
     use super::{MemorySecretStore, SecretStore};
+    use std::sync::Arc;
 
     #[test]
     fn memory_secret_store_round_trips_and_deletes_secret() {
@@ -99,5 +108,30 @@ mod tests {
 
         store.delete("cloudflare-tunnel-token").unwrap();
         assert_eq!(store.get("cloudflare-tunnel-token").unwrap(), None);
+    }
+
+    #[test]
+    fn memory_secret_store_maps_mutex_poisoning_to_backend_errors() {
+        let store = Arc::new(MemorySecretStore::default());
+        let poisoned_store = Arc::clone(&store);
+        let join_result = std::thread::spawn(move || {
+            let _guard = poisoned_store.values.lock().unwrap();
+            panic!("poison memory secret store mutex");
+        })
+        .join();
+        assert!(join_result.is_err());
+
+        assert!(matches!(
+            store.set("key", "value"),
+            Err(super::SecretStoreError::Backend(_))
+        ));
+        assert!(matches!(
+            store.get("key"),
+            Err(super::SecretStoreError::Backend(_))
+        ));
+        assert!(matches!(
+            store.delete("key"),
+            Err(super::SecretStoreError::Backend(_))
+        ));
     }
 }
