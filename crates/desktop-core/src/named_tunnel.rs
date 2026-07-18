@@ -255,11 +255,35 @@ impl NamedTunnelHealthProbe for HttpNamedTunnelHealthProbe {
 fn classify_transport_failure(error: reqwest::Error) -> ProbeFailure {
     if error.is_timeout() {
         ProbeFailure::Timeout
-    } else if error.is_connect() && error.to_string().to_ascii_lowercase().contains("dns") {
+    } else if error.is_connect() && error_chain_indicates_dns(&error) {
         ProbeFailure::Dns
     } else {
         ProbeFailure::Transport
     }
+}
+
+fn error_chain_indicates_dns(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        let message = error.to_string().to_ascii_lowercase();
+        if [
+            "dns",
+            "failed to lookup address",
+            "failed to resolve host",
+            "host not found",
+            "name or service not known",
+            "name resolution",
+            "no such host is known",
+            "nodename nor servname",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -641,13 +665,14 @@ impl NamedTunnelManager {
         delay: Duration,
     ) -> Result<(), NamedTunnelError> {
         let deadline = Instant::now() + delay;
+        let poll_interval = normalized_poll_interval(self.config.poll_interval);
         loop {
             fail_if_child_exited_or_token_rejected(child, output)?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(());
             }
-            sleep(remaining.min(self.config.poll_interval)).await;
+            sleep(remaining.min(poll_interval)).await;
         }
     }
 
@@ -844,11 +869,7 @@ async fn monitor_child_for_duration(
     child: &mut Child,
     output: &mut TunnelOutputMonitor,
 ) -> Result<(), NamedTunnelError> {
-    let poll_interval = if poll_interval.is_zero() {
-        Duration::from_millis(1)
-    } else {
-        poll_interval
-    };
+    let poll_interval = normalized_poll_interval(poll_interval);
     let deadline = Instant::now() + duration;
 
     loop {
@@ -873,11 +894,7 @@ async fn monitored_probe_with_timeout(
 ) -> Result<Result<BridgeHealthIdentity, ProbeFailure>, NamedTunnelError> {
     let probe = timeout(duration, probe.health(base_url));
     tokio::pin!(probe);
-    let poll_interval = if poll_interval.is_zero() {
-        Duration::from_millis(1)
-    } else {
-        poll_interval
-    };
+    let poll_interval = normalized_poll_interval(poll_interval);
 
     loop {
         tokio::select! {
@@ -891,6 +908,14 @@ async fn monitored_probe_with_timeout(
                 fail_if_child_exited_or_token_rejected(child, output)?;
             }
         }
+    }
+}
+
+fn normalized_poll_interval(poll_interval: Duration) -> Duration {
+    if poll_interval.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        poll_interval
     }
 }
 
@@ -931,6 +956,7 @@ impl TemporarySecretFile {
             file.sync_all()
         })();
         if let Err(error) = write_result {
+            drop(file);
             let _ = std::fs::remove_file(&path);
             return Err(error.into());
         }
@@ -974,7 +1000,7 @@ mod tests {
         BridgeHealthIdentity, HttpNamedTunnelHealthProbe, NamedTunnelConfig, NamedTunnelError,
         NamedTunnelFailureKind, NamedTunnelHealthProbe, NamedTunnelManager,
         NamedTunnelProcessLauncher, NamedTunnelStatus, OUTPUT_RING_CAPACITY, ProbeFailure,
-        TemporarySecretFile, named_tunnel_launch_args,
+        TemporarySecretFile, error_chain_indicates_dns, named_tunnel_launch_args,
     };
 
     struct ScriptedProbe {
@@ -1032,6 +1058,20 @@ mod tests {
             version: version.to_string(),
             instance_id: instance_id.to_string(),
         }
+    }
+
+    #[test]
+    fn dns_detection_walks_transport_errors_without_misclassifying_refused_connections() {
+        let dns_error = std::io::Error::other(
+            "tcp connect error: dns error: failed to lookup address information",
+        );
+        let refused_error = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "tcp connect error: connection refused",
+        );
+
+        assert!(error_chain_indicates_dns(&dns_error));
+        assert!(!error_chain_indicates_dns(&refused_error));
     }
 
     #[cfg(unix)]
