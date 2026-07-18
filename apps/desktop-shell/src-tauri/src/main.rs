@@ -99,6 +99,7 @@ struct CodexLaunchCommandDto {
 struct DeviceDto {
     device_id: String,
     display_name: String,
+    paired_origin: Option<String>,
     created_at: u64,
     last_seen_at: u64,
 }

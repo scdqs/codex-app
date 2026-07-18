@@ -29,12 +29,20 @@ type ShellStatus = {
   appVersion: string;
   bridge: BridgeSnapshot;
   tunnel: TunnelSnapshot;
+  remoteAccess?: {
+    fixedOriginReady: boolean;
+    namedProfile: {
+      hostname: string;
+      localPort: number;
+    } | null;
+  };
   lastPairingLink: string | null;
 };
 
 type Device = {
   deviceId: string;
   displayName: string;
+  pairedOrigin: string | null;
   createdAt: number;
   lastSeenAt: number;
 };
@@ -323,6 +331,7 @@ function renderDevices() {
   if (!devices.length) {
     return `<p class="muted">暂无已配对设备。</p>`;
   }
+  const currentFixedOrigin = fixedRemoteOrigin();
   return `
     <div class="device-list">
       ${devices
@@ -332,6 +341,7 @@ function renderDevices() {
             <div>
               <strong>${escapeHtml(device.displayName)}</strong>
               <span>${escapeHtml(device.deviceId)}</span>
+              <span>${escapeHtml(deviceOriginLabel(device, currentFixedOrigin))}</span>
             </div>
             <button data-action="revoke-device" data-device-id="${escapeHtml(device.deviceId)}" ${busy ? "disabled" : ""}>撤销</button>
           </div>
@@ -340,6 +350,21 @@ function renderDevices() {
         .join("")}
     </div>
   `;
+}
+
+function fixedRemoteOrigin() {
+  const remoteAccess = status?.remoteAccess;
+  if (!remoteAccess?.fixedOriginReady || !remoteAccess.namedProfile) {
+    return null;
+  }
+  return new URL(`https://${remoteAccess.namedProfile.hostname}`).origin;
+}
+
+function deviceOriginLabel(device: Device, currentFixedOrigin: string | null) {
+  const pairedOrigin = device.pairedOrigin ?? "Origin unknown (paired before v0.1.5)";
+  return currentFixedOrigin && device.pairedOrigin !== currentFixedOrigin
+    ? `${pairedOrigin} · 旧 Origin`
+    : pairedOrigin;
 }
 
 function renderDiagnostics() {

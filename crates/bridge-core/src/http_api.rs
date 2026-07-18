@@ -127,6 +127,7 @@ pub struct PairingCompleteRequest {
     device_id: String,
     display_name: String,
     device_secret: String,
+    origin: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +158,7 @@ pub struct SessionRefreshResponse {
 pub struct DeviceResponse {
     device_id: String,
     display_name: String,
+    paired_origin: Option<String>,
     created_at: u64,
     last_seen_at: u64,
 }
@@ -488,12 +490,14 @@ async fn complete_pairing(
     State(state): State<AppState>,
     Json(request): Json<PairingCompleteRequest>,
 ) -> Result<Json<PairingCompleteResponse>, ApiError> {
+    let paired_origin = normalized_pairing_origin(request.origin.as_deref())?;
     let mut pairing = state.pairing.lock().await;
-    let registration = pairing.register_device(
+    let registration = pairing.register_device_with_origin(
         &request.pairing_token,
         &request.device_id,
         &request.display_name,
         &request.device_secret,
+        paired_origin,
     )?;
 
     Ok(Json(PairingCompleteResponse {
@@ -513,12 +517,52 @@ async fn list_devices(
         .map(|device| DeviceResponse {
             device_id: device.device_id,
             display_name: device.display_name,
+            paired_origin: device.paired_origin,
             created_at: device.created_at,
             last_seen_at: device.last_seen_at,
         })
         .collect();
 
     Ok(Json(devices))
+}
+
+fn normalized_pairing_origin(value: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let parsed = url::Url::parse(value)
+        .map_err(|_| ApiError::BadRequest("origin must be a valid http(s) origin"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::BadRequest(
+            "origin must be a valid http(s) origin",
+        ));
+    }
+    let parsed_userinfo = &parsed[url::Position::BeforeUsername..url::Position::BeforeHost];
+    let (raw_userinfo, raw_root_path_only) = value
+        .split_once("://")
+        .map(|(_, remainder)| {
+            let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+            let suffix = &remainder[authority_end..];
+            (
+                remainder[..authority_end].contains('@'),
+                suffix.is_empty() || suffix == "/",
+            )
+        })
+        .unwrap_or((false, false));
+    if value.trim() != value
+        || raw_userinfo
+        || !raw_root_path_only
+        || !parsed_userinfo.is_empty()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ApiError::BadRequest(
+            "origin must not include credentials, path, query, or fragment",
+        ));
+    }
+
+    Ok(Some(parsed.origin().ascii_serialization()))
 }
 
 async fn revoke_device(
@@ -1958,6 +2002,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pairing_complete_records_normalized_origin_for_device_listing() {
+        let (_dir, state) = test_state();
+        let pairing_token = state
+            .pairing
+            .lock()
+            .await
+            .create_token()
+            .expect("pairing token creates");
+        let app = build_router(state);
+
+        let complete_response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/pairing/complete",
+                json!({
+                    "pairingToken": pairing_token,
+                    "deviceId": "phone-1",
+                    "displayName": "Damon phone",
+                    "deviceSecret": "secret",
+                    "origin": "https://codex.example.com:443",
+                }),
+            ))
+            .await
+            .expect("pairing request succeeds");
+
+        assert_eq!(complete_response.status(), StatusCode::OK);
+
+        let devices_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/control/devices")
+                    .header(BRIDGE_CONTROL_TOKEN_HEADER, TEST_CONTROL_TOKEN)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("device request succeeds");
+        let devices = response_json(devices_response).await;
+
+        assert_eq!(
+            devices[0]["pairedOrigin"],
+            json!("https://codex.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_complete_rejects_values_that_are_not_http_origins() {
+        for origin in [
+            "ftp://codex.example.com",
+            "https://user@codex.example.com",
+            "https://:password@codex.example.com",
+            "https://@codex.example.com",
+            "https://codex.example.com/path",
+            "https://codex.example.com/.",
+            "https://codex.example.com?mode=remote",
+            "https://codex.example.com#fragment",
+        ] {
+            let (_dir, state) = test_state();
+            let pairing_token = state
+                .pairing
+                .lock()
+                .await
+                .create_token()
+                .expect("pairing token creates");
+            let app = build_router(state);
+
+            let response = app
+                .oneshot(json_request(
+                    Method::POST,
+                    "/api/pairing/complete",
+                    json!({
+                        "pairingToken": pairing_token,
+                        "deviceId": "phone-1",
+                        "displayName": "Damon phone",
+                        "deviceSecret": "secret",
+                        "origin": origin,
+                    }),
+                ))
+                .await
+                .expect("pairing request succeeds");
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{origin}");
+            assert_eq!(
+                response_json(response).await["code"],
+                json!("invalid_request"),
+                "{origin}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn pairing_start_requires_control_token() {
         let (_dir, state) = test_state();
         let app = build_router(state);
@@ -2395,6 +2532,7 @@ mod tests {
         assert_eq!(list_response.status(), StatusCode::OK);
         let body = response_json(list_response).await;
         assert_eq!(body[0]["deviceId"], json!("phone-1"));
+        assert_eq!(body[0]["pairedOrigin"], Value::Null);
 
         let revoke_response = app
             .oneshot(

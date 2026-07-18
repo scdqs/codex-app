@@ -255,6 +255,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower",
  "tower-http",
+ "url",
  "uuid",
 ]
 

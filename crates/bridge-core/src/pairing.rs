@@ -104,6 +104,23 @@ impl PairingManager {
         display_name: &str,
         device_secret: &str,
     ) -> Result<DeviceRegistration, PairingError> {
+        self.register_device_with_origin(
+            pairing_token,
+            device_id,
+            display_name,
+            device_secret,
+            None,
+        )
+    }
+
+    pub fn register_device_with_origin(
+        &mut self,
+        pairing_token: &str,
+        device_id: &str,
+        display_name: &str,
+        device_secret: &str,
+        paired_origin: Option<String>,
+    ) -> Result<DeviceRegistration, PairingError> {
         let now = self.now();
         let token = self
             .pairing_tokens
@@ -121,6 +138,7 @@ impl PairingManager {
             device_id: device_id.to_string(),
             display_name: display_name.to_string(),
             secret_hash: hash_secret(device_secret),
+            paired_origin,
             created_at: now,
             last_seen_at: now,
             revoked_at: None,

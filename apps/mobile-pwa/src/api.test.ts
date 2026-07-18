@@ -37,7 +37,7 @@ describe("pairing API helpers", () => {
   });
 
   it("stores_device_session_after_pairing", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       new Response(
         JSON.stringify({
           deviceId: "device-1",
@@ -48,7 +48,7 @@ describe("pairing API helpers", () => {
       ),
     );
 
-    const response = await completePairing("http://bridge.local", {
+    const response = await completePairing("http://bridge.local:4545", {
       pairingToken: "pair-1",
       deviceId: "device-1",
       displayName: "Damon Phone",
@@ -61,7 +61,7 @@ describe("pairing API helpers", () => {
       displayName: "Damon Phone",
       sessionToken: response.sessionToken,
       sessionExpiresAt: response.sessionExpiresAt,
-      bridgeUrl: "http://bridge.local",
+      bridgeUrl: "http://bridge.local:4545",
     });
 
     expect(loadSession()).toMatchObject({
@@ -70,7 +70,50 @@ describe("pairing API helpers", () => {
       displayName: "Damon Phone",
       sessionToken: "session-1",
       sessionExpiresAt: expiresAt,
-      bridgeUrl: "http://bridge.local",
+      bridgeUrl: "http://bridge.local:4545",
+    });
+    expect(fetchMock).toHaveBeenCalledWith("http://bridge.local:4545/api/pairing/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pairingToken: "pair-1",
+        deviceId: "device-1",
+        displayName: "Damon Phone",
+        deviceSecret: "secret-1",
+        origin: "http://bridge.local:4545",
+      }),
+    });
+  });
+
+  it("completePairing_posts_https_bridge_origin", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          deviceId: "device-1",
+          sessionToken: "session-1",
+          sessionExpiresAt: expiresAt,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    await completePairing("https://codex.example.com/pairing", {
+      pairingToken: "pair-1",
+      deviceId: "device-1",
+      displayName: "Damon Phone",
+      deviceSecret: "secret-1",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith("https://codex.example.com/api/pairing/complete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pairingToken: "pair-1",
+        deviceId: "device-1",
+        displayName: "Damon Phone",
+        deviceSecret: "secret-1",
+        origin: "https://codex.example.com",
+      }),
     });
   });
 

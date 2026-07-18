@@ -80,7 +80,12 @@ export async function completePairing(
   bridgeUrl: string,
   request: CompletePairingRequest,
 ): Promise<SessionResponse> {
-  return postJson(bridgeUrl, "/api/pairing/complete", request, parseSessionResponse);
+  return postJson(
+    bridgeUrl,
+    "/api/pairing/complete",
+    { ...request, origin: new URL(bridgeUrl).origin },
+    parseSessionResponse,
+  );
 }
 
 export async function refreshSession(
