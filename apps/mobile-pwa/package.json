@@ -1,6 +1,6 @@
 {
   "name": "@codex/mobile-pwa",
-  "version": "0.1.7",
+  "version": "0.1.14",
   "private": true,
   "type": "module",
   "scripts": {

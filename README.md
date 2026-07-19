@@ -2,7 +2,7 @@
 
 Codex Mobile Bridge 是一个 macOS 桌面桥接应用，让手机继续操作电脑上正在运行的 ChatGPT/Codex Desktop 任务。它不直接调用模型 API，也不替代桌面 Agent；电脑负责执行任务，手机负责查看会话、补充消息、创建会话和处理审批。
 
-当前版本：`v0.1.7 Beta`
+当前版本：`v0.1.14 Beta`
 
 ## 适用场景
 
@@ -13,6 +13,7 @@ Codex Mobile Bridge 是一个 macOS 桌面桥接应用，让手机继续操作�
 ## 当前能力
 
 - 自动检测并启动新版 `ChatGPT.app`，同时兼容旧版 `Codex.app`，排除 `ChatGPT Classic`。
+- 桌面应用、PWA、主屏幕快捷方式和系统通知统一使用 ChatGPT 交织结与手机桥接元素组合的新应用图标。
 - 通过 CDP 和 app-server RPC 读取真实桌面会话并回写消息。
 - 手机 PWA 查看会话列表和完整消息流，最新消息保持在底部。
 - 按规范化工作目录展示“项目 → 会话”两层结构；项目折叠和会话置顶保存在当前手机。
