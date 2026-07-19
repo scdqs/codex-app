@@ -1,0 +1,4 @@
+[build]
+# Sibling-worktree fallback. Project scripts override this with the canonical
+# Git common-dir target so worktrees in other locations still share one cache.
+target-dir = "../codex-app-shared-target"

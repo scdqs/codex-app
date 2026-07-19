@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cargo_target_dir="$("${script_dir}/cargo-target-dir.sh")"
 channel="${RELEASE_CHANNEL:-dev}"
 profile="${TAURI_BUNDLE_PROFILE:-release}"
 output_dir="${1:-artifacts/desktop-shell}"
-bundle_dir="target/${profile}/bundle"
+bundle_dir="${cargo_target_dir}/${profile}/bundle"
 app_path="${bundle_dir}/macos/Codex Mobile Bridge.app"
 dmg_dir="${bundle_dir}/dmg"
 manifest="${output_dir}/artifact-paths.txt"

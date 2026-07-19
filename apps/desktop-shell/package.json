@@ -9,8 +9,8 @@
     "test": "vitest",
     "test:run": "vitest run",
     "prepare:bundle": "../../scripts/prepare-desktop-bundle.sh",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "npm run prepare:bundle && bash ../../scripts/tauri-build.sh"
+    "tauri:dev": "../../scripts/with-build-cache-guard.sh npx tauri dev",
+    "tauri:build": "bash ../../scripts/tauri-build.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

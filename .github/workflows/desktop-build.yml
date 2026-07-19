@@ -65,7 +65,7 @@ jobs:
         run: npm ci
 
       - name: Run workspace tests
-        run: cargo test --workspace
+        run: scripts/cargo.sh test --workspace
 
       - name: Build desktop bundle
         working-directory: apps/desktop-shell

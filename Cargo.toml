@@ -35,3 +35,9 @@ tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"
 uuid = { version = "1", features = ["serde", "v4"] }
 url = "2"
 web-push = "0.11.0"
+
+[profile.dev]
+incremental = false
+
+[profile.test]
+incremental = false

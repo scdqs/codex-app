@@ -167,11 +167,25 @@ sudo /opt/homebrew/bin/cloudflared service uninstall
 
 需要 Rust、Node.js/npm、Xcode Command Line Tools，以及 Tauri 2 所需的 macOS 构建环境。
 
+### 构建缓存控制
+
+项目构建入口根据 Git common-dir 定位主工作树，并让所有 Git worktree 共用其同级的 `codex-app-shared-target/`，避免每个任务副本重复保存 Rust/Tauri 编译产物。开发和测试 profile 关闭 incremental 以控制磁盘增长。
+
+项目提供带缓存检查的 Cargo 入口；构建前后如果共享目录达到 20 GB，会在终端警告并发送一次 macOS 通知，不启动后台服务，也不会自动删除文件：
+
+```bash
+./scripts/cargo.sh test --workspace
+./scripts/check-build-cache.sh
+./scripts/cargo.sh clean
+```
+
+缓存降回阈值以下后，下一次超过阈值时会再次通知。优先使用项目脚本，确保位于任意路径的 worktree 都解析到同一共享目录；直接运行原始 `cargo` 命令不会触发预警，位于其他父目录的 worktree 还可能落入各自的静态 fallback target。
+
 ### 测试与检查
 
 ```bash
-cargo test --workspace
-cargo clippy -p desktop-shell -- -D warnings
+./scripts/cargo.sh test --workspace
+./scripts/cargo.sh clippy -p desktop-shell -- -D warnings
 
 cd apps/mobile-pwa
 npm ci
@@ -190,7 +204,7 @@ cd ../..
 ### 桌面开发
 
 ```bash
-cargo build -p bridge-sidecar
+./scripts/cargo.sh build -p bridge-sidecar
 (cd apps/mobile-pwa && npm ci && npm run build)
 
 cd apps/desktop-shell
@@ -200,7 +214,7 @@ npm run tauri:dev
 
 开发模式会自动定位仓库根目录，并支持：
 
-- `CODEX_MOBILE_BRIDGE_SIDECAR_BIN`：未设置时使用 `target/debug/bridge-sidecar`。
+- `CODEX_MOBILE_BRIDGE_SIDECAR_BIN`：未设置时使用共享 target 中的 `debug/bridge-sidecar`。
 - `CODEX_MOBILE_BRIDGE_PWA_DIR`：未设置时使用 `apps/mobile-pwa/dist`。
 - `CODEX_MOBILE_BRIDGE_ADVERTISED_HOST`：未设置时自动尝试 Wi-Fi/LAN IP。
 - `CODEX_MOBILE_BRIDGE_DEBUG_PORT`：默认 `9229`。
@@ -216,7 +230,7 @@ npm run tauri:build -- --bundles dmg
 构建过程会先编译 release sidecar 和 PWA，把 `bridge-sidecar` 与 `cloudflared` 放入 App resources，再执行 Tauri 打包。DMG 输出到：
 
 ```text
-target/release/bundle/dmg/
+<scripts/cargo-target-dir.sh 输出>/release/bundle/dmg/
 ```
 
 没有正式 Apple 证书时，开发构建会自动使用 ad-hoc 签名。它能验证 App bundle 完整性，但不等于 Developer ID 签名或 Apple notarization。

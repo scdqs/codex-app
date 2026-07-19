@@ -3,12 +3,21 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
+cargo_target_dir="$("${script_dir}/cargo-target-dir.sh")"
+export CARGO_TARGET_DIR="${cargo_target_dir}"
 desktop_resources="${repo_root}/apps/desktop-shell/src-tauri/resources"
 sidecar_target="${desktop_resources}/bin/bridge-sidecar"
 cloudflared_target="${desktop_resources}/bin/cloudflared"
 mobile_target="${desktop_resources}/mobile-pwa"
 
 cloudflared_version="${CLOUDFLARED_VERSION:-2026.7.1}"
+
+check_build_cache_after() {
+  "${script_dir}/check-build-cache.sh" after || true
+}
+
+trap check_build_cache_after EXIT
+"${script_dir}/check-build-cache.sh" before || true
 
 cloudflared_arch() {
   case "$(uname -m)" in
@@ -44,7 +53,7 @@ system_cloudflared() {
 prepare_cloudflared() {
   local arch
   arch="$(cloudflared_arch)"
-  local cache_dir="${repo_root}/target/cloudflared/${cloudflared_version}-${arch}"
+  local cache_dir="${cargo_target_dir}/cloudflared/${cloudflared_version}-${arch}"
   local archive="${cache_dir}/cloudflared-darwin-${arch}.tgz"
   local extracted="${cache_dir}/cloudflared"
   local url="${CLOUDFLARED_URL:-https://github.com/cloudflare/cloudflared/releases/download/${cloudflared_version}/cloudflared-darwin-${arch}.tgz}"
@@ -98,7 +107,7 @@ cargo build -p bridge-sidecar --release
 mkdir -p "${desktop_resources}/bin" "${mobile_target}"
 find "${mobile_target}" -mindepth 1 ! -name ".keep" -exec rm -rf {} +
 
-cp "${repo_root}/target/release/bridge-sidecar" "${sidecar_target}"
+cp "${cargo_target_dir}/release/bridge-sidecar" "${sidecar_target}"
 chmod 755 "${sidecar_target}"
 prepare_cloudflared
 cp -R "${repo_root}/apps/mobile-pwa/dist/." "${mobile_target}/"

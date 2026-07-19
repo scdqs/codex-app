@@ -29,6 +29,7 @@ use tokio::sync::{Mutex, Notify};
 
 const DEFAULT_DEBUG_PORT: u16 = 9229;
 const DEFAULT_BRIDGE_PORT: u16 = 57324;
+const SIBLING_CARGO_TARGET_DIR: &str = "codex-app-shared-target";
 const CONTROL_TOKEN_HEADER: &str = "x-bridge-control-token";
 const SECRET_STORE_SERVICE: &str = "com.codex.mobile.bridge";
 const NAMED_TUNNEL_SUPERVISOR_INTERVAL: Duration = Duration::from_secs(15);
@@ -1921,6 +1922,7 @@ fn sidecar_binary(resource_dir: Option<&Path>, workspace_root: Option<&Path>) ->
         env::var_os("CODEX_MOBILE_BRIDGE_SIDECAR_BIN").map(PathBuf::from),
         resource_dir,
         workspace_root,
+        env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),
     )
 }
 
@@ -1936,6 +1938,7 @@ fn choose_sidecar_binary(
     env_path: Option<PathBuf>,
     resource_dir: Option<&Path>,
     workspace_root: Option<&Path>,
+    cargo_target_dir: Option<PathBuf>,
 ) -> PathBuf {
     if let Some(path) = env_path {
         return path;
@@ -1946,7 +1949,10 @@ fn choose_sidecar_binary(
     {
         return path;
     }
-    workspace_path(workspace_root, "target/debug/bridge-sidecar")
+    if let Some(path) = cargo_target_dir {
+        return path.join("debug/bridge-sidecar");
+    }
+    workspace_cargo_target_path(workspace_root, "debug/bridge-sidecar")
 }
 
 fn choose_pwa_dist_dir(
@@ -1976,6 +1982,14 @@ fn workspace_path(workspace_root: Option<&Path>, path: &str) -> PathBuf {
         .map(Path::to_path_buf)
         .or_else(|| env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
+        .join(path)
+}
+
+fn workspace_cargo_target_path(workspace_root: Option<&Path>, path: &str) -> PathBuf {
+    workspace_root
+        .and_then(Path::parent)
+        .map(|parent| parent.join(SIBLING_CARGO_TARGET_DIR))
+        .unwrap_or_else(|| workspace_path(workspace_root, "target"))
         .join(path)
 }
 
@@ -2396,7 +2410,8 @@ mod tests {
             choose_sidecar_binary(
                 Some(env_path.clone()),
                 Some(resource_dir.path()),
-                Some(workspace_dir.path())
+                Some(workspace_dir.path()),
+                None,
             ),
             env_path
         );
@@ -2411,7 +2426,12 @@ mod tests {
         let workspace_dir = tempdir().expect("workspace tempdir");
 
         assert_eq!(
-            choose_sidecar_binary(None, Some(resource_dir.path()), Some(workspace_dir.path())),
+            choose_sidecar_binary(
+                None,
+                Some(resource_dir.path()),
+                Some(workspace_dir.path()),
+                Some(PathBuf::from("/custom/target")),
+            ),
             bundled_sidecar
         );
     }
@@ -2434,10 +2454,25 @@ mod tests {
     fn resource_lookup_falls_back_to_workspace_paths_when_bundle_is_incomplete() {
         let resource_dir = tempdir().expect("resource tempdir");
         let workspace_dir = tempdir().expect("workspace tempdir");
+        let cargo_target_dir = tempdir().expect("cargo target tempdir");
 
         assert_eq!(
-            choose_sidecar_binary(None, Some(resource_dir.path()), Some(workspace_dir.path())),
-            workspace_dir.path().join("target/debug/bridge-sidecar")
+            choose_sidecar_binary(
+                None,
+                Some(resource_dir.path()),
+                Some(workspace_dir.path()),
+                Some(cargo_target_dir.path().to_path_buf()),
+            ),
+            cargo_target_dir.path().join("debug/bridge-sidecar")
+        );
+        assert_eq!(
+            choose_sidecar_binary(None, None, Some(workspace_dir.path()), None),
+            workspace_dir
+                .path()
+                .parent()
+                .expect("workspace parent")
+                .join(SIBLING_CARGO_TARGET_DIR)
+                .join("debug/bridge-sidecar")
         );
         assert_eq!(
             choose_pwa_dist_dir(None, Some(resource_dir.path()), Some(workspace_dir.path())),

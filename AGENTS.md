@@ -95,8 +95,8 @@
 根据改动范围运行最小充分集合。涉及共享协议、HTTP API、远程访问或发行包时运行完整集合：
 
 ```bash
-cargo test --workspace
-cargo clippy -p desktop-shell -- -D warnings
+./scripts/cargo.sh test --workspace
+./scripts/cargo.sh clippy -p desktop-shell -- -D warnings
 
 cd apps/mobile-pwa
 npm test -- --run
@@ -110,6 +110,8 @@ cd ../..
 ./scripts/check-version-sync.sh
 git diff --check
 ```
+
+Rust/Tauri 构建通过 Git common-dir 统一使用主工作树同级的 `codex-app-shared-target/`。优先通过 `./scripts/cargo.sh` 运行 Cargo 命令，使构建前后执行 20 GB 缓存预警；不要为每个 worktree 恢复独立 `target/`。
 
 构建 DMG：
 
