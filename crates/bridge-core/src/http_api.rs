@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
@@ -35,7 +35,8 @@ use crate::{
     alert_detector::detect_alerts,
     approval::ApprovalDetector,
     codex_rpc::{
-        CodexAdapter, CodexPendingApproval, CodexRawEvent, CodexRpcError, UserImageAttachment,
+        CodexAdapter, CodexPendingApproval, CodexRawEvent, CodexRpcError, CodexThread, CodexTurn,
+        UserImageAttachment,
     },
     diagnostics::DiagnosticsReport,
     event_hub::EventHub,
@@ -69,6 +70,8 @@ pub struct AppState {
     pending_approvals: Arc<Mutex<HashMap<String, ApprovalRequest>>>,
     message_dedupe: Arc<Mutex<MessageDedupeCache>>,
     refresh_failures: Arc<Mutex<HashMap<String, usize>>>,
+    title_enrichment_attempts: Arc<Mutex<HashSet<String>>>,
+    subagent_thread_ids: Arc<Mutex<HashSet<String>>>,
     local_assets: Arc<Mutex<LocalAssetRegistry>>,
     control_token: Arc<str>,
     instance_id: Arc<str>,
@@ -306,6 +309,15 @@ struct ErrorResponse {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct SessionListItem {
+    #[serde(flatten)]
+    snapshot: SessionSnapshot,
+    #[serde(skip_serializing_if = "is_false")]
+    is_subagent: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ControlDiagnosticsResponse {
     #[serde(flatten)]
     diagnostics: DiagnosticsReport,
@@ -332,6 +344,8 @@ impl AppState {
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             message_dedupe: Arc::new(Mutex::new(MessageDedupeCache::default())),
             refresh_failures: Arc::new(Mutex::new(HashMap::new())),
+            title_enrichment_attempts: Arc::new(Mutex::new(HashSet::new())),
+            subagent_thread_ids: Arc::new(Mutex::new(HashSet::new())),
             local_assets: Arc::new(Mutex::new(LocalAssetRegistry::default())),
             control_token: control_token.into(),
             instance_id: Arc::<str>::from(Uuid::new_v4().to_string()),
@@ -417,6 +431,18 @@ impl AppState {
             event.created_at = current_time_ms();
         }
 
+        let suppress_repeated_status = if event.event_type == SessionEventType::StatusChanged {
+            match (
+                live_status_for_event(&event),
+                self.event_hub.snapshot_for_thread(&event.thread_id).await,
+            ) {
+                (Some(status), Some(snapshot)) => snapshot.status == status,
+                _ => false,
+            }
+        } else {
+            false
+        };
+
         let approval_id = self
             .record_live_approval(&notification, &event.thread_id, event.created_at)
             .await;
@@ -427,10 +453,28 @@ impl AppState {
             self.process_snapshot_alerts(&snapshot).await;
         }
 
+        if suppress_repeated_status {
+            return None;
+        }
+
+        self.cache_live_adapter_event(&event).await;
         let event = self.register_local_assets_for_event(event).await;
         let event = session_event_for_mobile(event);
         self.publish_session_event(event.clone()).await;
         Some(event)
+    }
+
+    async fn cache_live_adapter_event(&self, event: &SessionEvent) {
+        if !matches!(
+            event.event_type,
+            SessionEventType::ToolCall | SessionEventType::ToolResult
+        ) {
+            return;
+        }
+        let event = session_event_for_mobile(event.clone());
+        let mut caches = self.adapter_event_cache.lock().await;
+        let cache = caches.entry(event.thread_id.clone()).or_default();
+        merge_adapter_events(&mut cache.events, vec![event]);
     }
 
     async fn record_live_approval(
@@ -1142,18 +1186,112 @@ fn normalized_http_origin(value: &str) -> Option<String> {
 
 async fn list_sessions(
     State(state): State<AppState>,
-) -> Result<Json<Vec<SessionSnapshot>>, ApiError> {
+) -> Result<Json<Vec<SessionListItem>>, ApiError> {
     if let Some(adapter) = state.codex_adapter.as_ref() {
         let threads = adapter.list_threads().await?;
         for thread in threads {
-            state
-                .event_hub
-                .set_snapshot(Normalizer::snapshot_from_thread(&thread))
-                .await;
+            let snapshot = snapshot_for_listed_thread(&state, adapter.as_ref(), &thread).await;
+            state.event_hub.set_snapshot(snapshot).await;
+        }
+
+        for snapshot in state.event_hub.all_snapshots().await {
+            let enriched = enrich_snapshot_title(&state, adapter.as_ref(), snapshot.clone()).await;
+            if enriched.title != snapshot.title {
+                state.event_hub.set_snapshot(enriched).await;
+            }
         }
     }
 
-    Ok(Json(state.event_hub.all_snapshots().await))
+    let subagent_thread_ids = state.subagent_thread_ids.lock().await.clone();
+    Ok(Json(
+        state
+            .event_hub
+            .all_snapshots()
+            .await
+            .into_iter()
+            .map(|snapshot| SessionListItem {
+                is_subagent: subagent_thread_ids.contains(&snapshot.thread_id),
+                snapshot,
+            })
+            .collect(),
+    ))
+}
+
+async fn snapshot_for_listed_thread(
+    state: &AppState,
+    adapter: &dyn CodexAdapter,
+    thread: &CodexThread,
+) -> SessionSnapshot {
+    remember_subagent_classification(state, thread).await;
+    enrich_snapshot_title(state, adapter, Normalizer::snapshot_from_thread(thread)).await
+}
+
+async fn enrich_snapshot_title(
+    state: &AppState,
+    adapter: &dyn CodexAdapter,
+    mut snapshot: SessionSnapshot,
+) -> SessionSnapshot {
+    if snapshot.title != snapshot.thread_id {
+        return snapshot;
+    }
+
+    if let Some(cached) = state
+        .event_hub
+        .snapshot_for_thread(&snapshot.thread_id)
+        .await
+        && cached.title != cached.thread_id
+        && !cached.title.trim().is_empty()
+    {
+        snapshot.title = cached.title;
+        return snapshot;
+    }
+
+    if state
+        .title_enrichment_attempts
+        .lock()
+        .await
+        .contains(&snapshot.thread_id)
+    {
+        return snapshot;
+    }
+
+    match adapter.resume_thread(&snapshot.thread_id).await {
+        Ok(resumed) => {
+            state
+                .title_enrichment_attempts
+                .lock()
+                .await
+                .insert(snapshot.thread_id.clone());
+            if let Some(resumed) = resumed {
+                remember_subagent_classification(state, &resumed).await;
+                let resumed_snapshot = Normalizer::snapshot_from_thread(&resumed);
+                if resumed_snapshot.title != resumed_snapshot.thread_id
+                    && !resumed_snapshot.title.trim().is_empty()
+                {
+                    snapshot.title = resumed_snapshot.title;
+                }
+            }
+        }
+        Err(_) => {
+            // Title enrichment is best-effort. A transient resume failure must not hide sessions.
+        }
+    }
+
+    snapshot
+}
+
+async fn remember_subagent_classification(state: &AppState, thread: &CodexThread) {
+    if Normalizer::is_subagent_thread(thread) {
+        state
+            .subagent_thread_ids
+            .lock()
+            .await
+            .insert(thread.id.clone());
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 async fn list_workspaces(
@@ -1256,7 +1394,23 @@ async fn list_session_events(
             adapter_events_for_query(&state, adapter, &thread_id, &query).await?
         } else {
             let turns = adapter.list_turns(&thread_id).await?;
-            let events = Normalizer::events_from_turns(&thread_id, &turns);
+            let incoming = Normalizer::events_from_turns(&thread_id, &turns);
+            let turn_ids = turns
+                .iter()
+                .filter_map(|turn| turn.id.clone())
+                .collect::<Vec<_>>();
+            let active_turn_ids = active_turn_ids(&turns);
+            let events = {
+                let mut caches = state.adapter_event_cache.lock().await;
+                let cache = caches.entry(thread_id.clone()).or_default();
+                replace_adapter_turn_events(
+                    &mut cache.events,
+                    incoming,
+                    &turn_ids,
+                    &active_turn_ids,
+                );
+                cache.events.clone()
+            };
             state
                 .replace_session_event_history(&thread_id, &events)
                 .await;
@@ -1302,11 +1456,17 @@ async fn adapter_events_for_query(
         .iter()
         .filter_map(|turn| turn.id.clone())
         .collect::<Vec<_>>();
+    let active_first_page_turn_ids = active_turn_ids(&first_page.turns);
     let first_page_events = Normalizer::events_from_turns(thread_id, &first_page.turns);
     let limit = query.page_limit()?;
     let mut caches = state.adapter_event_cache.lock().await;
     let cache = caches.entry(thread_id.to_string()).or_default();
-    replace_adapter_turn_events(&mut cache.events, first_page_events, &first_page_turn_ids);
+    replace_adapter_turn_events(
+        &mut cache.events,
+        first_page_events,
+        &first_page_turn_ids,
+        &active_first_page_turn_ids,
+    );
     if !cache.loaded_older {
         cache.next_cursor = first_page.next_cursor;
     }
@@ -1347,13 +1507,81 @@ fn replace_adapter_turn_events(
     existing: &mut Vec<SessionEvent>,
     incoming: Vec<SessionEvent>,
     turn_ids: &[String],
+    active_turn_ids: &[String],
 ) {
-    existing.retain(|event| {
-        !turn_ids
+    let incoming_ids = incoming
+        .iter()
+        .map(|event| event.id.as_str())
+        .collect::<HashSet<_>>();
+    let turn_anchors = turn_ids
+        .iter()
+        .filter_map(|turn_id| {
+            incoming
+                .iter()
+                .filter(|event| event_belongs_to_turn(&event.id, turn_id))
+                .map(|event| event.created_at)
+                .min()
+                .map(|created_at| (turn_id.clone(), created_at))
+        })
+        .collect::<HashMap<_, _>>();
+    for event in existing.iter_mut() {
+        if !matches!(
+            event.event_type,
+            SessionEventType::ToolCall | SessionEventType::ToolResult
+        ) {
+            continue;
+        }
+        if let Some(turn_id) = turn_ids
             .iter()
-            .any(|turn_id| event_belongs_to_turn(&event.id, turn_id))
+            .find(|turn_id| event_belongs_to_turn(&event.id, turn_id))
+            && let Some(created_at) = turn_anchors.get(turn_id)
+        {
+            event.created_at = *created_at;
+        }
+    }
+    existing.retain(|event| {
+        let affected_turn = turn_ids
+            .iter()
+            .find(|turn_id| event_belongs_to_turn(&event.id, turn_id));
+        let Some(turn_id) = affected_turn else {
+            return !matches!(
+                event.event_type,
+                SessionEventType::ToolCall | SessionEventType::ToolResult
+            );
+        };
+        if incoming_ids.contains(event.id.as_str()) {
+            return false;
+        }
+        match event.event_type {
+            SessionEventType::ToolResult => true,
+            SessionEventType::ToolCall => active_turn_ids
+                .iter()
+                .any(|active| active.as_str() == turn_id.as_str()),
+            _ => false,
+        }
     });
     merge_adapter_events(existing, incoming);
+}
+
+fn active_turn_ids(turns: &[CodexTurn]) -> Vec<String> {
+    turns
+        .iter()
+        .filter(|turn| codex_turn_is_active(turn))
+        .filter_map(|turn| turn.id.clone())
+        .collect()
+}
+
+fn codex_turn_is_active(turn: &CodexTurn) -> bool {
+    let status = turn.raw.get("status");
+    let raw = status
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| status?.get("type")?.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        raw.as_str(),
+        "active" | "inprogress" | "in_progress" | "running" | "streaming"
+    )
 }
 
 fn event_belongs_to_turn(event_id: &str, turn_id: &str) -> bool {
@@ -1372,8 +1600,22 @@ fn merge_adapter_events(existing: &mut Vec<SessionEvent>, incoming: Vec<SessionE
             added += 1;
         }
     }
-    existing.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    existing.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| event_item_order(&left.id).cmp(&event_item_order(&right.id)))
+            .then_with(|| left.id.cmp(&right.id))
+    });
     added
+}
+
+fn event_item_order(event_id: &str) -> Option<u64> {
+    event_id.split(':').rev().find_map(|part| {
+        part.strip_prefix("item-")
+            .unwrap_or(part)
+            .parse::<u64>()
+            .ok()
+    })
 }
 
 async fn mobile_session_events(state: &AppState, events: Vec<SessionEvent>) -> Vec<SessionEvent> {
@@ -3610,6 +3852,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paired_device_enriches_and_caches_untitled_subagent_titles() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let thread_id = "019f75c5-91ec-72c2-b835-4540fc97dd2b";
+        let adapter = Arc::new(
+            RecordingAdapter::with_threads(vec![CodexThread {
+                id: thread_id.to_string(),
+                title: None,
+                cwd: Some("/repo".to_string()),
+                model_provider: Some("openai".to_string()),
+                preview: Some(String::new()),
+                created_at: None,
+                updated_at: Some(1_725_000_000_200),
+                raw: json!({ "id": thread_id, "status": "idle" }),
+            }])
+            .with_resumed_threads(vec![CodexThread {
+                id: thread_id.to_string(),
+                title: None,
+                cwd: Some("/repo".to_string()),
+                model_provider: Some("openai".to_string()),
+                preview: Some(String::new()),
+                created_at: None,
+                updated_at: Some(1_725_000_000_200),
+                raw: json!({
+                    "id": thread_id,
+                    "agentPath": "/root/task5_implementer",
+                    "agentNickname": "Darwin"
+                }),
+            }]),
+        );
+        let resume_calls = adapter.resume_calls();
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/sessions")
+                        .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("request succeeds");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(response).await[0],
+                json!({
+                    "threadId": thread_id,
+                    "title": "Task 5 Implementer · Darwin",
+                    "cwd": "/repo",
+                    "modelProvider": "openai",
+                    "preview": "",
+                    "updatedAt": 1_725_000_000_200u64,
+                    "status": "idle",
+                    "pendingApprovalIds": [],
+                    "isSubagent": true
+                })
+            );
+        }
+
+        assert_eq!(
+            resume_calls.lock().expect("resume calls lock").as_slice(),
+            &[thread_id.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_device_enriches_untitled_live_only_subagent_titles() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let thread_id = "019f78a4-f383-7813-96e0-522b5feb06c7";
+        state
+            .event_hub
+            .set_snapshot(SessionSnapshot {
+                thread_id: thread_id.to_string(),
+                title: thread_id.to_string(),
+                cwd: None,
+                model_provider: None,
+                preview: None,
+                updated_at: 1_725_000_000_300,
+                status: SessionStatus::Running,
+                pending_approval_ids: Vec::new(),
+            })
+            .await;
+        let adapter = Arc::new(
+            RecordingAdapter::with_threads(Vec::new()).with_resumed_threads(vec![CodexThread {
+                id: thread_id.to_string(),
+                title: None,
+                cwd: Some("/repo".to_string()),
+                model_provider: Some("openai".to_string()),
+                preview: Some(String::new()),
+                created_at: None,
+                updated_at: Some(1_725_000_000_300),
+                raw: json!({
+                    "id": thread_id,
+                    "agentPath": "/root/task5_final_fixer",
+                    "agentNickname": "Anscombe"
+                }),
+            }]),
+        );
+        let resume_calls = adapter.resume_calls();
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body[0]["title"], json!("Task 5 Final Fixer · Anscombe"));
+        assert_eq!(body[0]["isSubagent"], json!(true));
+        assert_eq!(
+            resume_calls.lock().expect("resume calls lock").as_slice(),
+            &[thread_id.to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn paired_device_can_list_safe_deduplicated_workspaces() {
         let (_dir, state) = test_state();
         let session_token = pair_device(&state).await;
@@ -4523,6 +4895,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_tool_process_survives_adapter_polling_and_completion() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let adapter = Arc::new(RecordingAdapter::with_turns(
+            "thread-tools",
+            vec![CodexTurn {
+                id: Some("turn-tools".to_string()),
+                thread_id: Some("thread-tools".to_string()),
+                created_at: Some(1_725_000_000_000),
+                updated_at: None,
+                raw: json!({
+                    "status": "inProgress",
+                    "items": [{
+                        "id": "item-1",
+                        "type": "userMessage",
+                        "text": "Find the file",
+                    }],
+                }),
+            }],
+        ));
+        let state = state.with_codex_adapter(adapter.clone());
+        state
+            .apply_codex_notification(CodexRawEvent {
+                method: "item/started".to_string(),
+                params: json!({
+                    "threadId": "thread-tools",
+                    "turnId": "turn-tools",
+                    "item": {
+                        "id": "item-3",
+                        "type": "commandExecution",
+                        "status": "inProgress",
+                        "commandActions": [{
+                            "type": "search",
+                            "command": "rg --files",
+                            "query": "codex-manual.md",
+                            "path": "/Users/damon/Documents/my_ai"
+                        }]
+                    }
+                }),
+            })
+            .await
+            .expect("live tool start is normalized");
+        assert!(
+            state
+                .adapter_event_cache
+                .lock()
+                .await
+                .get("thread-tools")
+                .and_then(|cache| cache.events.first())
+                .is_some_and(|event| event.payload.get("raw").is_none()),
+            "live adapter cache must not retain the raw tool payload"
+        );
+        let app = build_router(state.clone());
+
+        let running = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-tools/events?limit=50")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        let running = response_json(running).await;
+        let running_tool = running["events"]
+            .as_array()
+            .expect("events are returned")
+            .iter()
+            .find(|event| event["id"] == json!("turn-tools:item-3"))
+            .expect("live tool survives polling");
+        assert_eq!(running_tool["type"], json!("tool_call"));
+        assert_eq!(running_tool["payload"]["title"], json!("Searching files"));
+
+        adapter.turns.lock().expect("turns lock").insert(
+            "thread-tools".to_string(),
+            vec![CodexTurn {
+                id: Some("turn-tools".to_string()),
+                thread_id: Some("thread-tools".to_string()),
+                created_at: Some(1_725_000_000_000),
+                updated_at: None,
+                raw: json!({
+                    "status": "completed",
+                    "items": [
+                        {
+                            "id": "item-1",
+                            "type": "userMessage",
+                            "text": "Find the file",
+                        },
+                        {
+                            "id": "item-9",
+                            "type": "agentMessage",
+                            "text": "Found it",
+                        }
+                    ],
+                }),
+            }],
+        );
+        state
+            .apply_codex_notification(CodexRawEvent {
+                method: "item/completed".to_string(),
+                params: json!({
+                    "threadId": "thread-tools",
+                    "turnId": "turn-tools",
+                    "item": {
+                        "id": "item-3",
+                        "type": "commandExecution",
+                        "status": "completed",
+                        "commandActions": [{
+                            "type": "search",
+                            "command": "rg --files",
+                            "query": "codex-manual.md",
+                            "path": "/Users/damon/Documents/my_ai"
+                        }]
+                    }
+                }),
+            })
+            .await
+            .expect("live tool completion is normalized");
+
+        let completed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-tools/events?limit=50")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        let completed = response_json(completed).await;
+        let completed_tool = completed["events"]
+            .as_array()
+            .expect("events are returned")
+            .iter()
+            .find(|event| event["id"] == json!("turn-tools:item-3"))
+            .expect("completed tool remains in history");
+        assert_eq!(completed_tool["type"], json!("tool_result"));
+        assert_eq!(completed_tool["payload"]["title"], json!("Searched files"));
+        assert!(completed_tool["payload"].get("raw").is_none());
+        assert_eq!(
+            completed["events"]
+                .as_array()
+                .expect("events are returned")
+                .iter()
+                .map(|event| event["id"].as_str().expect("event id"))
+                .collect::<Vec<_>>(),
+            vec![
+                "turn-tools:item-1",
+                "turn-tools:item-3",
+                "turn-tools:item-9"
+            ]
+        );
+
+        adapter.turns.lock().expect("turns lock").insert(
+            "thread-tools".to_string(),
+            vec![CodexTurn {
+                id: Some("turn-next".to_string()),
+                thread_id: Some("thread-tools".to_string()),
+                created_at: Some(1_725_000_100_000),
+                updated_at: None,
+                raw: json!({
+                    "status": "completed",
+                    "items": [{
+                        "id": "item-1",
+                        "type": "agentMessage",
+                        "text": "A newer visible turn",
+                    }],
+                }),
+            }],
+        );
+
+        let refreshed = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions/thread-tools/events?limit=50")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        let refreshed = response_json(refreshed).await;
+        assert!(
+            refreshed["events"]
+                .as_array()
+                .expect("events are returned")
+                .iter()
+                .all(|event| event["id"] != json!("turn-tools:item-3")),
+            "tool history must leave the authoritative window with its turn"
+        );
+    }
+
+    #[tokio::test]
     async fn paired_device_event_response_omits_large_adapter_raw_payload() {
         let (_dir, state) = test_state();
         let session_token = pair_device(&state).await;
@@ -5075,6 +5646,115 @@ mod tests {
         assert_eq!(
             subscriber.recv().await.expect("event broadcasts second"),
             ServerEnvelope::SessionEvent(event)
+        );
+    }
+
+    #[tokio::test]
+    async fn app_state_suppresses_repeated_explicit_status_notifications() {
+        let (_dir, state) = test_state();
+        state
+            .event_hub
+            .set_snapshot(SessionSnapshot {
+                thread_id: "thread-live".to_string(),
+                title: "Live thread".to_string(),
+                cwd: Some("/repo".to_string()),
+                model_provider: Some("custom".to_string()),
+                preview: None,
+                updated_at: 1_725_000_000_000,
+                status: SessionStatus::Idle,
+                pending_approval_ids: Vec::new(),
+            })
+            .await;
+
+        let started = state
+            .apply_codex_notification(CodexRawEvent {
+                method: "turn/started".to_string(),
+                params: json!({
+                    "threadId": "thread-live",
+                    "turnId": "turn-live",
+                    "createdAt": 1_725_000_001
+                }),
+            })
+            .await;
+        let repeated = state
+            .apply_codex_notification(CodexRawEvent {
+                method: "thread/status/changed".to_string(),
+                params: json!({
+                    "threadId": "thread-live",
+                    "turnId": "turn-live",
+                    "status": "running",
+                    "createdAt": 1_725_000_002
+                }),
+            })
+            .await;
+
+        assert!(started.is_some());
+        assert!(repeated.is_none());
+        assert_eq!(
+            state
+                .event_history
+                .lock()
+                .await
+                .get("thread-live")
+                .map(VecDeque::len),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn app_state_ignores_context_compaction_without_error_state_or_broadcast() {
+        let (_dir, state) = test_state();
+        state
+            .event_hub
+            .set_snapshot(SessionSnapshot {
+                thread_id: "thread-live".to_string(),
+                title: "Drawer settings".to_string(),
+                cwd: Some("/repo".to_string()),
+                model_provider: Some("custom".to_string()),
+                preview: None,
+                updated_at: 1_725_000_000_000,
+                status: SessionStatus::Running,
+                pending_approval_ids: Vec::new(),
+            })
+            .await;
+        let mut subscriber = state.event_hub().subscribe().await;
+        assert!(matches!(
+            subscriber.recv().await.expect("running snapshot replays"),
+            ServerEnvelope::SessionSnapshot(SessionSnapshot {
+                status: SessionStatus::Running,
+                ..
+            })
+        ));
+
+        let event = state
+            .apply_codex_notification(CodexRawEvent {
+                method: "item/completed".to_string(),
+                params: json!({
+                    "threadId": "thread-live",
+                    "turnId": "turn-live",
+                    "item": {
+                        "id": "item-493",
+                        "type": "contextCompaction"
+                    }
+                }),
+            })
+            .await;
+
+        assert!(event.is_none());
+        assert_eq!(
+            state
+                .event_hub
+                .snapshot_for_thread("thread-live")
+                .await
+                .expect("running snapshot remains")
+                .status,
+            SessionStatus::Running
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), subscriber.recv())
+                .await
+                .is_err(),
+            "context compaction must not broadcast a mobile error or status change"
         );
     }
 
@@ -5722,6 +6402,8 @@ mod tests {
         pending_approvals: Arc<StdMutex<Vec<CodexPendingApproval>>>,
         send_release: Option<Arc<tokio::sync::Semaphore>>,
         send_started: Option<Arc<tokio::sync::Semaphore>>,
+        resumed_threads: Arc<StdMutex<StdHashMap<String, CodexThread>>>,
+        resume_calls: Arc<StdMutex<Vec<String>>>,
         started_threads: Arc<StdMutex<Vec<String>>>,
         started_workspaces: Arc<StdMutex<Vec<String>>>,
         thread_list_error: Option<String>,
@@ -5744,6 +6426,16 @@ mod tests {
                 thread_list_error: Some(message.to_string()),
                 ..Self::default()
             }
+        }
+
+        fn with_resumed_threads(mut self, threads: Vec<CodexThread>) -> Self {
+            self.resumed_threads = Arc::new(StdMutex::new(
+                threads
+                    .into_iter()
+                    .map(|thread| (thread.id.clone(), thread))
+                    .collect(),
+            ));
+            self
         }
 
         fn with_turns(thread_id: impl Into<String>, turns: Vec<CodexTurn>) -> Self {
@@ -5816,6 +6508,10 @@ mod tests {
             self.started_workspaces.clone()
         }
 
+        fn resume_calls(&self) -> Arc<StdMutex<Vec<String>>> {
+            self.resume_calls.clone()
+        }
+
         fn turn_page_cursors(&self) -> Arc<StdMutex<Vec<Option<String>>>> {
             self.turn_page_cursors.clone()
         }
@@ -5878,9 +6574,18 @@ mod tests {
 
         async fn resume_thread(
             &self,
-            _thread_id: &str,
+            thread_id: &str,
         ) -> Result<Option<CodexThread>, CodexRpcError> {
-            Ok(None)
+            self.resume_calls
+                .lock()
+                .expect("resume calls lock")
+                .push(thread_id.to_string());
+            Ok(self
+                .resumed_threads
+                .lock()
+                .expect("resumed threads lock")
+                .get(thread_id)
+                .cloned())
         }
 
         async fn list_turns(&self, thread_id: &str) -> Result<Vec<CodexTurn>, CodexRpcError> {

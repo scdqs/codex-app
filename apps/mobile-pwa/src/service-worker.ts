@@ -9,12 +9,13 @@ import {
 } from "./notifications/service-worker-handlers";
 
 const worker = globalThis as unknown as ServiceWorkerGlobalScope;
-const CACHE_NAME = "codex-mobile-shell-v3";
+const CACHE_NAME = "codex-mobile-shell-v4";
 const SHELL_ASSETS = [
   "/",
   "/manifest.webmanifest",
   "/icon-192.png",
   "/icon-512.png",
+  "/icon-maskable-512.png",
   "/apple-touch-icon.png",
 ];
 const recentEvents = new RecentEventStore();

@@ -21,16 +21,26 @@ import {
   Clock3,
   Command,
   FilePenLine,
+  FileText,
+  FolderOpen,
+  GitBranch,
+  Globe2,
+  Hammer,
+  Hourglass,
+  Image as ImageIcon,
   ImagePlus,
   Menu,
   Pin,
   Plus,
   RefreshCw,
+  Search,
   Send,
   Settings as SettingsIcon,
   ShieldAlert,
   TerminalSquare,
   UserRound,
+  UsersRound,
+  Wrench,
   X,
 } from "lucide-react";
 import {
@@ -75,6 +85,7 @@ import {
   type SessionEventPageOptions,
 } from "./api";
 import { groupSessionsByProject } from "./project-view";
+import { eventTurnScope, groupSessionEventsForDisplay } from "./turn-groups";
 import {
   createDeviceSession,
   loadProjectViewPreferences,
@@ -547,7 +558,7 @@ function App() {
           if (sorted.some((session) => session.threadId === current)) {
             return current;
           }
-          return sorted[0]?.threadId ?? "";
+          return preferredInitialSessionId(sorted);
         });
       } catch (error) {
         if (!cancelled) {
@@ -1421,6 +1432,7 @@ function App() {
         bridgeVersion={bridgeVersion}
         connection={connection}
         newSessionDisabled={!canCreateSession || sending}
+        pendingApprovalCount={pendingCount}
         statusText={statusText}
         showSessionMenuButton
         showNewSessionButton
@@ -1505,7 +1517,6 @@ function App() {
         attachmentError={draftAttachmentError}
         draft={draft}
         sendError={messageSendError}
-        selectedTitle={selectedSession?.title ?? "No session selected"}
         disabled={!canSend || sending}
         onAttachFiles={handleAttachDraftImages}
         onDraftChange={setDraft}
@@ -1563,6 +1574,7 @@ function ConnectionBar({
   newSessionDisabled = false,
   onCreateSession,
   onOpenSessions,
+  pendingApprovalCount = 0,
   sessionMenuButtonRef,
   showNewSessionButton = false,
   showSessionMenuButton = false,
@@ -1573,51 +1585,61 @@ function ConnectionBar({
   newSessionDisabled?: boolean;
   onCreateSession?: () => void;
   onOpenSessions?: () => void;
+  pendingApprovalCount?: number;
   sessionMenuButtonRef?: Ref<HTMLButtonElement>;
   showNewSessionButton?: boolean;
   showSessionMenuButton?: boolean;
   statusText: string;
 }) {
   const secondaryStatusText = statusText === connection.label ? null : statusText;
+  const pendingApprovalText = pendingApprovalCount > 0
+    ? `${pendingApprovalCount} pending approval${pendingApprovalCount === 1 ? "" : "s"}`
+    : null;
+  const railStatusText = [connection.detail, pendingApprovalText ?? secondaryStatusText]
+    .filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index)
+    .join(" · ");
 
   return (
     <header className="connection-bar" aria-label="Connection status">
-      {showSessionMenuButton ? (
-        <button
-          className="session-menu-button"
-          onClick={onOpenSessions}
-          ref={sessionMenuButtonRef}
-          type="button"
-          aria-label="Open sessions"
-        >
-          <Menu size={18} aria-hidden="true" />
-        </button>
-      ) : null}
-      {showNewSessionButton ? (
-        <button
-          className="new-session-button"
-          disabled={newSessionDisabled}
-          onClick={onCreateSession}
-          type="button"
-          aria-label="New session"
-        >
-          <Plus size={18} aria-hidden="true" />
-        </button>
-      ) : null}
-      <div className="connection-primary">
-        <span className={`status-dot ${connectionClass(connection.label)}`} aria-hidden="true" />
-        <div>
-          <p className="eyebrow">
-            LAN bridge
-            {bridgeVersion ? <span className="app-version">v{bridgeVersion}</span> : null}
-          </p>
+      <div className="connection-main-row">
+        <div className="connection-actions">
+          {showSessionMenuButton ? (
+            <button
+              className="session-menu-button"
+              onClick={onOpenSessions}
+              ref={sessionMenuButtonRef}
+              type="button"
+              aria-label="Open sessions"
+            >
+              <Menu size={18} aria-hidden="true" />
+            </button>
+          ) : null}
+          {showNewSessionButton ? (
+            <button
+              className="new-session-button"
+              disabled={newSessionDisabled}
+              onClick={onCreateSession}
+              type="button"
+              aria-label="New session"
+            >
+              <Plus size={18} aria-hidden="true" />
+            </button>
+          ) : null}
+        </div>
+        <div className="connection-primary">
           <h1>Codex Mobile</h1>
-          {connection.detail ? <p className="connection-detail">{connection.detail}</p> : null}
+        </div>
+        <div className="connection-meta">
+          <span className={`meta-chip ${connectionClass(connection.label)}`}>{connection.label}</span>
         </div>
       </div>
-      <div className="connection-meta">
-        <span className={`meta-chip ${connectionClass(connection.label)}`}>{connection.label}</span>
-        {secondaryStatusText ? <span className="meta-chip muted">{secondaryStatusText}</span> : null}
+      <div className="connection-status-rail" aria-label="Bridge status rail">
+        <span className="bridge-identity">
+          <span className={`status-dot ${connectionClass(connection.label)}`} aria-hidden="true" />
+          <span>LAN bridge</span>
+          {bridgeVersion ? <span className="app-version">v{bridgeVersion}</span> : null}
+        </span>
+        {railStatusText ? <span className="connection-status-message">{railStatusText}</span> : null}
       </div>
     </header>
   );
@@ -1652,7 +1674,7 @@ function ApprovalQueue({
                   <h3>{approval.title}</h3>
                   <span>{approval.kind.replace("_", " ")}</span>
                 </div>
-                <p className="approval-detail">{approval.detail}</p>
+                <ApprovalDetail detail={approval.detail} title={approval.title} />
                 {approval.riskHint ? (
                   <p className="risk-line">
                     <ShieldAlert size={13} aria-hidden="true" />
@@ -1662,22 +1684,24 @@ function ApprovalQueue({
               </div>
               <div className="approval-actions" aria-label={`${approval.title} decision`}>
                 <button
-                  className="icon-button danger"
+                  className="approval-action-button danger"
                   disabled={disabled}
                   onClick={() => onDecision(approval, "reject")}
                   type="button"
                   aria-label={`Reject ${approval.title}`}
                 >
-                  <X size={16} />
+                  <X size={16} aria-hidden="true" />
+                  <span>{pendingDecision === "reject" ? "Rejecting…" : "Reject"}</span>
                 </button>
                 <button
-                  className="icon-button success"
+                  className="approval-action-button success"
                   disabled={disabled}
                   onClick={() => onDecision(approval, "approve")}
                   type="button"
                   aria-label={`Approve ${approval.title}`}
                 >
-                  <Check size={16} />
+                  <Check size={16} aria-hidden="true" />
+                  <span>{pendingDecision === "approve" ? "Allowing…" : "Allow once"}</span>
                 </button>
               </div>
             </article>
@@ -1685,6 +1709,59 @@ function ApprovalQueue({
         })}
       </div>
     </section>
+  );
+}
+
+function ApprovalDetail({ detail, title }: { detail: string; title: string }) {
+  const detailRef = useRef<HTMLParagraphElement | null>(null);
+  const [expanded, setExpanded] = useState(false);
+  const [overflowing, setOverflowing] = useState(false);
+
+  useLayoutEffect(() => {
+    if (expanded) {
+      return;
+    }
+
+    const detailElement = detailRef.current;
+    if (!detailElement) {
+      return;
+    }
+
+    const measureOverflow = () => {
+      const nextOverflowing = detailElement.scrollHeight > detailElement.clientHeight + 1;
+      setOverflowing((current) => (current === nextOverflowing ? current : nextOverflowing));
+    };
+
+    measureOverflow();
+    window.addEventListener("resize", measureOverflow);
+    const resizeObserver =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measureOverflow);
+    resizeObserver?.observe(detailElement);
+
+    return () => {
+      window.removeEventListener("resize", measureOverflow);
+      resizeObserver?.disconnect();
+    };
+  }, [detail, expanded]);
+
+  const showToggle = expanded || overflowing;
+  return (
+    <div className="approval-detail-shell">
+      <p ref={detailRef} className={`approval-detail${expanded ? " expanded" : ""}`}>
+        {detail}
+      </p>
+      {showToggle ? (
+        <button
+          className="approval-detail-toggle"
+          type="button"
+          aria-expanded={expanded}
+          aria-label={`${expanded ? "Collapse" : "Expand"} ${title}`}
+          onClick={() => setExpanded((current) => !current)}
+        >
+          {expanded ? "Collapse" : "Expand"}
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -2105,6 +2182,10 @@ function SessionDetail({
   const eventTailKey = eventTail
     ? `${eventTail.id}:${eventTail.createdAt}:${payloadText(eventTail.payload).length}`
     : "";
+  const displayGroups = useMemo(
+    () => groupSessionEventsForDisplay(sessionEvents),
+    [sessionEvents],
+  );
 
   useLayoutEffect(() => {
     if (!threadId) {
@@ -2224,17 +2305,237 @@ function SessionDetail({
             </button>
           </div>
         ) : null}
-        {sessionEvents.map((event) => (
-          <EventRow
-            assetSession={assetSession}
-            event={event}
-            key={event.id}
-            sessionStatus={session.status}
-          />
-        ))}
+        {displayGroups.map((group) =>
+          group.kind === "assistant_turn" ? (
+            <AssistantTurn
+              assetSession={assetSession}
+              events={group.events}
+              key={group.key}
+              sessionStatus={session.status}
+            />
+          ) : (
+            <EventRow
+              assetSession={assetSession}
+              event={group.event}
+              key={group.key}
+              sessionStatus={session.status}
+            />
+          ),
+        )}
       </div>
     </section>
   );
+}
+
+function AssistantTurn({
+  assetSession,
+  events,
+  sessionStatus,
+}: {
+  assetSession: DeviceSession | null;
+  events: SessionEvent[];
+  sessionStatus: SessionStatus;
+}) {
+  const latestEvent = events.at(-1);
+  if (!latestEvent) {
+    return null;
+  }
+
+  return (
+    <article aria-label="Codex response" className="event-row assistant assistant-turn">
+      <span className="event-icon" aria-hidden="true">
+        <Bot size={14} />
+      </span>
+      <div className="event-content assistant-turn-content">
+        <div className="event-meta assistant-turn-meta">
+          <p className="event-kind">Codex</p>
+          <time dateTime={new Date(latestEvent.createdAt).toISOString()}>
+            {formatEventTime(latestEvent.createdAt)}
+          </time>
+        </div>
+        <div className="assistant-turn-parts">
+          {events.map((event) => (
+            <AssistantTurnPart
+              assetSession={assetSession}
+              event={event}
+              key={event.id}
+              sessionStatus={sessionStatus}
+            />
+          ))}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function AssistantTurnPart({
+  assetSession,
+  event,
+  sessionStatus,
+}: {
+  assetSession: DeviceSession | null;
+  event: SessionEvent;
+  sessionStatus: SessionStatus;
+}) {
+  if (event.type === "reasoning_summary" || event.type === "reasoning_summary_delta") {
+    return <ReasoningBlock event={event} sessionStatus={sessionStatus} />;
+  }
+
+  if (event.type === "tool_call" || event.type === "tool_result") {
+    return <ToolActivity event={event} />;
+  }
+
+  const actor = eventActor(event);
+  const attachments = payloadImageAttachments(event.payload);
+  const isAnswer = actor === "assistant";
+
+  return (
+    <section className={`assistant-turn-part${isAnswer ? " answer" : " progress"}`}>
+      {!isAnswer ? (
+        <div className="assistant-turn-part-meta">
+          <span aria-hidden="true">{eventIcon(event, actor)}</span>
+          <span>{eventKindLabel(event, actor)}</span>
+          <time dateTime={new Date(event.createdAt).toISOString()}>
+            {formatEventTime(event.createdAt)}
+          </time>
+        </div>
+      ) : null}
+      <MessageBody text={payloadText(event.payload)} />
+      {attachments.length > 0 ? (
+        <div className="attachment-list" aria-label="Image attachments">
+          {attachments.map((attachment, index) => (
+            <AttachmentImage
+              assetSession={assetSession}
+              attachment={attachment}
+              key={`${attachment.src}:${index}`}
+            />
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+type ToolActivityStatus = "running" | "completed" | "failed" | "declined";
+
+interface ToolActivityView {
+  kind: string;
+  status: ToolActivityStatus;
+  title: string;
+  detail: string | null;
+}
+
+function ToolActivity({ event }: { event: SessionEvent }) {
+  const activity = toolActivityView(event);
+
+  return (
+    <section
+      aria-label="Tool activity"
+      className={`tool-activity ${activity.status}`}
+    >
+      <span className="tool-activity-icon" aria-hidden="true">
+        {toolActivityIcon(activity.kind, activity.status)}
+      </span>
+      <span className="tool-activity-copy">
+        <span className="tool-activity-title">{activity.title}</span>
+        {activity.detail ? <span className="tool-activity-detail">{activity.detail}</span> : null}
+      </span>
+      <time dateTime={new Date(event.createdAt).toISOString()}>
+        {formatEventTime(event.createdAt)}
+      </time>
+    </section>
+  );
+}
+
+function toolActivityView(event: SessionEvent): ToolActivityView {
+  const payload = sessionEventPayloadObject(event.payload);
+  const status = toolActivityStatus(payload?.toolStatus, event.type);
+  const title = payloadString(payload?.title) ??
+    (status === "running"
+      ? "Working"
+      : status === "completed"
+        ? "Finished work"
+        : status === "declined"
+          ? "Skipped tool"
+          : "Tool failed");
+  const explicitDetail = payloadString(payload?.detail);
+  const fallbackText = payloadText(event.payload);
+  const detail = explicitDetail ??
+    (fallbackText && fallbackText !== title && !fallbackText.startsWith(`${title}:`)
+      ? fallbackText
+      : null);
+
+  return {
+    kind: payloadString(payload?.toolKind) ?? "tool",
+    status,
+    title,
+    detail,
+  };
+}
+
+function toolActivityStatus(
+  value: SessionEvent["payload"] | undefined,
+  eventType: SessionEvent["type"],
+): ToolActivityStatus {
+  if (value === "running" || value === "completed" || value === "failed" || value === "declined") {
+    return value;
+  }
+  return eventType === "tool_call" ? "running" : "completed";
+}
+
+function toolActivityIcon(kind: string, status: ToolActivityStatus) {
+  if (status === "completed") {
+    return <Check size={14} />;
+  }
+  if (status === "failed") {
+    return <AlertTriangle size={14} />;
+  }
+  if (status === "declined") {
+    return <X size={14} />;
+  }
+
+  switch (kind) {
+    case "search":
+      return <Search size={14} />;
+    case "read":
+      return <FileText size={14} />;
+    case "list_files":
+      return <FolderOpen size={14} />;
+    case "file_change":
+      return <FilePenLine size={14} />;
+    case "web_search":
+      return <Globe2 size={14} />;
+    case "image":
+      return <ImageIcon size={14} />;
+    case "subagent":
+      return <UsersRound size={14} />;
+    case "wait":
+      return <Hourglass size={14} />;
+    case "build":
+      return <Hammer size={14} />;
+    case "git":
+      return <GitBranch size={14} />;
+    case "test":
+      return <CircleDot size={14} />;
+    case "command":
+      return <TerminalSquare size={14} />;
+    case "review":
+      return <ShieldAlert size={14} />;
+    default:
+      return <Wrench size={14} />;
+  }
+}
+
+function sessionEventPayloadObject(
+  payload: SessionEvent["payload"],
+): Record<string, SessionEvent["payload"]> | null {
+  return payload !== null && typeof payload === "object" && !Array.isArray(payload)
+    ? (payload as Record<string, SessionEvent["payload"]>)
+    : null;
+}
+
+function payloadString(value: SessionEvent["payload"] | undefined): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
 function EventRow({
@@ -2584,7 +2885,6 @@ function Composer({
   onRemoveAttachment,
   onSubmit,
   sendError,
-  selectedTitle,
 }: {
   attachments: DraftImageAttachment[];
   attachmentError: string;
@@ -2595,7 +2895,6 @@ function Composer({
   onRemoveAttachment: (id: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   sendError: string;
-  selectedTitle: string;
 }) {
   const canSubmit = !disabled && (draft.trim().length > 0 || attachments.length > 0);
 
@@ -2626,7 +2925,6 @@ function Composer({
         id="codex-message"
         name="message"
         onChange={(event) => onDraftChange(event.target.value)}
-        placeholder={`Message ${selectedTitle}`}
         rows={1}
         disabled={disabled}
         value={draft}
@@ -3014,7 +3312,11 @@ export function appendOrMergeSessionEvent(events: SessionEvent[], event: Session
       shouldReconcileUserMessages(existing, event),
     );
     if (transientIndex !== -1) {
-      if (isPendingPayload(event.payload) && isBridgeUserEcho(events[transientIndex])) {
+      const existing = events[transientIndex];
+      if (
+        (isPendingPayload(event.payload) && isBridgeUserEcho(existing)) ||
+        (isBridgeUserEcho(event) && isCanonicalUserMessage(existing))
+      ) {
         return events;
       }
       const nextEvents = [...events];
@@ -3030,7 +3332,7 @@ export function appendOrMergeSessionEvent(events: SessionEvent[], event: Session
 
   const delta = deltaText(event.payload);
   if (!delta) {
-    return [...events, event];
+    return events;
   }
 
   const candidate = events.at(-1);
@@ -3049,7 +3351,7 @@ export function appendOrMergeSessionEvent(events: SessionEvent[], event: Session
     {
       ...event,
       type: baseType,
-      payload: { role: streamingRole(baseType), text: delta },
+      payload: streamingPayload(event.payload, baseType, delta),
     },
   ];
 }
@@ -3100,11 +3402,30 @@ function streamedEvent(
   return {
     ...current,
     type,
-    payload: {
-      role: streamingRole(type),
-      text: `${payloadText(current.payload)}${delta}`,
-    },
+    payload: streamingPayload(
+      current.payload,
+      type,
+      `${payloadText(current.payload)}${delta}`,
+    ),
     createdAt,
+  };
+}
+
+function streamingPayload(
+  payload: SessionEvent["payload"],
+  type: StreamingBaseEventType,
+  text: string,
+): SessionEvent["payload"] {
+  const metadata = payload !== null && typeof payload === "object" && !Array.isArray(payload)
+    ? { ...payload }
+    : {};
+  delete metadata.role;
+  delete metadata.text;
+  delete metadata.delta;
+  return {
+    ...metadata,
+    role: streamingRole(type),
+    text,
   };
 }
 
@@ -3182,6 +3503,9 @@ export function mergeIncrementalSessionEvents(
       .filter((text): text is string => text !== null),
   );
   const retained = current.filter((event) => {
+    if (incremental.some((snapshotEvent) => shouldReplaceLiveTurnEvent(event, snapshotEvent))) {
+      return false;
+    }
     if (!isPendingPayload(event.payload)) {
       return true;
     }
@@ -3190,6 +3514,49 @@ export function mergeIncrementalSessionEvents(
   });
 
   return sortSessionEvents(mergeSessionEvents([...retained, ...incremental]));
+}
+
+function shouldReplaceLiveTurnEvent(current: SessionEvent, snapshot: SessionEvent): boolean {
+  if (current.threadId !== snapshot.threadId) {
+    return false;
+  }
+  if (current.id === snapshot.id) {
+    return true;
+  }
+
+  const currentTurnScope = eventTurnScope(current);
+  const snapshotTurnScope = eventTurnScope(snapshot);
+  if (
+    currentTurnScope === null ||
+    snapshotTurnScope === null ||
+    currentTurnScope !== snapshotTurnScope
+  ) {
+    return false;
+  }
+
+  if (isUserMessage(current) && isUserMessage(snapshot)) {
+    return normalizedUserMessageText(current) === normalizedUserMessageText(snapshot);
+  }
+
+  const currentFamily = eventFamily(current.type);
+  if (currentFamily === null || currentFamily !== eventFamily(snapshot.type)) {
+    return false;
+  }
+  if (
+    currentFamily === "message" &&
+    (!isAssistantMessage(current) || !isAssistantMessage(snapshot))
+  ) {
+    return false;
+  }
+
+  const currentText = payloadText(current.payload).trim();
+  const snapshotText = payloadText(snapshot.payload).trim();
+  return (
+    currentText.length === 0 ||
+    snapshotText.length === 0 ||
+    currentText.startsWith(snapshotText) ||
+    snapshotText.startsWith(currentText)
+  );
 }
 
 function sortSessionEvents(events: SessionEvent[]): SessionEvent[] {
@@ -3274,14 +3641,19 @@ function shouldReconcileUserMessages(existing: SessionEvent, next: SessionEvent)
   const existingPending = isPendingPayload(existing.payload);
   const nextPending = isPendingPayload(next.payload);
   const existingBridgeEcho = isBridgeUserEcho(existing);
+  const nextBridgeEcho = isBridgeUserEcho(next);
 
   if (existingPending) {
     return !nextPending;
   }
-  if (!existingBridgeEcho) {
+  if (!existingBridgeEcho && !nextBridgeEcho) {
     return false;
   }
   return Math.abs(existing.createdAt - next.createdAt) <= USER_MESSAGE_RECONCILIATION_WINDOW_MS;
+}
+
+function isCanonicalUserMessage(event: SessionEvent): boolean {
+  return isUserMessage(event) && !isPendingPayload(event.payload) && !isBridgeUserEcho(event);
 }
 
 function isBridgeUserEcho(event: SessionEvent): boolean {
@@ -3481,6 +3853,14 @@ export function nextPollDelay(
 
 function sortSessions(items: SessionSnapshot[]): SessionSnapshot[] {
   return [...items].sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function preferredInitialSessionId(items: SessionSnapshot[]): string {
+  return items.find((session) => !isSubagentSession(session))?.threadId ?? items[0]?.threadId ?? "";
+}
+
+function isSubagentSession(session: SessionSnapshot): boolean {
+  return (session as SessionSnapshot & { isSubagent?: boolean }).isSubagent === true;
 }
 
 function selectNewSessionWorkspace(

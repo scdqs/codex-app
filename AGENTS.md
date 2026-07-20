@@ -4,7 +4,7 @@
 
 本项目让手机继续操作电脑上正在运行的 ChatGPT/Codex Desktop 任务。桌面 Agent 仍是唯一执行端；Bridge 负责读取会话、回写消息、处理审批、设备配对和远程访问，手机 PWA 不直接调用模型 API。
 
-当前产品基线为 `v0.1.7 Beta`，优先支持 macOS Desktop App。CLI、Windows、Linux、原生手机 App 和复杂授权策略属于后续范围，除非用户明确提升优先级。
+当前产品基线为 `v0.1.15 Beta`，优先支持 macOS Desktop App。CLI、Windows、Linux、原生手机 App 和复杂授权策略属于后续范围，除非用户明确提升优先级。
 
 ## 仓库结构
 
@@ -35,6 +35,8 @@
 - 消息按旧到新展示，最新消息在底部；同 turn 同时间戳要保持稳定顺序。
 - 不把 adapter 的大型 `raw` payload 暴露给手机端。
 - reasoning summary、最终回答、plan 和工具状态必须分类型；不得把 `reasoning/textDelta` 或隐藏 chain-of-thought 暴露给手机。
+- 工具过程必须从结构化 item 生成有界、可读、可脱敏的状态；搜索、读文件、目录、命令、修改、MCP/Web、图片和子任务等不得退化成空白 `tool call`，也不得把完整本机路径、命令原始大输出或 adapter `raw` 暴露给手机。
+- Desktop turn 快照省略实时工具 item 时，Bridge 可将已经由 app-server notification 确认的工具事件并入权威 HTTP 窗口；只在 turn 仍活动时保留未完成 `tool_call`，已完成 `tool_result` 可进入当前有界事件历史。
 
 ### 项目层级
 

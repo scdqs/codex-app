@@ -428,7 +428,11 @@ function parseSessionResponse(value: unknown): SessionResponse {
   };
 }
 
-function parseSessionSnapshots(value: unknown): SessionSnapshot[] {
+type SessionSnapshotWithMetadata = SessionSnapshot & {
+  isSubagent?: boolean;
+};
+
+function parseSessionSnapshots(value: unknown): SessionSnapshotWithMetadata[] {
   if (!Array.isArray(value)) {
     throw new ApiValidationError("Sessions response must be an array");
   }
@@ -459,7 +463,7 @@ function parseApprovalRequests(value: unknown): ApprovalRequest[] {
   });
 }
 
-function parseSessionSnapshot(value: unknown): SessionSnapshot {
+function parseSessionSnapshot(value: unknown): SessionSnapshotWithMetadata {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ApiValidationError("Session snapshot must be an object");
   }
@@ -472,7 +476,8 @@ function parseSessionSnapshot(value: unknown): SessionSnapshot {
     !Number.isFinite(session.updatedAt) ||
     !isSessionStatus(session.status) ||
     !Array.isArray(session.pendingApprovalIds) ||
-    !session.pendingApprovalIds.every((id) => typeof id === "string")
+    !session.pendingApprovalIds.every((id) => typeof id === "string") ||
+    (session.isSubagent !== undefined && typeof session.isSubagent !== "boolean")
   ) {
     throw new ApiValidationError("Session snapshot is missing required fields");
   }
@@ -483,6 +488,7 @@ function parseSessionSnapshot(value: unknown): SessionSnapshot {
     cwd: typeof session.cwd === "string" ? session.cwd : undefined,
     modelProvider: typeof session.modelProvider === "string" ? session.modelProvider : undefined,
     preview: typeof session.preview === "string" ? session.preview : undefined,
+    isSubagent: typeof session.isSubagent === "boolean" ? session.isSubagent : undefined,
     updatedAt: session.updatedAt,
     status: session.status,
     pendingApprovalIds: session.pendingApprovalIds,

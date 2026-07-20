@@ -9,14 +9,69 @@ use crate::{
 
 pub struct Normalizer;
 
+#[derive(Clone, Copy)]
+enum ToolLifecycle {
+    Started,
+    Completed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolStatus {
+    Running,
+    Completed,
+    Failed,
+    Declined,
+}
+
+impl ToolStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Declined => "declined",
+        }
+    }
+}
+
+struct ToolActivity {
+    kind: &'static str,
+    status: ToolStatus,
+    title: String,
+    detail: Option<String>,
+}
+
 impl Normalizer {
+    pub fn is_subagent_thread(thread: &CodexThread) -> bool {
+        string_field(
+            &thread.raw,
+            &[
+                "parentThreadId",
+                "parent_thread_id",
+                "parentId",
+                "parent_id",
+            ],
+        )
+        .is_some()
+            || string_field(&thread.raw, &["threadSource", "thread_source", "source"])
+                .is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
+            || subagent_title(&thread.raw).is_some()
+    }
+
     pub fn snapshot_from_thread(thread: &CodexThread) -> SessionSnapshot {
         SessionSnapshot {
             thread_id: thread.id.clone(),
             title: thread
                 .title
                 .clone()
-                .or_else(|| thread.preview.clone())
+                .filter(|title| !title.trim().is_empty())
+                .or_else(|| {
+                    thread
+                        .preview
+                        .clone()
+                        .filter(|preview| !preview.trim().is_empty())
+                })
+                .or_else(|| subagent_title(&thread.raw))
                 .unwrap_or_else(|| thread.id.clone()),
             cwd: thread.cwd.clone(),
             model_provider: thread.model_provider.clone(),
@@ -49,7 +104,14 @@ impl Normalizer {
         let thread_id = thread_id_from_value(&notification.params).unwrap_or_default();
         let created_at = timestamp_field(
             &notification.params,
-            &["createdAt", "created_at", "timestamp", "time"],
+            &[
+                "createdAt",
+                "created_at",
+                "startedAtMs",
+                "completedAtMs",
+                "timestamp",
+                "time",
+            ],
         )
         .unwrap_or_default();
         let method = notification.method.as_str();
@@ -64,7 +126,11 @@ impl Normalizer {
             _ => None,
         };
         if let Some((event_type, role)) = delta_type {
-            let text = delta_text_from_value(&notification.params).unwrap_or_default();
+            let text = delta_text_from_value(&notification.params)?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            let turn_id = turn_id_from_value(&notification.params);
             return Some(SessionEvent {
                 id: item_event_id(&thread_id, &notification.params, "delta"),
                 thread_id,
@@ -72,6 +138,7 @@ impl Normalizer {
                 payload: json!({
                     "role": role,
                     "text": text,
+                    "turnId": turn_id,
                     "raw": notification.params,
                 }),
                 created_at,
@@ -79,13 +146,18 @@ impl Normalizer {
         }
 
         if method == "item/reasoning/summaryPartAdded" {
+            let text = summary_part_text(&notification.params)?;
+            if text.trim().is_empty() {
+                return None;
+            }
             return Some(SessionEvent {
                 id: item_event_id(&thread_id, &notification.params, "reasoning-summary"),
                 thread_id,
                 event_type: SessionEventType::ReasoningSummary,
                 payload: json!({
                     "role": "reasoning",
-                    "text": summary_part_text(&notification.params).unwrap_or_default(),
+                    "text": text,
+                    "turnId": turn_id_from_value(&notification.params),
                     "raw": notification.params,
                 }),
                 created_at,
@@ -102,11 +174,12 @@ impl Normalizer {
                 updated_at: Some(created_at),
                 raw: json!({ "items": [item] }),
             };
-            let mut event = event_from_item(&thread_id, 0, 0, item, &turn);
-            if method == "item/completed" && event.event_type == SessionEventType::ToolCall {
-                event.event_type = SessionEventType::ToolResult;
-            }
-            return Some(event);
+            let lifecycle = if method == "item/started" {
+                ToolLifecycle::Started
+            } else {
+                ToolLifecycle::Completed
+            };
+            return event_from_item(&thread_id, 0, 0, item, &turn, Some(lifecycle));
         }
 
         if method == "turn/started" {
@@ -214,7 +287,9 @@ fn events_from_turn(thread_id: &str, turn_index: usize, turn: &CodexTurn) -> Vec
     turn_items(&turn.raw)
         .into_iter()
         .enumerate()
-        .map(|(item_index, item)| event_from_item(thread_id, turn_index, item_index, &item, turn))
+        .filter_map(|(item_index, item)| {
+            event_from_item(thread_id, turn_index, item_index, &item, turn, None)
+        })
         .collect()
 }
 
@@ -224,13 +299,30 @@ fn event_from_item(
     item_index: usize,
     item: &Value,
     turn: &CodexTurn,
-) -> SessionEvent {
+    lifecycle: Option<ToolLifecycle>,
+) -> Option<SessionEvent> {
     let role = role_from_item(item);
-    let event_type = event_type_for_role(role);
+    let mut event_type = event_type_for_role(role)?;
+    let tool_activity = matches!(
+        event_type,
+        SessionEventType::ToolCall | SessionEventType::ToolResult
+    )
+    .then(|| tool_activity_from_item(item, turn, lifecycle));
+    if let Some(activity) = tool_activity.as_ref() {
+        event_type = if activity.status == ToolStatus::Running {
+            SessionEventType::ToolCall
+        } else {
+            SessionEventType::ToolResult
+        };
+    }
     let attachments = image_attachments_from_value(item);
-    let text = text_for_item(item, event_type)
+    let text = tool_activity
+        .as_ref()
+        .map(tool_activity_text)
+        .or_else(|| text_for_item(item, event_type))
         .map(|text| scrub_attachment_paths_from_text(&text, &attachments))
         .unwrap_or_default();
+    let has_attachments = !attachments.is_empty();
     let created_at = timestamp_field(item, &["createdAt", "created_at", "timestamp"])
         .or_else(|| turn.created_at.map(normalize_timestamp_ms))
         .or_else(|| turn.updated_at.map(normalize_timestamp_ms))
@@ -244,24 +336,48 @@ fn event_from_item(
         })
         .or_else(|| turn.id.clone().map(|id| format!("{id}:{item_index}")))
         .unwrap_or_else(|| format!("{thread_id}:turn-{turn_index}:item-{item_index}"));
+    let payload_role = if event_type == SessionEventType::ToolResult {
+        "tool_result"
+    } else {
+        role
+    };
     let mut payload = json!({
-        "role": role,
+        "role": payload_role,
         "text": text,
+        "turnId": turn.id.clone(),
         "raw": item,
     });
-    if !attachments.is_empty() {
+    if let Some(activity) = tool_activity
+        && let Some(payload) = payload.as_object_mut()
+    {
+        payload.insert("toolKind".to_string(), json!(activity.kind));
+        payload.insert("toolStatus".to_string(), json!(activity.status.as_str()));
+        payload.insert("title".to_string(), json!(activity.title));
+        if let Some(detail) = activity.detail {
+            payload.insert("detail".to_string(), json!(detail));
+        }
+    }
+    if has_attachments {
         if let Some(payload) = payload.as_object_mut() {
             payload.insert("attachments".to_string(), Value::Array(attachments));
         }
     }
+    if text.trim().is_empty()
+        && !has_attachments
+        && (event_type == SessionEventType::ReasoningSummary
+            || event_type == SessionEventType::Plan
+            || (event_type == SessionEventType::Message && role == "assistant"))
+    {
+        return None;
+    }
 
-    SessionEvent {
+    Some(SessionEvent {
         id,
         thread_id: thread_id.to_string(),
         event_type,
         payload,
         created_at,
-    }
+    })
 }
 
 fn turn_items(value: &Value) -> Vec<Value> {
@@ -293,14 +409,15 @@ fn turn_items(value: &Value) -> Vec<Value> {
     }
 }
 
-fn event_type_for_role(role: &str) -> SessionEventType {
+fn event_type_for_role(role: &str) -> Option<SessionEventType> {
     match role {
-        "reasoning" => SessionEventType::ReasoningSummary,
-        "plan" => SessionEventType::Plan,
-        "tool" => SessionEventType::ToolCall,
-        "tool_result" => SessionEventType::ToolResult,
-        "unknown" => SessionEventType::Error,
-        _ => SessionEventType::Message,
+        "reasoning" => Some(SessionEventType::ReasoningSummary),
+        "plan" => Some(SessionEventType::Plan),
+        "tool" => Some(SessionEventType::ToolCall),
+        "tool_result" => Some(SessionEventType::ToolResult),
+        "error" => Some(SessionEventType::Error),
+        "context_compaction" | "unknown" => None,
+        _ => Some(SessionEventType::Message),
     }
 }
 
@@ -330,12 +447,584 @@ fn role_from_item(item: &Value) -> &'static str {
         | "assistant_message" | "output_text" | "output" => "assistant",
         "reasoning" | "reasoning_summary" | "reasoningsummary" => "reasoning",
         "plan" | "plan_update" | "planupdate" => "plan",
-        "toolcall" | "tool_call" | "function_call" | "commandexecution" | "command_execution"
-        | "filechange" | "file_change" | "mcptoolcall" | "mcp_tool_call" | "dynamictoolcall"
-        | "dynamic_tool_call" | "websearch" | "web_search" => "tool",
+        "contextcompaction" | "context_compaction" => "context_compaction",
+        "error" | "errorevent" | "error_event" => "error",
+        "toolcall"
+        | "tool_call"
+        | "function_call"
+        | "commandexecution"
+        | "command_execution"
+        | "filechange"
+        | "file_change"
+        | "mcptoolcall"
+        | "mcp_tool_call"
+        | "dynamictoolcall"
+        | "dynamic_tool_call"
+        | "collabagenttoolcall"
+        | "collab_agent_tool_call"
+        | "subagentactivity"
+        | "sub_agent_activity"
+        | "websearch"
+        | "web_search"
+        | "imageview"
+        | "image_view"
+        | "imagegeneration"
+        | "image_generation"
+        | "sleep"
+        | "enteredreviewmode"
+        | "entered_review_mode"
+        | "exitedreviewmode"
+        | "exited_review_mode" => "tool",
         "toolresult" | "tool_result" | "function_call_output" => "tool_result",
         _ => "unknown",
     }
+}
+
+fn tool_activity_from_item(
+    item: &Value,
+    turn: &CodexTurn,
+    lifecycle: Option<ToolLifecycle>,
+) -> ToolActivity {
+    let status = tool_status_from_item(item, turn, lifecycle);
+    let item_type = string_field(item, &["type", "itemType", "item_type"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match item_type.as_str() {
+        "commandexecution" | "command_execution" => command_activity(item, status),
+        "filechange" | "file_change" => ToolActivity {
+            kind: "file_change",
+            status,
+            title: activity_title(
+                status,
+                "Updating files",
+                "Updated files",
+                "File update failed",
+                "Skipped file update",
+            ),
+            detail: changed_file_detail(item),
+        },
+        "mcptoolcall" | "mcp_tool_call" => ToolActivity {
+            kind: "mcp",
+            status,
+            title: activity_title(
+                status,
+                "Using tool",
+                "Used tool",
+                "Tool failed",
+                "Skipped tool",
+            ),
+            detail: tool_name_detail(item, "server"),
+        },
+        "dynamictoolcall" | "dynamic_tool_call" => ToolActivity {
+            kind: "tool",
+            status,
+            title: activity_title(
+                status,
+                "Using tool",
+                "Used tool",
+                "Tool failed",
+                "Skipped tool",
+            ),
+            detail: tool_name_detail(item, "namespace"),
+        },
+        "websearch" | "web_search" => ToolActivity {
+            kind: "web_search",
+            status,
+            title: activity_title(
+                status,
+                "Searching the web",
+                "Searched the web",
+                "Web search failed",
+                "Skipped web search",
+            ),
+            detail: string_field(item, &["query"])
+                .or_else(|| string_field_at(item, &["/action/query"]))
+                .and_then(|query| bounded_safe_detail(&query, 180)),
+        },
+        "imageview" | "image_view" => ToolActivity {
+            kind: "image",
+            status,
+            title: activity_title(
+                status,
+                "Viewing image",
+                "Viewed image",
+                "Image view failed",
+                "Skipped image view",
+            ),
+            detail: string_field(item, &["path"]).map(|path| safe_path_label(&path)),
+        },
+        "imagegeneration" | "image_generation" => ToolActivity {
+            kind: "image",
+            status,
+            title: activity_title(
+                status,
+                "Generating image",
+                "Generated image",
+                "Image generation failed",
+                "Skipped image generation",
+            ),
+            detail: None,
+        },
+        "collabagenttoolcall" | "collab_agent_tool_call" => subagent_activity(item, status),
+        "subagentactivity" | "sub_agent_activity" => ToolActivity {
+            kind: "subagent",
+            status,
+            title: activity_title(
+                status,
+                "Coordinating subtask",
+                "Coordinated subtask",
+                "Subtask failed",
+                "Skipped subtask",
+            ),
+            detail: string_field(item, &["agentPath", "agent_path"])
+                .and_then(|path| agent_task_label(&path)),
+        },
+        "sleep" => ToolActivity {
+            kind: "wait",
+            status,
+            title: activity_title(status, "Waiting", "Waited", "Wait failed", "Skipped wait"),
+            detail: item
+                .get("durationMs")
+                .or_else(|| item.get("duration_ms"))
+                .and_then(Value::as_u64)
+                .map(duration_label),
+        },
+        "enteredreviewmode" | "entered_review_mode" => ToolActivity {
+            kind: "review",
+            status,
+            title: "Entered review mode".to_string(),
+            detail: string_field(item, &["review"])
+                .and_then(|value| bounded_safe_detail(&value, 180)),
+        },
+        "exitedreviewmode" | "exited_review_mode" => ToolActivity {
+            kind: "review",
+            status,
+            title: "Exited review mode".to_string(),
+            detail: string_field(item, &["review"])
+                .and_then(|value| bounded_safe_detail(&value, 180)),
+        },
+        _ => ToolActivity {
+            kind: "tool",
+            status,
+            title: activity_title(
+                status,
+                "Working",
+                "Finished work",
+                "Tool failed",
+                "Skipped tool",
+            ),
+            detail: string_field(item, &["name", "tool"])
+                .and_then(|value| humanize_identifier(&value)),
+        },
+    }
+}
+
+fn command_activity(item: &Value, status: ToolStatus) -> ToolActivity {
+    let action = item
+        .get("commandActions")
+        .or_else(|| item.get("command_actions"))
+        .and_then(Value::as_array)
+        .and_then(|actions| actions.first());
+    let action_type = action
+        .and_then(|action| string_field(action, &["type"]))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match action_type.as_str() {
+        "read" => ToolActivity {
+            kind: "read",
+            status,
+            title: activity_title(
+                status,
+                "Reading file",
+                "Read file",
+                "File read failed",
+                "Skipped file read",
+            ),
+            detail: action.and_then(|action| {
+                string_field(action, &["name"])
+                    .filter(|name| !name.trim().is_empty())
+                    .and_then(|name| bounded_safe_detail(&name, 120))
+                    .or_else(|| string_field(action, &["path"]).map(|path| safe_path_label(&path)))
+            }),
+        },
+        "listfiles" | "list_files" => ToolActivity {
+            kind: "list_files",
+            status,
+            title: activity_title(
+                status,
+                "Listing files",
+                "Listed files",
+                "File listing failed",
+                "Skipped file listing",
+            ),
+            detail: action
+                .and_then(|action| string_field(action, &["path"]))
+                .map(|path| safe_path_label(&path)),
+        },
+        "search" => ToolActivity {
+            kind: "search",
+            status,
+            title: activity_title(
+                status,
+                "Searching files",
+                "Searched files",
+                "File search failed",
+                "Skipped file search",
+            ),
+            detail: action.and_then(search_action_detail),
+        },
+        _ => command_fallback_activity(item, action, status),
+    }
+}
+
+fn command_fallback_activity(
+    item: &Value,
+    action: Option<&Value>,
+    status: ToolStatus,
+) -> ToolActivity {
+    let command = action
+        .and_then(|action| string_field(action, &["command"]))
+        .or_else(|| string_field(item, &["command"]))
+        .unwrap_or_default();
+    let lower = command.to_ascii_lowercase();
+    let (kind, running, completed, failed, declined) = if command_runs_tests(&lower) {
+        (
+            "test",
+            "Running tests",
+            "Ran tests",
+            "Tests failed",
+            "Skipped tests",
+        )
+    } else if command_builds_project(&lower) {
+        (
+            "build",
+            "Building project",
+            "Built project",
+            "Build failed",
+            "Skipped build",
+        )
+    } else if command_inspects_git(&lower) {
+        (
+            "git",
+            "Inspecting Git changes",
+            "Inspected Git changes",
+            "Git inspection failed",
+            "Skipped Git inspection",
+        )
+    } else if command_searches_files(&lower) {
+        (
+            "search",
+            "Searching files",
+            "Searched files",
+            "File search failed",
+            "Skipped file search",
+        )
+    } else if command_reads_files(&lower) {
+        (
+            "read",
+            "Reading files",
+            "Read files",
+            "File read failed",
+            "Skipped file read",
+        )
+    } else if command_lists_files(&lower) {
+        (
+            "list_files",
+            "Listing files",
+            "Listed files",
+            "File listing failed",
+            "Skipped file listing",
+        )
+    } else {
+        (
+            "command",
+            "Running command",
+            "Ran command",
+            "Command failed",
+            "Skipped command",
+        )
+    };
+
+    ToolActivity {
+        kind,
+        status,
+        title: activity_title(status, running, completed, failed, declined),
+        detail: None,
+    }
+}
+
+fn subagent_activity(item: &Value, status: ToolStatus) -> ToolActivity {
+    let tool = string_field(item, &["tool"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let (running, completed) = if tool.contains("spawn") {
+        ("Starting subtask", "Started subtask")
+    } else if tool.contains("wait") {
+        ("Waiting for subtasks", "Finished waiting for subtasks")
+    } else if tool.contains("close") || tool.contains("interrupt") {
+        ("Stopping subtask", "Stopped subtask")
+    } else {
+        ("Coordinating subtasks", "Coordinated subtasks")
+    };
+    ToolActivity {
+        kind: "subagent",
+        status,
+        title: activity_title(
+            status,
+            running,
+            completed,
+            "Subtask failed",
+            "Skipped subtask",
+        ),
+        detail: string_field(item, &["prompt"])
+            .filter(|prompt| !prompt.trim().is_empty())
+            .and_then(|prompt| bounded_safe_detail(&prompt, 180)),
+    }
+}
+
+fn tool_status_from_item(
+    item: &Value,
+    turn: &CodexTurn,
+    lifecycle: Option<ToolLifecycle>,
+) -> ToolStatus {
+    let raw_status = string_field(item, &["status", "state"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(raw_status.as_str(), "failed" | "failure" | "error")
+        || item.get("success").and_then(Value::as_bool) == Some(false)
+    {
+        return ToolStatus::Failed;
+    }
+    if matches!(raw_status.as_str(), "declined" | "rejected" | "denied") {
+        return ToolStatus::Declined;
+    }
+    if matches!(lifecycle, Some(ToolLifecycle::Started)) {
+        return ToolStatus::Running;
+    }
+    if matches!(lifecycle, Some(ToolLifecycle::Completed))
+        || matches!(
+            raw_status.as_str(),
+            "completed" | "complete" | "done" | "success"
+        )
+    {
+        return ToolStatus::Completed;
+    }
+    if matches!(
+        raw_status.as_str(),
+        "inprogress" | "in_progress" | "running" | "started"
+    ) {
+        return ToolStatus::Running;
+    }
+
+    match status_from_value(&turn.raw) {
+        Some(SessionStatus::Running)
+        | Some(SessionStatus::WaitingForApproval)
+        | Some(SessionStatus::WaitingForInput) => ToolStatus::Running,
+        Some(SessionStatus::Error) => ToolStatus::Failed,
+        _ => ToolStatus::Completed,
+    }
+}
+
+fn activity_title(
+    status: ToolStatus,
+    running: &str,
+    completed: &str,
+    failed: &str,
+    declined: &str,
+) -> String {
+    match status {
+        ToolStatus::Running => running,
+        ToolStatus::Completed => completed,
+        ToolStatus::Failed => failed,
+        ToolStatus::Declined => declined,
+    }
+    .to_string()
+}
+
+fn tool_activity_text(activity: &ToolActivity) -> String {
+    match activity.detail.as_deref() {
+        Some(detail) if !detail.trim().is_empty() => format!("{}: {detail}", activity.title),
+        _ => activity.title.clone(),
+    }
+}
+
+fn search_action_detail(action: &Value) -> Option<String> {
+    let query = string_field(action, &["query"])
+        .filter(|query| !query.trim().is_empty())
+        .and_then(|query| bounded_safe_detail(&query, 140));
+    let path = string_field(action, &["path"])
+        .filter(|path| !path.trim().is_empty())
+        .map(|path| safe_path_label(&path));
+    match (query, path) {
+        (Some(query), Some(path)) => Some(format!("{query} in {path}")),
+        (Some(query), None) => Some(query),
+        (None, Some(path)) => Some(path),
+        (None, None) => None,
+    }
+}
+
+fn changed_file_detail(item: &Value) -> Option<String> {
+    let changes = item.get("changes")?.as_array()?;
+    let mut labels = Vec::new();
+    for change in changes {
+        let Some(path) = string_field(change, &["path"]) else {
+            continue;
+        };
+        let label = safe_path_label(&path);
+        if !labels.iter().any(|current| current == &label) {
+            labels.push(label);
+        }
+    }
+    match labels.len() {
+        0 => None,
+        1..=3 => Some(labels.join(", ")),
+        count => Some(format!("{count} files")),
+    }
+}
+
+fn tool_name_detail(item: &Value, namespace_key: &str) -> Option<String> {
+    let tool = string_field(item, &["tool", "name"])
+        .filter(|tool| !tool.trim().is_empty())
+        .and_then(|tool| humanize_identifier(&tool));
+    let namespace = string_field(item, &[namespace_key])
+        .filter(|namespace| !namespace.trim().is_empty())
+        .and_then(|namespace| bounded_safe_detail(&namespace, 80));
+    match (namespace, tool) {
+        (Some(namespace), Some(tool)) => Some(format!("{namespace} · {tool}")),
+        (None, Some(tool)) => Some(tool),
+        (Some(namespace), None) => Some(namespace),
+        (None, None) => None,
+    }
+}
+
+fn safe_path_label(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| bounded_plain_text(name, 120))
+        .unwrap_or_else(|| "workspace".to_string())
+}
+
+fn humanize_identifier(value: &str) -> Option<String> {
+    bounded_safe_detail(&value.replace(['_', '-'], " "), 120)
+}
+
+fn bounded_safe_detail(value: &str, max_chars: usize) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() || contains_absolute_path(&normalized) {
+        return None;
+    }
+    Some(bounded_plain_text(&normalized, max_chars))
+}
+
+fn contains_absolute_path(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '\"' | '\''
+                        | '`'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        | ','
+                        | ';'
+                        | '='
+                )
+        })
+        .filter(|candidate| !candidate.is_empty())
+        .any(|candidate| {
+            Path::new(candidate).is_absolute()
+                || candidate
+                    .as_bytes()
+                    .get(1..3)
+                    .is_some_and(|separator| separator == b":\\" || separator == b":/")
+                || candidate.starts_with("\\\\")
+                || candidate.split_once(':').is_some_and(|(prefix, path)| {
+                    !matches!(prefix.to_ascii_lowercase().as_str(), "http" | "https")
+                        && Path::new(path).is_absolute()
+                })
+        })
+}
+
+fn bounded_plain_text(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let bounded = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
+
+fn duration_label(duration_ms: u64) -> String {
+    if duration_ms < 1_000 {
+        format!("{duration_ms} ms")
+    } else if duration_ms % 1_000 == 0 {
+        format!("{} s", duration_ms / 1_000)
+    } else {
+        format!("{:.1} s", duration_ms as f64 / 1_000.0)
+    }
+}
+
+fn command_runs_tests(command: &str) -> bool {
+    [
+        "cargo test",
+        "npm test",
+        "pnpm test",
+        "yarn test",
+        "pytest",
+        "vitest",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle))
+}
+
+fn command_builds_project(command: &str) -> bool {
+    [
+        "cargo build",
+        "npm run build",
+        "pnpm build",
+        "yarn build",
+        "tauri build",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle))
+}
+
+fn command_inspects_git(command: &str) -> bool {
+    ["git status", "git diff", "git log", "git show"]
+        .iter()
+        .any(|needle| command.contains(needle))
+}
+
+fn command_searches_files(command: &str) -> bool {
+    command.starts_with("rg ")
+        || command.contains(" rg ")
+        || command.starts_with("grep ")
+        || command.contains(" grep ")
+}
+
+fn command_reads_files(command: &str) -> bool {
+    ["sed ", "cat ", "head ", "tail "]
+        .iter()
+        .any(|needle| command.starts_with(needle) || command.contains(&format!(" {needle}")))
+}
+
+fn command_lists_files(command: &str) -> bool {
+    ["find ", "ls "]
+        .iter()
+        .any(|needle| command.starts_with(needle) || command.contains(&format!(" {needle}")))
 }
 
 fn text_for_item(item: &Value, event_type: SessionEventType) -> Option<String> {
@@ -434,6 +1123,90 @@ fn approval_ids_from_value(value: &Value) -> Vec<String> {
     .unwrap_or_default()
 }
 
+fn subagent_title(value: &Value) -> Option<String> {
+    let agent_path = string_field(value, &["agentPath", "agent_path"]).or_else(|| {
+        [
+            "/source/subagent/threadSpawn/agentPath",
+            "/source/subagent/thread_spawn/agent_path",
+            "/source/subAgent/threadSpawn/agentPath",
+            "/source/subAgent/thread_spawn/agent_path",
+        ]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .map(ToString::to_string)
+    });
+    let agent_nickname = string_field(value, &["agentNickname", "agent_nickname"]).or_else(|| {
+        [
+            "/source/subagent/threadSpawn/agentNickname",
+            "/source/subagent/thread_spawn/agent_nickname",
+            "/source/subAgent/threadSpawn/agentNickname",
+            "/source/subAgent/thread_spawn/agent_nickname",
+        ]
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .map(ToString::to_string)
+    });
+    let task_label = agent_path.as_deref().and_then(agent_task_label);
+    let nickname = agent_nickname.filter(|nickname| !nickname.trim().is_empty());
+
+    match (task_label, nickname) {
+        (Some(task_label), Some(nickname)) => Some(format!("{task_label} · {nickname}")),
+        (Some(task_label), None) => Some(task_label),
+        (None, Some(nickname)) => Some(format!("Subtask · {nickname}")),
+        (None, None) => None,
+    }
+}
+
+fn agent_task_label(path: &str) -> Option<String> {
+    let leaf = path.rsplit('/').find(|part| !part.trim().is_empty())?;
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut previous_was_digit: Option<bool> = None;
+
+    for character in leaf.chars() {
+        if !character.is_ascii_alphanumeric() {
+            push_agent_word(&mut words, &mut current);
+            previous_was_digit = None;
+            continue;
+        }
+
+        let is_digit = character.is_ascii_digit();
+        if previous_was_digit.is_some_and(|previous| previous != is_digit) {
+            push_agent_word(&mut words, &mut current);
+        }
+        current.push(character);
+        previous_was_digit = Some(is_digit);
+    }
+    push_agent_word(&mut words, &mut current);
+
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+fn push_agent_word(words: &mut Vec<String>, current: &mut String) {
+    if current.is_empty() {
+        return;
+    }
+
+    let raw = std::mem::take(current);
+    let lower = raw.to_ascii_lowercase();
+    let display = match lower.as_str() {
+        "api" => "API".to_string(),
+        "mvp" => "MVP".to_string(),
+        "pwa" => "PWA".to_string(),
+        "qa" => "QA".to_string(),
+        "tdd" => "TDD".to_string(),
+        "ui" => "UI".to_string(),
+        _ => {
+            let mut characters = lower.chars();
+            match characters.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + characters.as_str(),
+                None => return,
+            }
+        }
+    };
+    words.push(display);
+}
+
 fn thread_id_from_value(value: &Value) -> Option<String> {
     string_field(value, &["threadId", "thread_id"])
         .or_else(|| {
@@ -468,19 +1241,21 @@ fn thread_id_from_value(value: &Value) -> Option<String> {
         })
 }
 
+fn turn_id_from_value(value: &Value) -> Option<String> {
+    string_field(value, &["turnId", "turn_id"]).or_else(|| {
+        value
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+    })
+}
+
 fn event_id(thread_id: &str, value: &Value, suffix: &str) -> String {
     if let Some(id) = string_field(value, &["eventId", "event_id", "id"]) {
         return id;
     }
 
-    let turn_id = string_field(value, &["turnId", "turn_id"])
-        .or_else(|| {
-            value
-                .pointer("/turn/id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-        .unwrap_or_else(|| "turn".to_string());
+    let turn_id = turn_id_from_value(value).unwrap_or_else(|| "turn".to_string());
     let item_id = string_field(value, &["itemId", "item_id"])
         .or_else(|| {
             value
@@ -494,12 +1269,7 @@ fn event_id(thread_id: &str, value: &Value, suffix: &str) -> String {
 }
 
 fn item_event_id(thread_id: &str, value: &Value, suffix: &str) -> String {
-    let turn_id = string_field(value, &["turnId", "turn_id"]).or_else(|| {
-        value
-            .pointer("/turn/id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-    });
+    let turn_id = turn_id_from_value(value);
     let item_id = string_field(value, &["itemId", "item_id"]).or_else(|| {
         value
             .pointer("/item/id")
@@ -634,6 +1404,13 @@ fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn string_field_at(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .map(ToString::to_string)
+}
+
 fn timestamp_field(value: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_u64))
@@ -692,6 +1469,55 @@ mod tests {
     }
 
     #[test]
+    fn uses_subagent_metadata_when_thread_has_no_title_or_preview() {
+        let thread = CodexThread {
+            id: "019f75c5-91ec-72c2-b835-4540fc97dd2b".to_string(),
+            title: None,
+            cwd: Some("/repo".to_string()),
+            model_provider: Some("custom".to_string()),
+            preview: Some("".to_string()),
+            created_at: None,
+            updated_at: Some(1_725_000_000_000),
+            raw: json!({
+                "source": {
+                    "subAgent": {
+                        "thread_spawn": {
+                            "agent_path": "/root/task5_implementer",
+                            "agent_nickname": "Darwin"
+                        }
+                    }
+                },
+                "thread_source": "subagent",
+                "agentNickname": "Darwin"
+            }),
+        };
+
+        let snapshot = Normalizer::snapshot_from_thread(&thread);
+
+        assert_eq!(snapshot.title, "Task 5 Implementer · Darwin");
+        assert!(Normalizer::is_subagent_thread(&thread));
+    }
+
+    #[test]
+    fn keeps_root_threads_out_of_subagent_classification() {
+        let thread = CodexThread {
+            id: "thread-root".to_string(),
+            title: Some("Main conversation".to_string()),
+            cwd: Some("/repo".to_string()),
+            model_provider: Some("custom".to_string()),
+            preview: Some("Continue the main task".to_string()),
+            created_at: None,
+            updated_at: Some(1_725_000_000_000),
+            raw: json!({
+                "id": "thread-root",
+                "threadSource": "user"
+            }),
+        };
+
+        assert!(!Normalizer::is_subagent_thread(&thread));
+    }
+
+    #[test]
     fn maps_active_waiting_on_approval_status_object() {
         let thread = CodexThread {
             id: "thread-approval".to_string(),
@@ -735,8 +1561,286 @@ mod tests {
         assert_eq!(event.event_type, SessionEventType::MessageDelta);
         assert_eq!(event.payload["role"], json!("assistant"));
         assert_eq!(event.payload["text"], json!("hello"));
+        assert_eq!(event.payload["turnId"], json!("turn-1"));
         assert_eq!(event.payload["raw"]["delta"], json!("hello"));
         assert_eq!(event.created_at, 1_725_000_000_000);
+    }
+
+    #[test]
+    fn ignores_empty_live_stream_events() {
+        for method in [
+            "item/agentMessage/delta",
+            "item/reasoning/summaryTextDelta",
+            "item/plan/delta",
+            "item/reasoning/summaryPartAdded",
+        ] {
+            let event = Normalizer::event_from_raw_notification(&CodexRawEvent {
+                method: method.to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-empty",
+                    "delta": "",
+                    "text": "",
+                    "part": { "text": "" }
+                }),
+            });
+
+            assert!(
+                event.is_none(),
+                "{method} must not create an empty mobile card"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_empty_in_progress_assistant_reasoning_and_plan_items() {
+        for item_type in ["agentMessage", "reasoning", "plan"] {
+            let event = Normalizer::event_from_raw_notification(&CodexRawEvent {
+                method: "item/started".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": format!("{item_type}-empty"),
+                        "type": item_type,
+                        "content": []
+                    }
+                }),
+            });
+
+            assert!(
+                event.is_none(),
+                "empty {item_type} must stay hidden until text arrives"
+            );
+        }
+    }
+
+    #[test]
+    fn normalizes_live_file_search_as_a_safe_tool_activity() {
+        let started = Normalizer::event_from_raw_notification(&CodexRawEvent {
+            method: "item/started".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "search-1",
+                    "type": "commandExecution",
+                    "command": "rg --files /Users/damon/Documents/my_ai/codex-manual.md",
+                    "cwd": "/Users/damon/Documents/my_ai",
+                    "status": "inProgress",
+                    "commandActions": [{
+                        "type": "search",
+                        "command": "rg --files",
+                        "query": "codex-manual.md",
+                        "path": "/Users/damon/Documents/my_ai"
+                    }]
+                }
+            }),
+        })
+        .expect("started search is public progress");
+        let completed = Normalizer::event_from_raw_notification(&CodexRawEvent {
+            method: "item/completed".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "search-1",
+                    "type": "commandExecution",
+                    "command": "rg --files /Users/damon/Documents/my_ai/codex-manual.md",
+                    "cwd": "/Users/damon/Documents/my_ai",
+                    "status": "completed",
+                    "commandActions": [{
+                        "type": "search",
+                        "command": "rg --files",
+                        "query": "codex-manual.md",
+                        "path": "/Users/damon/Documents/my_ai"
+                    }]
+                }
+            }),
+        })
+        .expect("completed search is public progress");
+
+        assert_eq!(started.id, "turn-1:search-1");
+        assert_eq!(completed.id, started.id);
+        assert_eq!(started.event_type, SessionEventType::ToolCall);
+        assert_eq!(completed.event_type, SessionEventType::ToolResult);
+        assert_eq!(started.payload["toolKind"], json!("search"));
+        assert_eq!(started.payload["toolStatus"], json!("running"));
+        assert_eq!(started.payload["title"], json!("Searching files"));
+        assert_eq!(started.payload["detail"], json!("codex-manual.md in my_ai"));
+        assert_eq!(completed.payload["toolStatus"], json!("completed"));
+        assert_eq!(completed.payload["title"], json!("Searched files"));
+        assert!(
+            !started.payload["text"]
+                .as_str()
+                .unwrap()
+                .contains("/Users/damon")
+        );
+    }
+
+    #[test]
+    fn historical_tool_items_keep_meaningful_completed_processes() {
+        let turns = vec![CodexTurn {
+            id: Some("turn-1".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            created_at: Some(1_725_000_000_000),
+            updated_at: None,
+            raw: json!({
+                "status": "completed",
+                "items": [
+                    {
+                        "id": "read-1",
+                        "type": "commandExecution",
+                        "command": "sed -n 1,120p /Users/damon/Documents/my_ai/codex-app/AGENTS.md",
+                        "status": "completed",
+                        "commandActions": [{
+                            "type": "read",
+                            "command": "sed",
+                            "name": "AGENTS.md",
+                            "path": "/Users/damon/Documents/my_ai/codex-app/AGENTS.md"
+                        }]
+                    },
+                    {
+                        "id": "edit-1",
+                        "type": "fileChange",
+                        "status": "completed",
+                        "changes": [
+                            { "path": "/Users/damon/Documents/my_ai/codex-app/src/App.tsx", "kind": "update", "diff": "large" },
+                            { "path": "/Users/damon/Documents/my_ai/codex-app/src/styles.css", "kind": "update", "diff": "large" }
+                        ]
+                    },
+                    {
+                        "id": "mcp-1",
+                        "type": "mcpToolCall",
+                        "server": "nocturne-memory",
+                        "tool": "read_memory",
+                        "status": "completed",
+                        "arguments": { "uri": "system://boot" }
+                    },
+                    {
+                        "id": "web-1",
+                        "type": "webSearch",
+                        "query": "Codex app-server protocol",
+                        "action": { "type": "search", "query": "Codex app-server protocol" }
+                    }
+                ]
+            }),
+        }];
+
+        let events = Normalizer::events_from_turns("thread-1", &turns);
+
+        assert_eq!(events.len(), 4);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type == SessionEventType::ToolResult)
+        );
+        assert_eq!(events[0].payload["title"], json!("Read file"));
+        assert_eq!(events[0].payload["detail"], json!("AGENTS.md"));
+        assert_eq!(events[1].payload["title"], json!("Updated files"));
+        assert_eq!(events[1].payload["detail"], json!("App.tsx, styles.css"));
+        assert_eq!(events[2].payload["title"], json!("Used tool"));
+        assert_eq!(
+            events[2].payload["detail"],
+            json!("nocturne-memory · read memory")
+        );
+        assert_eq!(events[3].payload["title"], json!("Searched the web"));
+        assert_eq!(
+            events[3].payload["detail"],
+            json!("Codex app-server protocol")
+        );
+        assert!(events.iter().all(|event| {
+            !event.payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("/Users/damon")
+        }));
+    }
+
+    #[test]
+    fn free_form_tool_details_do_not_expose_absolute_paths() {
+        let turns = vec![CodexTurn {
+            id: Some("turn-private-paths".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            created_at: Some(1_725_000_000_000),
+            updated_at: None,
+            raw: json!({
+                "status": "completed",
+                "items": [
+                    {
+                        "id": "web-1",
+                        "type": "webSearch",
+                        "query": "inspect /Users/damon/Documents/private-notes.md"
+                    },
+                    {
+                        "id": "read-1",
+                        "type": "commandExecution",
+                        "commandActions": [{
+                            "type": "read",
+                            "name": "/Users/damon/Documents/private-notes.md",
+                            "path": "/Users/damon/Documents/private-notes.md"
+                        }]
+                    },
+                    {
+                        "id": "subagent-1",
+                        "type": "collabAgentToolCall",
+                        "tool": "spawn_agent",
+                        "prompt": "Review /Users/damon/Documents/private-notes.md"
+                    },
+                    {
+                        "id": "review-1",
+                        "type": "enteredReviewMode",
+                        "review": "Inspect /Users/damon/Documents/private-notes.md"
+                    },
+                    {
+                        "id": "tool-1",
+                        "type": "dynamicToolCall",
+                        "tool": "/Users/damon/bin/private-tool"
+                    },
+                    {
+                        "id": "web-2",
+                        "type": "webSearch",
+                        "query": "cwd=/Users/damon/Documents/private-notes.md"
+                    },
+                    {
+                        "id": "web-3",
+                        "type": "webSearch",
+                        "query": "file:///Users/damon/Documents/private-notes.md"
+                    },
+                    {
+                        "id": "web-4",
+                        "type": "webSearch",
+                        "query": "https://example.com/docs"
+                    }
+                ]
+            }),
+        }];
+
+        let events = Normalizer::events_from_turns("thread-1", &turns);
+
+        assert_eq!(events.len(), 8);
+        assert_eq!(events[0].payload.get("detail"), None);
+        assert_eq!(events[1].payload["detail"], json!("private-notes.md"));
+        assert_eq!(events[2].payload.get("detail"), None);
+        assert_eq!(events[3].payload.get("detail"), None);
+        assert_eq!(events[4].payload.get("detail"), None);
+        assert_eq!(events[5].payload.get("detail"), None);
+        assert_eq!(events[6].payload.get("detail"), None);
+        assert_eq!(
+            events[7].payload["detail"],
+            json!("https://example.com/docs")
+        );
+        assert!(events.iter().all(|event| {
+            let mut public_payload = event.payload.clone();
+            public_payload
+                .as_object_mut()
+                .expect("tool payload is an object")
+                .remove("raw");
+            !serde_json::to_string(&public_payload)
+                .expect("payload serializes")
+                .contains("/Users/damon")
+        }));
     }
 
     #[test]
@@ -783,6 +1887,46 @@ mod tests {
     }
 
     #[test]
+    fn ignores_live_context_compaction_items_without_emitting_errors() {
+        for item_type in ["contextCompaction", "futureProtocolItem"] {
+            for method in ["item/started", "item/completed"] {
+                let notification = CodexRawEvent {
+                    method: method.to_string(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "item-493",
+                            "type": item_type
+                        }
+                    }),
+                };
+
+                assert!(
+                    Normalizer::event_from_raw_notification(&notification).is_none(),
+                    "{method} {item_type} must not become a mobile error"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_explicit_turn_failures_as_error_status() {
+        let event = Normalizer::event_from_raw_notification(&CodexRawEvent {
+            method: "turn/failed".to_string(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "error": { "message": "model request failed" }
+            }),
+        })
+        .expect("turn failure is public");
+
+        assert_eq!(event.event_type, SessionEventType::StatusChanged);
+        assert_eq!(event.payload["status"], json!("error"));
+    }
+
+    #[test]
     fn normalizes_historical_reasoning_summary_and_plan_items() {
         let turns = vec![CodexTurn {
             id: Some("turn-1".to_string()),
@@ -821,6 +1965,49 @@ mod tests {
         );
         assert_eq!(events[1].event_type, SessionEventType::Plan);
         assert_eq!(events[1].payload["text"], json!("Run the regression suite"));
+    }
+
+    #[test]
+    fn ignores_historical_context_compaction_items_without_emitting_errors() {
+        let turns = vec![CodexTurn {
+            id: Some("turn-1".to_string()),
+            thread_id: Some("thread-1".to_string()),
+            created_at: Some(1_725_000_000_000),
+            updated_at: None,
+            raw: json!({
+                "items": [
+                    {
+                        "id": "item-1",
+                        "type": "userMessage",
+                        "content": "Run the drawer tests"
+                    },
+                    {
+                        "id": "item-493",
+                        "type": "contextCompaction"
+                    },
+                    {
+                        "id": "future-item",
+                        "type": "futureProtocolItem"
+                    },
+                    {
+                        "id": "item-494",
+                        "type": "reasoning",
+                        "summary": [{ "type": "summary_text", "text": "Continuing after compaction" }]
+                    }
+                ]
+            }),
+        }];
+
+        let events = Normalizer::events_from_turns("thread-1", &turns);
+
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != SessionEventType::Error)
+        );
+        assert_eq!(events[0].id, "turn-1:item-1");
+        assert_eq!(events[1].id, "turn-1:item-494");
     }
 
     #[test]

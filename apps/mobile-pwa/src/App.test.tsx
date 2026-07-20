@@ -12,6 +12,7 @@ import App, {
 } from "./App";
 import type { SessionEvent, SessionSnapshot } from "@codex/bridge-protocol";
 import { ApiError } from "./api";
+import { groupSessionEventsForDisplay } from "./turn-groups";
 import {
   clearProjectViewPreferences,
   clearSession,
@@ -56,7 +57,7 @@ describe("App", () => {
     expect(screen.queryByText("Bridge sidecar API")).not.toBeInTheDocument();
     expect(screen.getByText("No live sessions yet. Use the newest pairing URL from the bridge terminal.")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "No sessions available" })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("Message No session selected")).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: "Message selected Codex session" })).toBeDisabled();
   });
 
   it("shows_the_running_bridge_version_from_health", async () => {
@@ -75,6 +76,63 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByText("v9.9.9")).toBeInTheDocument();
+  });
+
+  it("uses_the_confirmed_two_level_mobile_header", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable", version: "9.9.9" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-header",
+            title: "Header layout",
+            status: "waiting_for_approval",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/approvals") {
+        return jsonResponse([
+          {
+            id: "approval-header",
+            threadId: "thread-header",
+            kind: "command",
+            title: "Review header command",
+            detail: "npm test",
+            createdAt: 1_783_584_000_000,
+          },
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-header/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const header = screen.getByLabelText("Connection status");
+    expect(await within(header).findByRole("heading", { name: "Codex Mobile" })).toBeInTheDocument();
+    const rail = within(header).getByLabelText("Bridge status rail");
+    expect(rail).toHaveTextContent("LAN bridge");
+    expect(rail).toHaveTextContent("v9.9.9");
+    expect(within(header).getAllByText("Writable")).toHaveLength(1);
+    await waitFor(() => {
+      expect(rail).toHaveTextContent("1 pending approval");
+    });
+  });
+
+  it("leaves_the_message_composer_visually_empty_until_the_user_types", () => {
+    render(<App />);
+
+    const composer = screen.getByRole("form", { name: "Message composer" });
+    const input = within(composer).getByRole("textbox", {
+      name: "Message selected Codex session",
+    });
+    expect(input).not.toHaveAttribute("placeholder");
   });
 
   it("opens_and_closes_the_mobile_session_drawer", async () => {
@@ -133,7 +191,7 @@ describe("App", () => {
 
     expect(screen.queryByRole("dialog", { name: "Sessions" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Live thread" })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("Message Live thread")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Message selected Codex session" })).toBeInTheDocument();
   });
 
   it("keeps_focus_on_drawer_session_row_during_live_session_updates", async () => {
@@ -501,11 +559,44 @@ describe("App", () => {
           : `.${stylesUrl.pathname}`;
     const css = readFileSync(stylesPath, "utf8");
 
-    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.connection-bar\s*\{[\s\S]*grid-template-columns:\s*38px 38px minmax\(0, 1fr\) minmax\(0, auto\);/);
-    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.session-menu-button\s*\{[\s\S]*display:\s*grid;/);
+    expect(css).toMatch(/\.connection-main-row\s*\{[^}]*grid-template-columns:\s*auto minmax\(0, 1fr\) auto;/);
+    expect(css).toMatch(/\.connection-status-rail\s*\{[^}]*justify-content:\s*space-between;/);
+    expect(css).toMatch(/\.session-menu-button\s*\{[^}]*display:\s*grid;/);
     expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.desktop-session-panel\s*\{[\s\S]*display:\s*none;/);
-    expect(css).toMatch(/@media \(max-width: 720px\)[\s\S]*\.session-drawer\s*\{[\s\S]*width:\s*min\(84vw, 340px\);/);
+    expect(css).toMatch(/\.session-drawer\s*\{[^}]*width:\s*min\(84vw, 340px\);/);
     expect(css).not.toContain("grid-template-rows: minmax(150px, 0.42fr) minmax(0, 1fr)");
+  });
+
+  it("reserves_more_mobile_height_for_the_conversation_and_bounds_approval_content", () => {
+    const stylesUrl = new URL("./styles.css", import.meta.url);
+    const stylesPath =
+      stylesUrl.protocol === "file:"
+        ? stylesUrl
+        : stylesUrl.pathname.startsWith("/@fs/")
+          ? stylesUrl.pathname.slice("/@fs".length)
+          : `.${stylesUrl.pathname}`;
+    const css = readFileSync(stylesPath, "utf8");
+
+    expect(css).toContain("--composer-height: 66px");
+    expect(css).toMatch(/\.composer\s*\{[^}]*padding:\s*6px 8px calc\(6px \+ var\(--safe-bottom\)\);/);
+    expect(css).toMatch(/\.approval-detail\.expanded\s*\{[^}]*max-height:\s*min\(34dvh, 280px\);[^}]*overflow-y:\s*auto;/);
+    expect(css).toMatch(/\.approval-actions\s*\{[^}]*position:\s*relative;/);
+  });
+
+  it("keeps_the_sessions_drawer_and_settings_entry_reachable_on_wide_screens", () => {
+    const stylesUrl = new URL("./styles.css", import.meta.url);
+    const stylesPath =
+      stylesUrl.protocol === "file:"
+        ? stylesUrl
+        : stylesUrl.pathname.startsWith("/@fs/")
+          ? stylesUrl.pathname.slice("/@fs".length)
+          : `.${stylesUrl.pathname}`;
+    const css = readFileSync(stylesPath, "utf8");
+    const baseCss = css.slice(0, css.indexOf("@media (max-width: 720px)"));
+
+    expect(baseCss).toMatch(/\.session-menu-button\s*\{[^}]*display:\s*grid;/);
+    expect(baseCss).toMatch(/\.session-drawer-layer\s*\{[^}]*position:\s*fixed;[^}]*display:\s*block;/);
+    expect(baseCss).toMatch(/\.session-drawer\s*\{[^}]*width:\s*min\(84vw, 340px\);/);
   });
 
   it("shows_revoked_or_expired_connection_error", async () => {
@@ -1021,6 +1112,67 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Review sidecar API" })).toHaveAttribute("aria-current", "true");
   });
 
+  it("prefers_the_recent_root_session_over_a_newer_subagent_on_initial_load", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          {
+            ...sessionSnapshot({
+              threadId: "thread-subagent",
+              title: "Task 6 Mode Implementer · Raman the 2nd",
+              preview: "Internal worker",
+              updatedAt: 300,
+              status: "running",
+            }),
+            isSubagent: true,
+          },
+          {
+            ...sessionSnapshot({
+              threadId: "thread-root",
+              title: "同步 Codex 回复过程到手机",
+              preview: "Main conversation",
+              updatedAt: 200,
+              status: "running",
+            }),
+            isSubagent: false,
+          },
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-root/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-root",
+            threadId: "thread-root",
+            payload: { role: "assistant", text: "Loaded the main conversation." },
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-subagent/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-subagent",
+            threadId: "thread-subagent",
+            payload: { role: "assistant", text: "Loaded the internal worker." },
+          }),
+        ]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "同步 Codex 回复过程到手机" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Loaded the main conversation.")).toBeInTheDocument();
+    expect(screen.queryByText("Loaded the internal worker.")).not.toBeInTheDocument();
+  });
+
   it("groups_sessions_by_project_and_restores_local_view_preferences", async () => {
     const user = userEvent.setup();
     saveActiveSession();
@@ -1438,6 +1590,12 @@ describe("App", () => {
             payload: { role: "plan", text: "Run the focused tests" },
           }),
           sessionEvent({
+            id: "turn-1:tool-result-empty",
+            threadId: "thread-stream",
+            type: "tool_result",
+            payload: { role: "tool_result", text: "" },
+          }),
+          sessionEvent({
             id: "turn-1:message-1",
             threadId: "thread-stream",
             payload: { role: "assistant", text: "The change is ready." },
@@ -1455,9 +1613,106 @@ describe("App", () => {
     expect(screen.getByText("Reviewing the implementation")).toBeInTheDocument();
     expect(screen.getByText("Run the focused tests")).toBeInTheDocument();
     expect(screen.getByText("The change is ready.")).toBeInTheDocument();
+    const responses = screen.getAllByRole("article", { name: "Codex response" });
+    expect(responses).toHaveLength(1);
+    expect(within(responses[0]).getByText("Reviewing the implementation")).toBeInTheDocument();
+    expect(within(responses[0]).getByText("Run the focused tests")).toBeInTheDocument();
+    expect(within(responses[0]).getByText("The change is ready.")).toBeInTheDocument();
+    expect(within(responses[0]).queryByText("tool result", { exact: false })).not.toBeInTheDocument();
 
     await user.click(thinking);
     expect(details).not.toHaveAttribute("open");
+  });
+
+  it("renders_semantic_tool_progress_inside_the_codex_turn", async () => {
+    saveActiveSession();
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-tools",
+            title: "Tool progress",
+            status: "running",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-tools/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "turn-1:search-1",
+            threadId: "thread-tools",
+            type: "tool_call",
+            payload: {
+              role: "tool",
+              text: "Searching files: codex-manual.md in my_ai",
+              title: "Searching files",
+              detail: "codex-manual.md in my_ai",
+              toolKind: "search",
+              toolStatus: "running",
+              turnId: "turn-1",
+            },
+          }),
+          sessionEvent({
+            id: "turn-1:edit-1",
+            threadId: "thread-tools",
+            type: "tool_result",
+            payload: {
+              role: "tool_result",
+              text: "Updated files: App.tsx, styles.css",
+              title: "Updated files",
+              detail: "App.tsx, styles.css",
+              toolKind: "file_change",
+              toolStatus: "completed",
+              turnId: "turn-1",
+            },
+          }),
+          sessionEvent({
+            id: "turn-1:build-1",
+            threadId: "thread-tools",
+            type: "tool_result",
+            payload: {
+              role: "tool_result",
+              text: "Build failed",
+              title: "Build failed",
+              toolKind: "build",
+              toolStatus: "failed",
+              turnId: "turn-1",
+            },
+          }),
+          sessionEvent({
+            id: "turn-1:edit-2",
+            threadId: "thread-tools",
+            type: "tool_result",
+            payload: {
+              role: "tool_result",
+              text: "Skipped file update",
+              title: "Skipped file update",
+              toolKind: "file_change",
+              toolStatus: "declined",
+              turnId: "turn-1",
+            },
+          }),
+        ]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const response = await screen.findByRole("article", { name: "Codex response" });
+    expect(within(response).getByText("Searching files")).toBeInTheDocument();
+    expect(within(response).getByText("codex-manual.md in my_ai")).toBeInTheDocument();
+    expect(within(response).getByText("Updated files")).toBeInTheDocument();
+    expect(within(response).getByText("App.tsx, styles.css")).toBeInTheDocument();
+    expect(within(response).getByText("Build failed").closest(".tool-activity")).toHaveClass("failed");
+    expect(within(response).getByText("Skipped file update").closest(".tool-activity")).toHaveClass("declined");
+    expect(within(response).getAllByLabelText("Tool activity")).toHaveLength(4);
+    expect(within(response).queryByText("tool call", { exact: false })).not.toBeInTheDocument();
+    expect(within(response).queryByText("tool result", { exact: false })).not.toBeInTheDocument();
   });
 
   it("updates_same-id_assistant_message_with_new_text", () => {
@@ -1477,6 +1732,42 @@ describe("App", () => {
 
     expect(merged).toHaveLength(1);
     expect(merged[0].payload).toEqual({ role: "assistant", text: "Hello" });
+  });
+
+  it("replaces_running_tool_activity_with_its_completed_state", () => {
+    const running = sessionEvent({
+      id: "turn-1:item-3",
+      threadId: "thread-tools",
+      type: "tool_call",
+      payload: {
+        role: "tool",
+        text: "Searching files: codex-manual.md in my_ai",
+        title: "Searching files",
+        detail: "codex-manual.md in my_ai",
+        toolKind: "search",
+        toolStatus: "running",
+        turnId: "turn-1",
+      },
+    });
+    const completed = sessionEvent({
+      id: "turn-1:item-3",
+      threadId: "thread-tools",
+      type: "tool_result",
+      payload: {
+        role: "tool_result",
+        text: "Searched files: codex-manual.md in my_ai",
+        title: "Searched files",
+        detail: "codex-manual.md in my_ai",
+        toolKind: "search",
+        toolStatus: "completed",
+        turnId: "turn-1",
+      },
+    });
+
+    const merged = appendOrMergeSessionEvent([running], completed);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toEqual(completed);
   });
 
   it("starts_new_delta_tail_after_intervening_user_message", () => {
@@ -1530,7 +1821,8 @@ describe("App", () => {
 
     render(<App />);
 
-    const input = await screen.findByPlaceholderText("Message Reply target");
+    const input = await screen.findByRole("textbox", { name: "Message selected Codex session" });
+    await waitFor(() => expect(input).toBeEnabled());
     await user.type(input, "continue from phone");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
@@ -1575,7 +1867,8 @@ describe("App", () => {
 
     render(<App />);
 
-    const input = await screen.findByPlaceholderText("Message Reply target");
+    const input = await screen.findByRole("textbox", { name: "Message selected Codex session" });
+    await waitFor(() => expect(input).toBeEnabled());
     await user.type(input, "retry from phone");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
@@ -1613,7 +1906,8 @@ describe("App", () => {
 
     render(<App />);
 
-    const input = await screen.findByPlaceholderText("Message Reply target");
+    const input = await screen.findByRole("textbox", { name: "Message selected Codex session" });
+    await waitFor(() => expect(input).toBeEnabled());
     const fileInput = screen.getByLabelText("Choose image attachment");
     const image = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], "phone.png", {
       type: "image/png",
@@ -1708,7 +2002,7 @@ describe("App", () => {
     expect(screen.queryByRole("dialog", { name: "Start from phone" })).not.toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Start from phone" })).toBeInTheDocument();
     expect(screen.getAllByText("Start from phone").length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByPlaceholderText("Message Start from phone")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Message selected Codex session" })).toBeInTheDocument();
   });
 
   it("creates_a_new_session_with_an_image_attachment", async () => {
@@ -2675,7 +2969,7 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByText("No sessions available")).toBeInTheDocument();
-    expect(screen.getByPlaceholderText("Message No session selected")).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: "Message selected Codex session" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
     expect(
       vi
@@ -3011,7 +3305,8 @@ describe("App", () => {
 
     render(<App />);
 
-    const input = await screen.findByPlaceholderText("Message Reply target");
+    const input = await screen.findByRole("textbox", { name: "Message selected Codex session" });
+    await waitFor(() => expect(input).toBeEnabled());
     await user.type(input, "same text");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     expect(await screen.findByText("same text")).toBeInTheDocument();
@@ -3097,6 +3392,38 @@ describe("App", () => {
     ).toHaveLength(1);
   });
 
+  it("keeps_canonical_user_message_when_bridge_echo_arrives_after_it", () => {
+    const optimistic = sessionEvent({
+      id: "client-message-1",
+      threadId: "thread-send",
+      payload: { role: "user", text: "Deep Research 开发条件是什么?", pending: true },
+      createdAt: 1_783_515_390_000,
+    });
+    const canonical = sessionEvent({
+      id: "turn-new:item-1",
+      threadId: "thread-send",
+      payload: { role: "user", text: "Deep Research 开发条件是什么?" },
+      createdAt: 1_783_515_390_010,
+    });
+    const bridgeEcho = sessionEvent({
+      id: "client-message-1",
+      threadId: "thread-send",
+      payload: {
+        role: "user",
+        text: "Deep Research 开发条件是什么?",
+        bridgeEcho: true,
+        clientMessageId: "client-message-1",
+      },
+      createdAt: 1_783_515_390_020,
+    });
+
+    const afterCanonical = appendOrMergeSessionEvent([optimistic], canonical);
+    const merged = appendOrMergeSessionEvent(afterCanonical, bridgeEcho);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].id).toBe(canonical.id);
+  });
+
   it("keeps_polled_events_oldest_first_and_reconciles_pending_echo_with_newline", () => {
     const current = [
       sessionEvent({
@@ -3168,6 +3495,133 @@ describe("App", () => {
 
     expect(merged.map((event) => event.id)).toEqual(["event-1", "event-2", "event-3"]);
     expect(merged[1].payload).toMatchObject({ text: "Finished" });
+  });
+
+  it("replaces_live_turn_events_with_the_polled_snapshot_while_the_reply_is_running", () => {
+    const liveUser = sessionEvent({
+      id: "turn-live:user-live",
+      threadId: "thread-a",
+      payload: {
+        role: "user",
+        text: "Codex免费的token额度有多少?",
+        turnId: "turn-live",
+      },
+      createdAt: 1_783_515_390_000,
+    });
+    const liveEvents = [
+      sessionEvent({
+        id: "turn-live:assistant-live",
+        threadId: "thread-a",
+        type: "message_delta",
+        payload: {
+          role: "assistant",
+          text: "我按官方 Codex 文档核对一下。",
+          turnId: "turn-live",
+        },
+        createdAt: 1_783_515_390_010,
+      }),
+      sessionEvent({
+        id: "turn-live:reasoning-empty-1",
+        threadId: "thread-a",
+        type: "reasoning_summary_delta",
+        payload: { role: "reasoning", text: "", turnId: "turn-live" },
+        createdAt: 1_783_515_390_020,
+      }),
+      sessionEvent({
+        id: "turn-live:reasoning-empty-2",
+        threadId: "thread-a",
+        type: "reasoning_summary_delta",
+        payload: { role: "reasoning", text: "", turnId: "turn-live" },
+        createdAt: 1_783_515_390_030,
+      }),
+    ].reduce<SessionEvent[]>(
+      (events, event) => appendOrMergeSessionEvent(events, event),
+      [liveUser],
+    );
+
+    const polledSnapshot = [
+      sessionEvent({
+        id: "turn-live:item-1",
+        threadId: "thread-a",
+        payload: {
+          role: "user",
+          text: "Codex免费的token额度有多少?",
+          turnId: "turn-live",
+        },
+        createdAt: 1_783_515_390_000,
+      }),
+      sessionEvent({
+        id: "turn-live:item-5",
+        threadId: "thread-a",
+        payload: {
+          role: "assistant",
+          text: "我按官方 Codex 文档核对一下。",
+          turnId: "turn-live",
+        },
+        createdAt: 1_783_515_390_010,
+      }),
+    ];
+
+    const merged = mergeIncrementalSessionEvents(liveEvents, polledSnapshot);
+    const visibleGroups = groupSessionEventsForDisplay(merged);
+
+    expect(merged.filter((event) => event.payload && typeof event.payload === "object" && !Array.isArray(event.payload) && event.payload.role === "user")).toHaveLength(1);
+    expect(merged.filter((event) => event.payload && typeof event.payload === "object" && !Array.isArray(event.payload) && event.payload.role === "assistant")).toHaveLength(1);
+    expect(merged.filter((event) => event.type === "reasoning_summary" || event.type === "reasoning_summary_delta")).toHaveLength(0);
+    expect(visibleGroups).toHaveLength(2);
+    expect(visibleGroups[1]).toMatchObject({
+      kind: "assistant_turn",
+      turnScope: "turn-live",
+      events: [{ id: "turn-live:item-5" }],
+    });
+  });
+
+  it("preserves_turn_identity_when_promoting_a_stream_delta", () => {
+    const merged = appendOrMergeSessionEvent([], sessionEvent({
+      id: "turn-live:assistant-live",
+      type: "message_delta",
+      payload: {
+        role: "assistant",
+        text: "Streaming",
+        turnId: "turn-live",
+      },
+    }));
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].payload).toMatchObject({
+      role: "assistant",
+      text: "Streaming",
+      turnId: "turn-live",
+    });
+  });
+
+  it("keeps_earlier_same_turn_items_when_an_incremental_page_only_contains_the_tail", () => {
+    const current = [
+      sessionEvent({
+        id: "turn-live:item-1",
+        payload: { role: "user", text: "Keep the prompt", turnId: "turn-live" },
+        createdAt: 1_783_515_390_000,
+      }),
+      sessionEvent({
+        id: "turn-live:assistant-live",
+        payload: { role: "assistant", text: "Partial", turnId: "turn-live" },
+        createdAt: 1_783_515_390_010,
+      }),
+    ];
+    const incrementalTail = [
+      sessionEvent({
+        id: "turn-live:item-5",
+        payload: { role: "assistant", text: "Partial answer", turnId: "turn-live" },
+        createdAt: 1_783_515_390_010,
+      }),
+    ];
+
+    const merged = mergeIncrementalSessionEvents(current, incrementalTail);
+
+    expect(merged.map((event) => event.id)).toEqual([
+      "turn-live:item-1",
+      "turn-live:item-5",
+    ]);
   });
 
   it("treats_polled_events_as_authoritative_and_drops_stale_carried_ws_events", () => {
@@ -3382,7 +3836,120 @@ describe("App", () => {
     });
     expect(await screen.findByText("approval resolved")).toBeInTheDocument();
   });
+
+  it("collapses_long_approval_content_until_the_user_expands_it", async () => {
+    const user = userEvent.setup();
+    mockApprovalDetailOverflow();
+    saveActiveSession();
+    const longCommand = Array.from(
+      { length: 8 },
+      (_, index) => `step-${index + 1} --workspace /Users/example/project --check all`,
+    ).join("\n");
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-long-approval",
+            title: "Long approval",
+            status: "waiting_for_approval",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/approvals") {
+        return jsonResponse([
+          {
+            id: "approval-long",
+            threadId: "thread-long-approval",
+            kind: "command",
+            title: "Run long command",
+            detail: longCommand,
+            createdAt: 1_783_584_000_000,
+          },
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-long-approval/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    const expandButton = await screen.findByRole("button", { name: "Expand Run long command" });
+    const approval = expandButton.closest("article");
+    expect(approval).not.toBeNull();
+    expect(expandButton).toHaveAttribute("aria-expanded", "false");
+    const detail = (approval as HTMLElement).querySelector(".approval-detail");
+    expect(detail).not.toBeNull();
+    expect(detail).toHaveTextContent("step-1 --workspace /Users/example/project --check all");
+    expect(detail).toHaveClass("approval-detail");
+    expect(within(approval as HTMLElement).getByRole("button", { name: "Reject Run long command" })).toBeVisible();
+    expect(within(approval as HTMLElement).getByRole("button", { name: "Approve Run long command" })).toBeVisible();
+
+    await user.click(expandButton);
+
+    expect(expandButton).toHaveAttribute("aria-expanded", "true");
+    expect(detail).toHaveClass("expanded");
+    expect(within(approval as HTMLElement).getByRole("button", { name: "Collapse Run long command" })).toBeInTheDocument();
+  });
+
+  it("offers_expansion_when_short_approval_text_wraps_beyond_three_visual_lines", async () => {
+    mockApprovalDetailOverflow();
+    saveActiveSession();
+    const wrappedCommand = "npm run verify -- --workspace packages/mobile --configuration production";
+    expect(wrappedCommand.length).toBeLessThan(140);
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: "thread-wrapped-approval",
+            title: "Wrapped approval",
+            status: "waiting_for_approval",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/approvals") {
+        return jsonResponse([
+          {
+            id: "approval-wrapped",
+            threadId: "thread-wrapped-approval",
+            kind: "command",
+            title: "Run wrapped command",
+            detail: wrappedCommand,
+            createdAt: 1_783_584_000_000,
+          },
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-wrapped-approval/events") {
+        return jsonResponse([]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("button", { name: "Expand Run wrapped command" }),
+    ).toBeInTheDocument();
+  });
 });
+
+function mockApprovalDetailOverflow() {
+  vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains("approval-detail") ? 80 : 0;
+  });
+  vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains("approval-detail") ? 40 : 0;
+  });
+}
 
 function saveActiveSession() {
   saveSession({

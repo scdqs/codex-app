@@ -242,6 +242,8 @@ fn cdp_rpc_expression(request_json: &str, response_mode: CdpRpcResponseMode) -> 
   if (!thread || typeof thread !== "object") {
     return result;
   }
+  const subAgent = thread.source?.subAgent ?? thread.source?.subagent ?? null;
+  const threadSpawn = subAgent?.thread_spawn ?? subAgent?.threadSpawn ?? null;
   return {
     thread: {
       id: thread.id ?? thread.threadId ?? thread.thread_id ?? request.params?.threadId ?? null,
@@ -251,6 +253,9 @@ fn cdp_rpc_expression(request_json: &str, response_mode: CdpRpcResponseMode) -> 
       preview: thread.preview ?? thread.summary ?? null,
       createdAt: thread.createdAt ?? thread.created_at ?? null,
       updatedAt: thread.updatedAt ?? thread.updated_at ?? null,
+      threadSource: thread.threadSource ?? thread.thread_source ?? null,
+      agentPath: thread.agentPath ?? thread.agent_path ?? threadSpawn?.agentPath ?? threadSpawn?.agent_path ?? null,
+      agentNickname: thread.agentNickname ?? thread.agent_nickname ?? threadSpawn?.agentNickname ?? threadSpawn?.agent_nickname ?? null,
     },
   };
 "#
@@ -670,6 +675,9 @@ mod tests {
         );
         assert!(expression.contains("const thread = result?.thread"));
         assert!(expression.contains("request.params?.threadId"));
+        assert!(expression.contains("agentPath:"));
+        assert!(expression.contains("agentNickname:"));
+        assert!(expression.contains("thread.source?.subAgent"));
         assert!(!expression.contains("initialTurnsPage"));
     }
 
