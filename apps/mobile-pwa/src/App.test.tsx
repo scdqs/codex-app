@@ -116,9 +116,12 @@ describe("App", () => {
 
     const header = screen.getByLabelText("Connection status");
     expect(await within(header).findByRole("heading", { name: "Codex Mobile" })).toBeInTheDocument();
+    const identity = header.querySelector(".connection-primary");
+    expect(identity).not.toBeNull();
+    expect(within(identity as HTMLElement).getByText("v9.9.9")).toBeInTheDocument();
     const rail = within(header).getByLabelText("Bridge status rail");
     expect(rail).toHaveTextContent("LAN bridge");
-    expect(rail).toHaveTextContent("v9.9.9");
+    expect(rail).not.toHaveTextContent("v9.9.9");
     expect(within(header).getAllByText("Writable")).toHaveLength(1);
     await waitFor(() => {
       expect(rail).toHaveTextContent("1 pending approval");
@@ -621,6 +624,40 @@ describe("App", () => {
       expect(screen.getByLabelText("Connection status")).toHaveTextContent("Connection error");
     });
     expect(screen.getByLabelText("Connection status")).toHaveTextContent("Session revoked or expired");
+  });
+
+  it("opens_the_full_connection_message_in_a_bottom_sheet", async () => {
+    const user = userEvent.setup();
+    saveSession({
+      deviceId: "device-1",
+      deviceSecret: "secret-1",
+      displayName: "Damon Phone",
+      sessionToken: "expired-token",
+      sessionExpiresAt: 1_767_225_600_000,
+      bridgeUrl: "http://bridge.local",
+    });
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ message: "revoked" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    render(<App />);
+
+    const trigger = await screen.findByRole("button", { name: "Show connection details" });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    await user.click(trigger);
+
+    const dialog = screen.getByRole("dialog", { name: "Connection details" });
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(dialog).toHaveTextContent("Session revoked or expired · Needs new link");
+    expect(within(dialog).getByText("LAN bridge")).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("button", { name: "Close connection details" }));
+
+    expect(screen.queryByRole("dialog", { name: "Connection details" })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
   });
 
   it("hides_sample_data_when_pairing_link_is_invalid", async () => {

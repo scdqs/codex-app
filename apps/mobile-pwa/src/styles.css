@@ -128,7 +128,11 @@ button {
 }
 
 .connection-primary {
+  display: flex;
   min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
 }
 
 .connection-primary h1 {
@@ -173,10 +177,111 @@ button {
 }
 
 .app-version {
-  margin-left: 7px;
+  margin-top: 2px;
   color: #9ba8b1;
+  font-size: 0.64rem;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
+  line-height: 1;
   text-transform: none;
+}
+
+.connection-status-trigger {
+  display: inline-flex;
+  min-width: 0;
+  max-width: min(62vw, 560px);
+  height: 30px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.connection-status-trigger > svg {
+  flex: 0 0 auto;
+}
+
+.connection-status-trigger:focus-visible {
+  border-radius: 5px;
+  outline: 2px solid rgb(66 184 155 / 58%);
+  outline-offset: 2px;
+}
+
+.connection-detail-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  align-items: end;
+}
+
+.connection-detail-backdrop {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  border: 0;
+  background: rgb(0 0 0 / 58%);
+  backdrop-filter: blur(2px);
+}
+
+.connection-detail-sheet {
+  position: relative;
+  display: grid;
+  width: min(100%, 620px);
+  max-height: min(72dvh, 520px);
+  margin: 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: 16px 16px 0 0;
+  background: var(--surface);
+  box-shadow: 0 -18px 50px rgb(0 0 0 / 38%);
+}
+
+.connection-detail-grabber {
+  width: 38px;
+  height: 4px;
+  margin: 8px auto 0;
+  border-radius: 999px;
+  background: #4a5962;
+}
+
+.connection-detail-heading {
+  display: flex;
+  min-height: 58px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.connection-detail-content {
+  display: grid;
+  gap: 14px;
+  overflow-y: auto;
+  padding: 14px 14px calc(16px + var(--safe-bottom));
+}
+
+.connection-detail-content > p {
+  color: var(--text-soft);
+  font-size: 0.88rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.connection-detail-state {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: 0.74rem;
+  font-weight: 720;
 }
 
 .status-dot {

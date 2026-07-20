@@ -1591,6 +1591,9 @@ function ConnectionBar({
   showSessionMenuButton?: boolean;
   statusText: string;
 }) {
+  const [isDetailOpen, setIsDetailOpen] = useState(false);
+  const detailCloseButtonRef = useRef<HTMLButtonElement | null>(null);
+  const detailTriggerRef = useRef<HTMLButtonElement | null>(null);
   const secondaryStatusText = statusText === connection.label ? null : statusText;
   const pendingApprovalText = pendingApprovalCount > 0
     ? `${pendingApprovalCount} pending approval${pendingApprovalCount === 1 ? "" : "s"}`
@@ -1599,49 +1602,132 @@ function ConnectionBar({
     .filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index)
     .join(" · ");
 
+  function closeDetails() {
+    setIsDetailOpen(false);
+    detailTriggerRef.current?.focus();
+  }
+
+  useEffect(() => {
+    if (!isDetailOpen) {
+      return;
+    }
+
+    detailCloseButtonRef.current?.focus();
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        closeDetails();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isDetailOpen]);
+
+  useEffect(() => {
+    if (!railStatusText) {
+      setIsDetailOpen(false);
+    }
+  }, [railStatusText]);
+
   return (
-    <header className="connection-bar" aria-label="Connection status">
-      <div className="connection-main-row">
-        <div className="connection-actions">
-          {showSessionMenuButton ? (
+    <>
+      <header className="connection-bar" aria-label="Connection status">
+        <div className="connection-main-row">
+          <div className="connection-actions">
+            {showSessionMenuButton ? (
+              <button
+                className="session-menu-button"
+                onClick={onOpenSessions}
+                ref={sessionMenuButtonRef}
+                type="button"
+                aria-label="Open sessions"
+              >
+                <Menu size={18} aria-hidden="true" />
+              </button>
+            ) : null}
+            {showNewSessionButton ? (
+              <button
+                className="new-session-button"
+                disabled={newSessionDisabled}
+                onClick={onCreateSession}
+                type="button"
+                aria-label="New session"
+              >
+                <Plus size={18} aria-hidden="true" />
+              </button>
+            ) : null}
+          </div>
+          <div className="connection-primary">
+            <h1>Codex Mobile</h1>
+            {bridgeVersion ? <span className="app-version">v{bridgeVersion}</span> : null}
+          </div>
+          <div className="connection-meta">
+            <span className={`meta-chip ${connectionClass(connection.label)}`}>{connection.label}</span>
+          </div>
+        </div>
+        <div className="connection-status-rail" aria-label="Bridge status rail">
+          <span className="bridge-identity">
+            <span className={`status-dot ${connectionClass(connection.label)}`} aria-hidden="true" />
+            <span>LAN bridge</span>
+          </span>
+          {railStatusText ? (
             <button
-              className="session-menu-button"
-              onClick={onOpenSessions}
-              ref={sessionMenuButtonRef}
+              className="connection-status-trigger"
               type="button"
-              aria-label="Open sessions"
+              aria-expanded={isDetailOpen}
+              aria-label="Show connection details"
+              onClick={() => setIsDetailOpen(true)}
+              ref={detailTriggerRef}
             >
-              <Menu size={18} aria-hidden="true" />
+              <span className="connection-status-message">{railStatusText}</span>
+              <ChevronRight size={14} aria-hidden="true" />
             </button>
           ) : null}
-          {showNewSessionButton ? (
-            <button
-              className="new-session-button"
-              disabled={newSessionDisabled}
-              onClick={onCreateSession}
-              type="button"
-              aria-label="New session"
-            >
-              <Plus size={18} aria-hidden="true" />
-            </button>
-          ) : null}
         </div>
-        <div className="connection-primary">
-          <h1>Codex Mobile</h1>
+      </header>
+      {isDetailOpen && railStatusText ? (
+        <div className="connection-detail-layer">
+          <button
+            className="connection-detail-backdrop"
+            onClick={closeDetails}
+            type="button"
+            aria-label="Close connection details"
+          />
+          <section
+            className="connection-detail-sheet"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="connection-detail-heading"
+          >
+            <div className="connection-detail-grabber" aria-hidden="true" />
+            <div className="connection-detail-heading">
+              <div>
+                <p className="eyebrow">LAN bridge</p>
+                <h2 id="connection-detail-heading">Connection details</h2>
+              </div>
+              <button
+                className="icon-button"
+                onClick={closeDetails}
+                ref={detailCloseButtonRef}
+                type="button"
+                aria-label="Close connection details"
+              >
+                <X size={16} aria-hidden="true" />
+              </button>
+            </div>
+            <div className="connection-detail-content">
+              <p>{railStatusText}</p>
+              <span className={`connection-detail-state ${connectionClass(connection.label)}`}>
+                <span className={`status-dot ${connectionClass(connection.label)}`} aria-hidden="true" />
+                {connection.label}
+              </span>
+            </div>
+          </section>
         </div>
-        <div className="connection-meta">
-          <span className={`meta-chip ${connectionClass(connection.label)}`}>{connection.label}</span>
-        </div>
-      </div>
-      <div className="connection-status-rail" aria-label="Bridge status rail">
-        <span className="bridge-identity">
-          <span className={`status-dot ${connectionClass(connection.label)}`} aria-hidden="true" />
-          <span>LAN bridge</span>
-          {bridgeVersion ? <span className="app-version">v{bridgeVersion}</span> : null}
-        </span>
-        {railStatusText ? <span className="connection-status-message">{railStatusText}</span> : null}
-      </div>
-    </header>
+      ) : null}
+    </>
   );
 }
 
