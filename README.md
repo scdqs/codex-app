@@ -1,148 +1,324 @@
-# Codex Mobile Bridge
+<div align="center">
+  <img src="apps/desktop-shell/src-tauri/icons/128x128.png" width="96" alt="Codex Mobile Bridge 图标">
+  <h1>Codex Mobile Bridge</h1>
+  <p><strong>把 Mac 上正在运行的 ChatGPT / Codex Desktop，带到手机继续操作。</strong></p>
+  <p>电脑继续执行任务；手机查看进度、补充消息、创建会话和处理审批。</p>
+  <p>
+    <img src="https://img.shields.io/badge/version-v0.1.19_Beta-1f8a70" alt="v0.1.19 Beta">
+    <img src="https://img.shields.io/badge/platform-macOS-111827" alt="macOS">
+    <img src="https://img.shields.io/badge/mobile-PWA-2563eb" alt="Mobile PWA">
+    <img src="https://img.shields.io/badge/license-MIT-f59e0b" alt="MIT License">
+  </p>
+  <p>
+    <a href="#界面预览">界面预览</a> ·
+    <a href="#mac-app-快速体验">快速体验</a> ·
+    <a href="#当前能力">功能能力</a> ·
+    <a href="#安全边界">安全边界</a> ·
+    <a href="#开发环境">开发与构建</a>
+  </p>
+</div>
 
-macOS 优先的 ChatGPT/Codex Desktop 手机桥接 MVP。电脑侧运行 Rust sidecar，手机侧打开同一局域网内的 PWA，用来查看会话流、发送文本回复，并处理可捕获的审批请求。
+> [!IMPORTANT]
+> 当前为 `v0.1.19 Beta`，优先支持 Apple Silicon Mac。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。
 
-## MVP 范围
+## 界面预览
 
-- 桌面端优先支持新版 ChatGPT Desktop App，并兼容仍叫 Codex 的旧安装；通过 CDP target 发现和注入 bridge 脚本连接 app-server JSON-RPC。
-- 手机端是 PWA，由 sidecar 静态托管，扫码或复制 URL 打开。
-- 设备配对为本机长期绑定；MVP 安全策略是“已配对手机等同本机用户审批”。
-- 第一版默认局域网直连；Quick Tunnel 只作为用户显式开启的 Beta 远程能力。云端账号、多租户、Web Push、原生 App 和复杂授权策略不在当前范围。
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <strong>在手机查看执行进度和处理审批</strong><br><br>
+      <img src="docs/images/mobile-workbench.png" width="320" alt="手机端任务执行、计划、工具状态和审批界面">
+    </td>
+    <td width="50%" align="center">
+      <strong>按项目管理桌面中的真实会话</strong><br><br>
+      <img src="docs/images/mobile-sessions.png" width="320" alt="手机端项目与会话抽屉">
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <strong>Mac 负责连接 Desktop、启动 Bridge 和管理远程访问</strong><br><br>
+  <img src="docs/images/desktop-console.jpg" width="900" alt="Codex Mobile Bridge Mac 控制台">
+</p>
+
+<p align="center"><sub>手机截图由真实 PWA 使用脱敏演示数据渲染；桌面截图已移除配对 Token、域名和设备信息。</sub></p>
+
+## 为什么用它
+
+- **离开电脑，任务不必停下。** 在手机上继续查看长任务、追加要求，或及时处理等待中的审批。
+- **沿用桌面里的真实会话。** Bridge 连接 ChatGPT/Codex Desktop，不另起一套模型调用，也不要求额外 API 费用。
+- **局域网和公网都能用。** 同一 Wi-Fi 可直接连接，也可选择固定 Cloudflare 域名或临时 Quick Tunnel。
+- **访问边界由你掌控。** 一次性配对链接、可撤销设备、认证 API、Keychain Token 和脱敏诊断共同保护本机数据。
+
+## 当前能力
+
+- 自动检测并启动新版 `ChatGPT.app`，同时兼容旧版 `Codex.app`，排除 `ChatGPT Classic`。
+- 桌面应用使用符合现代 macOS 规范的透明连续圆角图标；PWA、主屏幕快捷方式和系统通知使用对应的普通与 Maskable 图标。
+- 通过 CDP 和 app-server RPC 读取真实桌面会话并回写消息。
+- 手机 PWA 查看会话列表和完整消息流，最新消息保持在底部；首次扫码或重新打开时优先进入最近且信息完整的主会话，不会被更新时间更晚的内部子任务或 UUID 空快照抢占；Desktop 元数据延迟到达时 Bridge 会有界重试，并补齐标题、工作目录、模型和预览。
+- 按规范化工作目录展示“项目 → 会话”两层结构；项目折叠和会话置顶保存在当前手机。
+- 手机和 Web 宽屏都可通过顶部菜单打开统一会话抽屉，并从抽屉进入提醒设置。
+- 手机顶栏采用双层信息布局：主操作、产品名和连接状态位于第一层，Bridge 版本以小字显示在产品名下方，第二层状态提示可点击并通过底部抽屉完整展示；底部输入区减少留白且不再显示会话标题占位文案。
+- 通过 app-server 实时通知流增量展示最终回答、思考摘要、计划和执行进度；搜索、读取文件、列出目录、运行命令/测试/构建、修改文件、Web/MCP 工具、图片和子任务等过程会显示语义化的运行与完成状态，同一 turn 聚合在一个 Codex 回复容器内，HTTP 游标同步负责断线恢复。
+- 实时工具过程使用稳定 item ID 与轮询快照合并；即使 Desktop 的 turn 快照省略工具 item，Bridge 也会保留已收到的权威执行过程，同时只向手机暴露文件名或目录名等有界信息，不发送完整本机路径和大型原始 payload。
+- 手机发送的 optimistic 消息、Bridge 回显和 Desktop 正式消息会按来源协调；运行中的 HTTP turn 快照会替换对应的实时临时事件，避免用户消息、回答片段和空 Thinking 重复；内部状态迁移不再显示成原始消息卡。
+- 上下文自动压缩属于正常执行进度，不会在手机端误显示 Error 或触发错误提醒。
+- 向现有会话发送文本和图片附件。
+- 从手机创建新会话，并从 Bridge 提供的安全工作目录列表中选择工作空间。
+- 查看并处理 Bridge 能捕获到的审批请求；长审批内容默认折叠为三行，展开后在有界区域内滚动，拒绝和允许操作始终可见。
+- 长期设备配对、自动恢复会话和桌面端撤销设备。
+- 三种访问方式：局域网、Cloudflare 固定域名、Quick Tunnel 临时通道。
+- 四类任务提醒：完成、等待审批、等待输入和错误；前台提供不同提示音与可用时的震动。
+- Cloudflare 固定 HTTPS 域名下支持直接 Web Push、锁屏系统通知、订阅修复和通知点击回到对应会话。
+- 固定域名 Token 写入 macOS Keychain，诊断信息会脱敏。
+
+## 当前限制
+
+- 当前只实现 macOS，已验证的内部 DMG 为 Apple Silicon 架构。
+- 电脑必须开机，ChatGPT/Codex Desktop 和 Bridge Service 必须保持运行。
+- 手机端目前是 PWA，不是 App Store 或 Android 原生应用。
+- 手机只展示 ChatGPT/Codex Desktop 或 provider 已提供的思考摘要和结构化执行过程，不暴露或伪造模型隐藏的完整 chain-of-thought。
+- Quick Tunnel 和局域网只支持页面前台提醒；可靠锁屏通知需要固定 HTTPS 域名。
+- iPhone 必须把 PWA 添加到主屏幕并从主屏幕打开后，才能请求系统通知权限；锁屏声音和震动最终由 iOS 控制。
+- 已配对手机在 MVP 中被视为可信本机用户，复杂权限分级尚未实现。
+- 当前内部 DMG 使用 ad-hoc 签名，没有 Apple Developer ID 签名和 notarization，不属于 stable 公共发行包。
+- CLI adapter、Windows 和 Linux 支持尚未实现。
+
+## 工作原理
+
+```text
+Phone PWA
+   |  authenticated HTTP / WebSocket
+   v
+Bridge Sidecar <--- Desktop Shell manages process, pairing and tunnels
+   |
+   |  CDP + app-server RPC
+   v
+ChatGPT.app / Codex.app
+```
+
+Bridge 不修改 ChatGPT/Codex 安装文件。桌面壳负责以 remote debugging port 启动或重新附着桌面应用，并管理 sidecar、配对链接和 Cloudflare 连接器。
 
 ## Mac App 快速体验
 
-当前内部体验优先使用 `Codex Mobile Bridge.app`，不要求普通试用同事手动运行 sidecar 或复制 control token。
+1. 安装并打开 `Codex Mobile Bridge.app`，确认窗口中显示的版本号与安装包一致。
+2. 点击 ChatGPT/Codex 的检测或启动按钮。若桌面应用已经运行但没有开启 CDP，按提示允许 Bridge 重启它。
+3. 点击 `Bridge Service / 启动`，等待状态变成 `ready`。只有连接状态为 `writable` 时手机才能发送消息。
+4. 选择访问方式：
+   - 同一 Wi-Fi：直接使用局域网地址。
+   - 长期公网访问：配置 Cloudflare 固定域名。
+   - 临时应急：手动启动 Quick Tunnel。
+5. 在“手机配对”区域点击“生成新链接”，使用手机扫描二维码。
 
-1. 启动 `Codex Mobile Bridge.app`。
-2. 点击 **检测/启动**，让 Bridge 附着或启动新版 `ChatGPT.app` / 旧版 `Codex.app`。
-3. 点击 **Bridge Service / 启动**，等待状态变成 `ready` 或 `degraded`。只有 `writable` 才允许手机回写消息。
-4. 局域网体验：点击 **手机配对 / 生成新链接**，用手机扫码或复制完整链接打开。
-5. 远程体验：先点击 **远程链接 Beta / 开启**，再使用桌面端生成的远程配对链接。`trycloudflare.com` 是临时通道，断网、睡眠、重启、换链接后可能失效。
+### 配对链接规则
 
-远程链接依赖 Cloudflare `cloudflared`。内部试用包会把 `cloudflared` 打进 `Codex Mobile Bridge.app/Contents/Resources/bin/`；如果旧包显示 `failed to spawn tunnel provider: No such file or directory`，说明该包没有内置 provider，重新安装新版 DMG 即可。
+- 带 `pairingToken=...` 的完整链接是一次性配对入口，使用后或过期后不能再次绑定新浏览器。
+- 同一台手机、同一个浏览器成功配对后，可以反复打开当前 Bridge 根地址。
+- 更换浏览器、清除站点数据、设备被撤销，或页面显示 `Unpaired`、`Needs new link`、`Session revoked or expired` 时，需要重新生成配对链接。
+- 不要把包含 `pairingToken` 的链接转发给其他人。
 
-链接语义：
+## Cloudflare 固定域名
 
-- 带 `pairingToken=...` 的完整链接是一次性配对入口，用过或过期后需要在 Mac App 里重新生成。
-- 同一台手机、同一个浏览器配对成功后，可以重复打开当前 bridge URL；如果显示 `Unpaired`、`Needs new link` 或 `Session revoked or expired`，重新生成配对链接。
-- 直接打开远程根地址但没有保存过设备 session 时，只会显示未配对空态，不应展示任何 demo 会话。
+固定域名适合电脑长期在线、需要在外网重复访问的用户。它需要一个已托管在 Cloudflare 的域名，不需要路由器端口映射。
 
-## 开发命令
+### 1. 创建 Named Tunnel
+
+1. 登录 [Cloudflare Zero Trust](https://one.dash.cloudflare.com/)。
+2. 进入 `Networks / 网络` -> `Connectors / 连接器` -> `Cloudflare Tunnels`。
+3. 创建 `Cloudflared` 类型的 Tunnel，例如 `codex-mobile-bridge`。
+4. 在安装 Connector 页面只复制 `--token` 后面的长 Tunnel Token。
+
+不要运行 Cloudflare 给出的 `cloudflared service install ...` 完整命令。Bridge 会使用内置的 `cloudflared` 管理连接器生命周期。
+
+### 2. 添加已发布应用程序路由
+
+在 Tunnel 的“已发布应用程序路由”中添加：
+
+| 字段 | 示例 |
+| --- | --- |
+| Public Hostname | `codex.example.com` |
+| Path | 留空 |
+| Service Type | `HTTP` |
+| Service URL | `localhost:57324` |
+
+不需要手动创建额外的 CNAME，也不要给这个子域名添加 Cloudflare Access 登录页、缓存或重写规则。
+
+### 3. 在 Bridge 中连接
+
+1. 打开 `远程访问`，选择 `固定域名`。
+2. `Create Tunnel` 页面确认 Origin 为 `http://localhost:57324`，点击继续。
+3. 在 `Connect Bridge` 填写：
+   - `Public Hostname`：完整子域名，不带 `https://`。
+   - `Tunnel Token`：只粘贴 Token，不粘贴终端命令。
+   - `Local Port`：`57324`。
+4. 保存后进入 `Verify`，点击“开始验证”。
+5. 以下四项全部为 `ready` 才算配置完成：
+   - `Local Bridge`
+   - `Cloudflare connection`
+   - `Public health`
+   - `Same Bridge instance`
+
+固定域名失败时，Bridge 只做有限自动重试，不会静默切换连接地址。用户可以修改配置、重新检测，或手动启动临时通道。
+
+### 误装系统 Connector 的处理
+
+如果曾运行 `cloudflared service install ...`，同一台 Mac 会同时出现系统 Connector 和 Bridge Connector。确认 Bridge 的 Verify 四项均为 `ready` 后，可执行：
 
 ```bash
-cargo test --workspace -- --nocapture
-cargo check --workspace
-
-cd apps/mobile-pwa
-npm test -- --run
-npm run test:run
-npm run build
+sudo /opt/homebrew/bin/cloudflared service uninstall
 ```
 
-桌面壳开发：
+这只删除重复的本机系统服务，不会删除 Cloudflare Tunnel、DNS 路由或 Bridge Keychain 中保存的 Token。
+
+## Quick Tunnel 临时通道
+
+- Quick Tunnel 会生成 `trycloudflare.com` 临时地址。
+- 地址可能因进程退出、电脑睡眠、网络变化或 Cloudflare 回收而失效。
+- Bridge 不会在固定域名失败时自动切换到 Quick Tunnel，必须由用户明确启动。
+- Quick Tunnel 适合应急，不应作为稳定地址分发或收藏。
+
+## 手机端行为
+
+- 会话列表来自 ChatGPT/Codex Desktop 的真实 threads，不是独立云端数据库。
+- Bridge 会有界遍历 `thread/list` 分页，因此较早创建但最近仍在运行或置顶的会话不会因只读取第一页而缺失。
+- 首次配对时如果实时通知先产生只有 UUID 的临时快照，手机会跳过它并优先打开信息完整的主会话；Bridge 会以 1–30 秒退避重试补全延迟到达的标题、工作目录、模型和预览，同时保留实时状态、更新时间和待审批信息。
+- 会话按 canonical `cwd` 分组为项目；手机端折叠和置顶是本地偏好，不依赖 Desktop 私有 UI store。
+- 当前会话只请求有界事件窗口，并通过游标加载更早历史，避免大线程每次传输全部消息。
+- app-server 实时通知经认证 WebSocket 增量到达；HTTP 游标结果仍是恢复和校准依据，仅保留尚未被服务端回显的本地 pending 消息。
+- 思考区域只展示 Desktop 可展示的 reasoning summary；最终回答、计划和工具状态使用独立事件类型，避免混在一起。
+- 顶部连接信息分两层展示，版本号位于产品名下方；第二层状态提示过长时保持单行省略，点击后由底部抽屉展示完整内容。长审批内容默认折叠，展开后只滚动内容区域，操作按钮不会被推出可视范围；消息输入框保持空白视觉占位并压缩底部留白。
+- 新建会话必须选择 Bridge 返回且当前仍可用的工作目录，手机不能任意浏览整个 Mac 文件系统。
+- 图片附件通过受认证的本地资源代理传递，诊断和事件响应不会暴露完整本机路径。
+
+## 手机提醒
+
+- 在 Settings 中可以分别开关完成、等待审批、等待输入和错误提醒，并试听四种前台提示音。
+- 固定 HTTPS 模式可启用系统通知；状态会显示 `Active`、`Not enabled`、`Blocked`、`Needs repair` 或 `Unavailable`。
+- `Repair notifications` 会清理浏览器与 Bridge 的旧订阅后重新注册；`Disable alerts` 会先关闭服务端总开关，再尝试清理两侧订阅。
+- 页面可见时普通 push 只转发到页面，并与 WebSocket 使用同一个 `eventId` 去重；后台或锁屏时由 Service Worker 显示系统通知。
+- 点击系统通知会聚焦或打开 PWA，并在会话列表加载后选择对应 thread；会话已不存在时会显示明确提示。
+- Quick Tunnel 地址不稳定，不会请求或复用 PushSubscription，也不会承诺锁屏通知。
+
+## 安全边界
+
+- 一次性配对 Token 有有效期，并且成功使用后立即失效。
+- 会话 API、图片资源和 WebSocket 都要求已配对设备的 session。
+- Local Control API 不会挂载到手机公网路由。
+- Tunnel Token 存在 macOS Keychain；启动 `cloudflared` 时通过权限受限的临时 token 文件传入，不出现在命令行参数和诊断中。
+- VAPID 私钥存在 macOS Keychain，只通过一次性 `0600` 文件交给 sidecar 并在读取后删除；PushSubscription 与 outbox 绑定已配对设备。
+- Web Push payload 只含事件类别、thread ID/标题和时间，不含消息正文、CWD、工具参数或错误详情。
+- 固定域名和 Quick Tunnel 互斥，关闭远程访问应真正停止由 Bridge 管理的 Connector。
+- 当前没有账号体系或审批风险分级。请只配对可信设备，并在设备丢失时立即从桌面端撤销。
+- 不要直接把 `57324` 端口映射到公网。
+
+## 开发环境
+
+需要 Rust、Node.js/npm、Xcode Command Line Tools，以及 Tauri 2 所需的 macOS 构建环境。
+
+### 构建缓存控制
+
+项目构建入口根据 Git common-dir 定位主工作树，并让所有 Git worktree 共用其同级的 `codex-app-shared-target/`，避免每个任务副本重复保存 Rust/Tauri 编译产物。开发和测试 profile 关闭 incremental 以控制磁盘增长。
+
+项目提供带缓存检查的 Cargo 入口；构建前后如果共享目录达到 20 GB，会在终端警告并发送一次 macOS 通知，不启动后台服务，也不会自动删除文件：
 
 ```bash
-cargo build -p bridge-sidecar
+./scripts/cargo.sh test --workspace
+./scripts/check-build-cache.sh
+./scripts/cargo.sh clean
+```
+
+缓存降回阈值以下后，下一次超过阈值时会再次通知。优先使用项目脚本，确保位于任意路径的 worktree 都解析到同一共享目录；直接运行原始 `cargo` 命令不会触发预警，位于其他父目录的 worktree 还可能落入各自的静态 fallback target。
+
+### 测试与检查
+
+```bash
+./scripts/cargo.sh test --workspace
+./scripts/cargo.sh clippy -p desktop-shell -- -D warnings
+
+cd apps/mobile-pwa
+npm ci
+npm test -- --run
+npm run build
+
+cd ../desktop-shell
+npm ci
+npm test -- --run
+npm run build
+
+cd ../..
+./scripts/check-version-sync.sh
+```
+
+### 桌面开发
+
+```bash
+./scripts/cargo.sh build -p bridge-sidecar
 (cd apps/mobile-pwa && npm ci && npm run build)
 
 cd apps/desktop-shell
 npm ci
-npm run build
 npm run tauri:dev
 ```
 
-桌面壳当前是产品化 Mac App 的 scaffold：提供 ChatGPT/Codex 检测/启动、Bridge start/stop、手机配对二维码/链接、Quick Tunnel Beta、设备撤销和本地诊断入口。开发模式会自动向上定位仓库根目录，并默认读取：
+开发模式会自动定位仓库根目录，并支持：
 
-- `CODEX_MOBILE_BRIDGE_SIDECAR_BIN`，未设置时使用 `target/debug/bridge-sidecar`。
-- `CODEX_MOBILE_BRIDGE_PWA_DIR`，未设置时使用 `apps/mobile-pwa/dist`。
-- `CODEX_MOBILE_BRIDGE_ADVERTISED_HOST`，未设置时自动尝试 Wi-Fi/LAN IP。
+- `CODEX_MOBILE_BRIDGE_SIDECAR_BIN`：未设置时使用共享 target 中的 `debug/bridge-sidecar`。
+- `CODEX_MOBILE_BRIDGE_PWA_DIR`：未设置时使用 `apps/mobile-pwa/dist`。
+- `CODEX_MOBILE_BRIDGE_ADVERTISED_HOST`：未设置时自动尝试 Wi-Fi/LAN IP。
+- `CODEX_MOBILE_BRIDGE_DEBUG_PORT`：默认 `9229`。
 
-桌面壳打包前先准备 bundle resources：
+### 构建 DMG
 
 ```bash
 cd apps/desktop-shell
-npm run tauri:build
+npm ci
+npm run tauri:build -- --bundles dmg
 ```
 
-`tauri:build` 会先运行 `prepare:bundle`，构建 release sidecar 和 mobile PWA，并复制到 `apps/desktop-shell/src-tauri/resources/`。这些生成物不会提交到仓库；Tauri 打包时会把它们放进 App resources，运行时桌面壳会优先使用 bundle 内资源，找不到时才回退到开发路径。
+构建过程会先编译 release sidecar 和 PWA，把 `bridge-sidecar` 与 `cloudflared` 放入 App resources，再执行 Tauri 打包。DMG 输出到：
 
-GitHub Actions 可手动生成内部试用包：运行 **Desktop build** workflow，`channel` 选 `dev` 或 `beta`，`bundles` 选 `dmg`。
-
-## 启动
-
-先构建 PWA：
-
-```bash
-cd apps/mobile-pwa
-npm run build
+```text
+<scripts/cargo-target-dir.sh 输出>/release/bundle/dmg/
 ```
 
-再启动 sidecar：
+没有正式 Apple 证书时，开发构建会自动使用 ad-hoc 签名。它能验证 App bundle 完整性，但不等于 Developer ID 签名或 Apple notarization。
 
-```bash
-cd ../..
-CODEX_MOBILE_BRIDGE_DEBUG_PORT=9229 cargo run -p bridge-sidecar
+## 诊断
+
+本地和公网都可以检查：
+
+```text
+/api/health
 ```
 
-默认配置：
+正常响应应包含：
 
-- `CODEX_MOBILE_BRIDGE_BIND=0.0.0.0:57324`
-- `CODEX_MOBILE_BRIDGE_DEBUG_PORT=9229`
-- `CODEX_MOBILE_BRIDGE_DB=bridge.sqlite`
-- `CODEX_MOBILE_BRIDGE_PWA_DIR=apps/mobile-pwa/dist`
+- `status: ok`
+- `connectionState: writable`
+- 当前 `version`
+- 当前 `instanceId`
 
-启动后终端会打印：
+固定域名验证时，本地和公网的 `version`、`instanceId` 必须一致。公网返回旧版本通常表示旧 sidecar 仍占用固定端口；Cloudflare 显示正常但 Bridge Connector 已停止，通常表示机器上还残留独立系统 Connector。
 
-- 本机监听地址。
-- PWA 静态目录。
-- `PWA pairing URL`，形如 `http://<lan-ip>:57324/?pairingToken=...&bridgeUrl=...`。
-- `QR text`，内容同 pairing URL，可复制给二维码工具。
-- 本机 control token，用于后续手动启动新的 pairing token。
+常见桌面降级状态：
 
-## ChatGPT/Codex Desktop 要求
-
-OpenAI 将 Codex app 并入新版 ChatGPT Desktop 后，用户机器上可能存在两种名称：新版 `ChatGPT.app`，或仍叫 `Codex.app` 的旧安装。本项目同时兼容这两种名称，但会排除 `ChatGPT Classic`。目标桌面应用必须以 remote debugging port 启动，端口和 `CODEX_MOBILE_BRIDGE_DEBUG_PORT` 一致。当前 MVP 默认端口是 `9229`。
-
-sidecar 的诊断顺序：
-
-1. 查询 CDP targets。
-2. 选择 ChatGPT/Codex page target。
-3. 注入 `window.__codexMobileBridge.rpc`。
-4. 通过 app-server RPC 检查 `thread/list`，如已有 thread 再检查 `thread/turns/list`。
-5. 根据结果返回 `writable`、`read_only` 或明确降级原因。
-
-## 常见降级状态
-
-- `codex_not_running`：sidecar 尚未跑过有效诊断，或 ChatGPT/Codex 未启动。
-- `cdp_unavailable`：debug port 不可达，检查 ChatGPT/Codex 启动参数和端口。
-- `target_not_found`：CDP 可达，但没有识别到 ChatGPT/Codex page target。
-- `inject_failed`：找到 ChatGPT/Codex target，但页面内未发现可用 app-server client。
-- `rpc_unavailable`：注入成功但基础 app-server RPC 不可用。
-- `read_only`：可读取会话，但文本回写能力不可用，手机端应禁用文本回写。
-- `writable`：Desktop bridge RPC 可用，手机端允许向已选 thread 发送文本。
-
-## 局域网安全边界
-
-- sidecar 默认绑定 `0.0.0.0:57324`，同一局域网内设备可访问。
-- 配对 URL 内的一次性 `pairingToken` 有效期有限，使用后失效。
-- 会话数据 API 和 WebSocket 都需要已配对设备的 session token。
-- MVP 不做账号体系、云端鉴权、风险分级或二次确认；不要把端口直接暴露到公网。
-
-## 手动烟测
-
-1. 启动带 remote debugging port 的 ChatGPT 或 Codex Desktop。
-2. 运行 `cargo run -p bridge-sidecar`，访问 `/api/health`，确认返回 `writable` 或明确降级状态。
-3. 用手机或同网浏览器打开终端打印的 PWA pairing URL，完成配对并刷新页面，确认仍保持登录。
-4. 选择 thread，发送文本，确认 ChatGPT/Codex Desktop 对应 thread 继续执行。
-5. 触发需要确认的命令或文件编辑，确认 PWA 出现审批卡片，批准或拒绝后桌面任务继续。
+- `codex_not_running`：ChatGPT/Codex 尚未启动或没有完成有效诊断。
+- `cdp_unavailable`：remote debugging port 不可达。
+- `target_not_found`：CDP 可达，但没有识别到支持的桌面 page target。
+- `inject_failed`：找到了页面，但 app-server bridge 注入失败。
+- `rpc_unavailable`：注入成功，但基础 app-server RPC 不可用。
+- `read_only`：可读取会话但不能回写。
+- `writable`：可以读取会话并发送消息。
 
 ## 试用与发布
 
-- 内部同事试用流程见 [docs/dogfood-qa-checklist.md](docs/dogfood-qa-checklist.md)。
-- 共享内部包前先跑 `scripts/dogfood-smoke.sh`；最近一次 dogfood 记录见 [docs/dogfood-runs/2026-07-10-dogfood-20260710.2.md](docs/dogfood-runs/2026-07-10-dogfood-20260710.2.md)。
-- dev / beta / stable 发布门禁见 [docs/release-gates.md](docs/release-gates.md)。
-- `scripts/check-release-gate.sh --channel stable` 会阻止未签名、未公证、缺 updater metadata 或把 Quick Tunnel 当稳定远程能力的公开发布。
+- 内部人工 QA：[docs/dogfood-qa-checklist.md](docs/dogfood-qa-checklist.md)
+- 发布门禁：[docs/release-gates.md](docs/release-gates.md)
+- Web Push 真机矩阵：[docs/qa/2026-07-18-web-push-device-matrix.md](docs/qa/2026-07-18-web-push-device-matrix.md)
+- 固定域名实现计划：[docs/superpowers/plans/2026-07-18-fixed-domain-named-tunnel.md](docs/superpowers/plans/2026-07-18-fixed-domain-named-tunnel.md)
+- GitHub Actions 的 `Desktop build` workflow 可生成 dev/beta DMG。
+- stable 版本必须具备 Developer ID 签名、Apple notarization 和 updater metadata。
 
 ## 参考
 
-- CodexPlusPlus mobile relay 和 CDP bridge 方向验证：<https://github.com/BigPizzaV3/CodexPlusPlus>
+- [BigPizzaV3/CodexPlusPlus](https://github.com/BigPizzaV3/CodexPlusPlus)：CDP bridge 与 mobile relay 方向参考。

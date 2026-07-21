@@ -1,6 +1,8 @@
 export interface BridgeHealth {
   status: string;
   connectionState: string;
+  instanceId: string;
+  version?: string;
 }
 
 export type ConnectionLabel =
@@ -11,6 +13,7 @@ export type ConnectionLabel =
   | "Inject failed"
   | "Read-only"
   | "Writable"
+  | "Reconnecting"
   | "Connection error";
 
 export interface ConnectionViewState {
@@ -49,6 +52,8 @@ export function secondaryStatusText(label: ConnectionLabel): string {
       return "Desktop bridge unavailable";
     case "ChatGPT/Codex not running":
       return "Start desktop app";
+    case "Reconnecting":
+      return "Retrying automatically";
     case "Connection error":
       return "Needs new link";
     case "Pairing":
@@ -59,7 +64,7 @@ export function secondaryStatusText(label: ConnectionLabel): string {
 }
 
 export function isSessionDataEnabled(label: ConnectionLabel): boolean {
-  return label === "Connected" || label === "Writable" || label === "Read-only";
+  return label === "Connected" || label === "Writable" || label === "Read-only" || label === "Reconnecting";
 }
 
 function normalizeConnectionState(value: string): string {

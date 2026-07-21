@@ -67,6 +67,8 @@ scripts/dogfood-smoke.sh --skip-bundle
 ## 会话读取
 
 - [ ] 手机端能看到最近 ChatGPT/Codex 会话列表。
+- [ ] 创建时间较早、位于 `thread/list` 第二页但最近仍更新的会话也能出现。
+- [ ] 会话按项目工作目录分组；项目折叠和手机置顶在刷新/重开后保留。
 - [ ] 会话列表按 Codex 体验展示，最近更新的任务易于找到。
 - [ ] 进入任一会话后，消息按时间从上到下展示，最新消息在底部。
 - [ ] 用户消息和 Codex 回复有清晰区分。
@@ -81,7 +83,8 @@ scripts/dogfood-smoke.sh --skip-bundle
 - [ ] 在手机输入文本并发送。
 - [ ] ChatGPT/Codex Desktop 对应 thread 收到文本并继续执行。
 - [ ] 手机端不会重复显示同一条用户消息。
-- [ ] ChatGPT/Codex 生成回复后，手机端能在短轮询周期内看到更新。
+- [ ] ChatGPT/Codex 生成回复后，手机端能实时追加最终回答；断线后可由 HTTP 游标同步恢复。
+- [ ] reasoning summary、plan、最终回答和工具进度不会混成一段；没有 summary 时不伪造思考内容。
 - [ ] 只读降级时，输入框被禁用并说明原因。
 
 通过标准：手机发送的是对真实 Codex thread 的回写，不只是前端本地新增消息。
@@ -107,6 +110,39 @@ scripts/dogfood-smoke.sh --skip-bundle
 
 通过标准：公网能力是用户显式开启的临时 Beta，不被包装成稳定远程服务。
 
+## 固定域名远程访问
+
+- [ ] 配置 Named Tunnel 后重启 Mac App，hostname/port 保留，Token 输入框为空且显示 Keychain 已保存。
+- [ ] 固定端口被占用时显示 Local port unavailable，不切换随机端口。
+- [ ] Token 错误、DNS 错误不持续重试。
+- [ ] 临时网络错误最多重试 3 次后停止。
+- [ ] Ready 后短暂断网显示 Degraded；网络恢复后同一 cloudflared PID 自动回到 Ready。
+- [ ] Ready 后 cloudflared 子进程退出会进入 Failed，不自动 respawn 或切换 Quick。
+- [ ] 固定域名失败后不会自动启动 Quick Tunnel。
+- [ ] 点击“启动临时通道”后固定配置仍保留，页面明确显示锁屏通知暂停。
+- [ ] 固定域名重新配对后，Devices 可识别旧 Origin 并允许撤销。
+
+通过标准：固定地址只在完整健康检查通过后显示 Ready；失败后停止自动动作，由用户选择重试、修正配置或手动启用临时通道。
+
+## 手机提醒与 Web Push
+
+- [ ] 四类前台提醒分别使用不同提示音：完成、等待审批、等待输入、错误。
+- [ ] iPhone 只有添加到主屏幕后才能请求通知权限；Safari 普通标签页不误报可用。
+- [ ] 固定域名锁屏后四类状态在 15 秒内收到系统通知。
+- [ ] 前台可见时普通 push 不弹系统通知，只转发页面并按 eventId 去重。
+- [ ] `Send test alert` 即使 Settings 可见也弹一条系统通知。
+- [ ] Android 支持时震动模式不同；iPhone 明确标明由系统控制。
+- [ ] permission denied 不重复弹权限请求；`Repair notifications` 可恢复丢失 subscription。
+- [ ] 404/410 将 subscription 标记为 needs repair，不持续重试。
+- [ ] 408/429/5xx 初次失败后最多重试 3 次，总发送最多 4 次；某设备失败不阻塞其他设备。
+- [ ] 从 Named 手动切到 Quick/Local 后，pending/retry outbox 被终止，不会恢复后补发旧提醒。
+- [ ] Bridge 重启恢复 pending outbox，不重复生成 AlertEvent。
+- [ ] 同一事件经 WebSocket 与 Push 同时到达时只提示一次。
+- [ ] 设备撤销后不再收到通知，subscription 和 outbox 已清理。
+- [ ] Quick Tunnel 不请求通知权限，也不创建 PushSubscription。
+
+通过标准：固定域名可以可靠承担后台/锁屏提醒；临时与本地模式准确降级为前台提醒，不误导用户。
+
 ## 设备撤销
 
 - [ ] 桌面端能列出已配对设备。
@@ -121,6 +157,7 @@ scripts/dogfood-smoke.sh --skip-bundle
 - [ ] 能导出诊断包。
 - [ ] 诊断包包含 app version、sidecar version、Codex adapter 状态、Bridge 状态、Tunnel 状态和最近连接状态。
 - [ ] 诊断包不会包含 control token、Authorization header、API key、pairing token 或本机完整路径。
+- [ ] Push 诊断只包含 endpoint host、订阅状态、最后成功时间和错误类别，不包含 endpoint path/query、p256dh、auth、payload 或 VAPID 私钥。
 - [ ] 用户仍应在发送诊断包前人工扫一眼内容。
 
 通过标准：普通用户遇到问题时，可以给开发者提供足够线索，同时不泄漏敏感凭证。

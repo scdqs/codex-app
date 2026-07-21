@@ -13,6 +13,10 @@ Environment:
   RELEASE_ARTIFACT                         Optional artifact path to validate.
   ENABLE_QUICK_TUNNEL_BY_DEFAULT=true      Fails stable, requires beta acknowledgement.
   QUICK_TUNNEL_BETA_ACK=true               Required for beta when quick tunnel is default-on.
+  ENABLE_WEB_PUSH=true                     Enables stable Web Push release checks.
+  STABLE_REMOTE_ACCESS_PROVIDER=named_tunnel Required for stable Web Push.
+  PUSH_QA_IOS_ACK=true                     Confirms iPhone lock-screen QA for stable Web Push.
+  PUSH_QA_ANDROID_ACK=true                 Confirms Android lock-screen QA for stable Web Push.
 USAGE
 }
 
@@ -99,6 +103,17 @@ if [ "${channel}" = "stable" ]; then
   if [ "${STABLE_REMOTE_ACCESS_PROVIDER:-}" = "quick_tunnel" ]; then
     fail "stable releases cannot treat Quick Tunnel as the stable remote access provider"
   fi
+  if [ "${ENABLE_WEB_PUSH:-false}" = "true" ]; then
+    if [ "${STABLE_REMOTE_ACCESS_PROVIDER:-}" != "named_tunnel" ]; then
+      fail "stable Web Push requires STABLE_REMOTE_ACCESS_PROVIDER=named_tunnel"
+    fi
+    if [ "${PUSH_QA_IOS_ACK:-false}" != "true" ]; then
+      fail "stable Web Push requires PUSH_QA_IOS_ACK=true"
+    fi
+    if [ "${PUSH_QA_ANDROID_ACK:-false}" != "true" ]; then
+      fail "stable Web Push requires PUSH_QA_ANDROID_ACK=true"
+    fi
+  fi
 
   require_one_of "macOS signing identity or imported certificate" APPLE_SIGNING_IDENTITY MACOS_CERTIFICATE_P12
   if [ -n "${MACOS_CERTIFICATE_P12:-}" ]; then
@@ -120,4 +135,3 @@ if [ "${channel}" = "stable" ]; then
 fi
 
 echo "release gate passed for channel: ${channel}"
-

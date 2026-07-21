@@ -35,6 +35,7 @@ done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
+cargo_target_dir="$("${script_dir}/cargo-target-dir.sh")"
 
 cd "${repo_root}"
 
@@ -42,7 +43,7 @@ echo "==> release gate: dev"
 scripts/check-release-gate.sh --channel dev
 
 echo "==> cargo test --workspace"
-cargo test --workspace
+scripts/cargo.sh test --workspace
 
 echo "==> mobile PWA tests"
 (
@@ -57,7 +58,7 @@ if [ "${run_bundle}" = "true" ]; then
     cd apps/desktop-shell
     npm run tauri:build -- --debug --bundles app
   )
-  bundled_cloudflared="target/debug/bundle/macos/Codex Mobile Bridge.app/Contents/Resources/bin/cloudflared"
+  bundled_cloudflared="${cargo_target_dir}/debug/bundle/macos/Codex Mobile Bridge.app/Contents/Resources/bin/cloudflared"
   if [ ! -x "${bundled_cloudflared}" ]; then
     echo "Bundled cloudflared is missing or not executable: ${bundled_cloudflared}" >&2
     exit 1

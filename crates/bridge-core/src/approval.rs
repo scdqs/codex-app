@@ -1,6 +1,9 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use crate::protocol::{ApprovalKind, ApprovalRequest};
+use crate::{
+    codex_rpc::CodexPendingApproval,
+    protocol::{ApprovalKind, ApprovalRequest},
+};
 
 pub struct ApprovalDetector;
 
@@ -45,6 +48,139 @@ impl ApprovalDetector {
             expires_at,
         })
     }
+
+    pub fn detect_pending(
+        pending: &CodexPendingApproval,
+        created_at: u64,
+    ) -> Option<ApprovalRequest> {
+        let kind = match pending.method.as_str() {
+            "item/commandExecution/requestApproval" => ApprovalKind::Command,
+            "item/fileChange/requestApproval" => ApprovalKind::FileEdit,
+            "item/permissions/requestApproval" => approval_kind(&pending.params),
+            "mcpServer/elicitation/request" => ApprovalKind::Mcp,
+            _ => return None,
+        };
+        let title = match kind {
+            ApprovalKind::Command => "Run command".to_string(),
+            ApprovalKind::FileEdit => "Apply file edit".to_string(),
+            ApprovalKind::Network => "Allow network access".to_string(),
+            ApprovalKind::Mcp => mcp_tool_name(&pending.params)
+                .map(|tool_name| format!("Allow {tool_name}"))
+                .unwrap_or_else(|| "Allow MCP tool".to_string()),
+            ApprovalKind::Unknown => "Approval required".to_string(),
+        };
+        let detail = pending_detail(&pending.method, &pending.params);
+        let risk_hint = if kind == ApprovalKind::Mcp {
+            string_field(&pending.params, &["serverName", "server_name"])
+                .map(|server| format!("MCP server: {server}"))
+        } else {
+            string_field(
+                &pending.params,
+                &["riskHint", "risk_hint", "reason", "warning"],
+            )
+        };
+        let raw = json!({
+            "requestId": pending.request_id,
+            "method": pending.method,
+            "params": pending.params,
+        });
+
+        Some(ApprovalRequest {
+            id: format!("{}:{}", pending.thread_id, pending.request_id),
+            thread_id: pending.thread_id.clone(),
+            kind,
+            title,
+            detail,
+            risk_hint,
+            raw: Some(raw),
+            created_at,
+            expires_at: number_field(&pending.params, &["expiresAt", "expires_at"]),
+        })
+    }
+}
+
+fn pending_detail(method: &str, params: &Value) -> String {
+    match method {
+        "item/commandExecution/requestApproval" => command_detail(params),
+        "mcpServer/elicitation/request" => mcp_params_detail(params)
+            .or_else(|| string_field(params, &["message", "reason"]))
+            .unwrap_or_else(|| params.to_string()),
+        "item/fileChange/requestApproval" => string_field(
+            params,
+            &["reason", "grantRoot", "grant_root", "itemId", "item_id"],
+        )
+        .unwrap_or_else(|| params.to_string()),
+        "item/permissions/requestApproval" => string_field(params, &["reason", "message"])
+            .or_else(|| params.get("permissions").map(Value::to_string))
+            .unwrap_or_else(|| params.to_string()),
+        _ => params.to_string(),
+    }
+}
+
+fn command_detail(params: &Value) -> String {
+    if let Some(actions) = params.get("commandActions").and_then(Value::as_array) {
+        let commands = actions
+            .iter()
+            .filter_map(|action| string_field(action, &["cmd", "command"]))
+            .collect::<Vec<_>>();
+        if !commands.is_empty() {
+            return commands.join(" && ");
+        }
+    }
+
+    string_field(params, &["command", "cmd", "reason"]).unwrap_or_else(|| params.to_string())
+}
+
+fn mcp_tool_name(params: &Value) -> Option<String> {
+    params
+        .pointer("/_meta/tool_title")
+        .or_else(|| params.pointer("/_meta/tool_name"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            let message = params.get("message").and_then(Value::as_str)?;
+            let start = message.find("tool \"")? + "tool \"".len();
+            let end = message[start..].find('"')? + start;
+            Some(message[start..end].to_string())
+        })
+}
+
+fn mcp_params_detail(params: &Value) -> Option<String> {
+    if let Some(items) = params
+        .pointer("/_meta/tool_params_display")
+        .and_then(Value::as_array)
+    {
+        let details = items
+            .iter()
+            .filter_map(|item| {
+                let name = string_field(item, &["display_name", "displayName", "name"])?;
+                let value = item.get("value")?;
+                Some(format!("{name}: {}", display_json_value(value)))
+            })
+            .collect::<Vec<_>>();
+        if !details.is_empty() {
+            return Some(details.join(", "));
+        }
+    }
+
+    params
+        .pointer("/_meta/tool_params")
+        .and_then(Value::as_object)
+        .map(|tool_params| {
+            tool_params
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", display_json_value(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|detail| !detail.is_empty())
+}
+
+fn display_json_value(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn looks_like_approval(raw: &Value) -> bool {
@@ -127,6 +263,7 @@ fn number_field(value: &Value, keys: &[&str]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_rpc::CodexPendingApproval;
     use serde_json::json;
 
     #[test]
@@ -153,5 +290,39 @@ mod tests {
             Some("Executes a local shell command")
         );
         assert_eq!(request.raw, Some(raw));
+    }
+
+    #[test]
+    fn detects_mcp_tool_approval_from_desktop_pending_request() {
+        let pending = CodexPendingApproval {
+            thread_id: "thread-approval".to_string(),
+            request_id: "7".to_string(),
+            method: "mcpServer/elicitation/request".to_string(),
+            params: json!({
+                "serverName": "mcpServers",
+                "message": "Allow the mcpServers MCP server to run tool \"read_memory\"?",
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "tool_params": { "uri": "system://boot" },
+                    "tool_params_display": [
+                        { "name": "uri", "value": "system://boot", "display_name": "uri" }
+                    ]
+                }
+            }),
+        };
+
+        let request = ApprovalDetector::detect_pending(&pending, 1_725_000_000_000)
+            .expect("MCP approval is detected");
+
+        assert_eq!(request.id, "thread-approval:7");
+        assert_eq!(request.thread_id, "thread-approval");
+        assert_eq!(request.kind, ApprovalKind::Mcp);
+        assert_eq!(request.title, "Allow read_memory");
+        assert_eq!(request.detail, "uri: system://boot");
+        assert_eq!(request.risk_hint.as_deref(), Some("MCP server: mcpServers"));
+        assert_eq!(
+            request.raw.as_ref().and_then(|raw| raw.get("method")),
+            Some(&json!("mcpServer/elicitation/request"))
+        );
     }
 }

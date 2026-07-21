@@ -17,6 +17,33 @@ pub struct SessionSnapshot {
     pub pending_approval_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceOption {
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiErrorCode {
+    Unauthorized,
+    InvalidRequest,
+    Forbidden,
+    NotFound,
+    UnsupportedMediaType,
+    InternalError,
+    InvalidPairingToken,
+    ExpiredPairingToken,
+    DeviceRevoked,
+    DeviceNotFound,
+    AdapterError,
+    WorkspaceRequired,
+    WorkspaceNotAllowed,
+    WorkspaceUnavailable,
+    PushUnavailable,
+    InvalidSubscription,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
@@ -43,12 +70,35 @@ pub struct SessionEvent {
 pub enum SessionEventType {
     Message,
     MessageDelta,
+    ReasoningSummary,
+    ReasoningSummaryDelta,
+    Plan,
+    PlanDelta,
     ToolCall,
     ToolResult,
     ApprovalRequested,
     ApprovalResolved,
     StatusChanged,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertKind {
+    Completed,
+    ApprovalRequired,
+    InputRequired,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertEvent {
+    pub event_id: String,
+    pub kind: AlertKind,
+    pub thread_id: String,
+    pub thread_title: String,
+    pub occurred_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,6 +156,7 @@ pub enum DecisionKind {
 pub enum ServerEnvelope {
     SessionSnapshot(SessionSnapshot),
     SessionEvent(SessionEvent),
+    AlertEvent(AlertEvent),
     ApprovalRequest(ApprovalRequest),
     ApprovalResolved(ApprovalDecision),
     Error { message: String },
@@ -168,5 +219,56 @@ mod tests {
             serde_json::from_str(&serialized).expect("envelope deserializes");
 
         assert_eq!(deserialized, envelope);
+    }
+
+    #[test]
+    fn workspace_option_serializes_with_camel_case_fields() {
+        let workspace = WorkspaceOption {
+            cwd: "/Users/damon/Documents/my_ai/codex-app".to_string(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(workspace).expect("workspace option serializes"),
+            json!({ "cwd": "/Users/damon/Documents/my_ai/codex-app" })
+        );
+    }
+
+    #[test]
+    fn alert_event_envelope_serializes_for_mobile_protocol() {
+        let envelope = ServerEnvelope::AlertEvent(AlertEvent {
+            event_id: "alert-abc".to_string(),
+            kind: AlertKind::ApprovalRequired,
+            thread_id: "thread-1".to_string(),
+            thread_title: "Release v0.1.7".to_string(),
+            occurred_at: 1_784_349_000_000,
+        });
+
+        assert_eq!(
+            serde_json::to_value(envelope).expect("alert envelope serializes"),
+            json!({
+                "type": "alert_event",
+                "payload": {
+                    "eventId": "alert-abc",
+                    "kind": "approval_required",
+                    "threadId": "thread-1",
+                    "threadTitle": "Release v0.1.7",
+                    "occurredAt": 1_784_349_000_000u64,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn api_error_code_serializes_as_stable_snake_case_value() {
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::WorkspaceNotAllowed)
+                .expect("api error code serializes"),
+            json!("workspace_not_allowed")
+        );
+        assert_eq!(
+            serde_json::to_value(ApiErrorCode::InvalidPairingToken)
+                .expect("pairing error code serializes"),
+            json!("invalid_pairing_token")
+        );
     }
 }

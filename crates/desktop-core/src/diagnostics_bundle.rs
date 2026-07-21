@@ -126,11 +126,75 @@ pub fn redact_sensitive_text(text: &str) -> String {
     redacted = redact_header_value(&redacted, "authorization");
     redacted = redact_header_value(&redacted, "x-bridge-control-token");
     redacted = redact_assignment_value(&redacted, "CODEX_MOBILE_BRIDGE_CONTROL_TOKEN");
+    redacted = redact_assignment_value(&redacted, "CLOUDFLARE_TUNNEL_TOKEN");
+    redacted = redact_assignment_value(&redacted, "CLOUDFLARE_TUNNEL_TOKEN_FILE_CONTENTS");
+    redacted = redact_assignment_value(&redacted, "TUNNEL_TOKEN");
+    redacted = redact_assignment_value(&redacted, "token_file_contents");
+    redacted = redact_assignment_value(&redacted, "VAPID_PRIVATE_KEY");
+    redacted = redact_assignment_value(&redacted, "VAPID_SECRET");
+    redacted = redact_assignment_value(&redacted, "vapid-private-key");
+    redacted = redact_after_marker_with_replacement(
+        &redacted,
+        "CODEX_MOBILE_BRIDGE_VAPID_KEY_FILE=",
+        false,
+        REDACTED_PATH,
+    );
     redacted = redact_assignment_value(&redacted, "OPENAI_API_KEY");
     redacted = redact_assignment_value(&redacted, "ANTHROPIC_API_KEY");
+    redacted = redact_after_marker(&redacted, "--token ", false);
+    redacted = redact_after_marker(&redacted, "--token=", false);
+    redacted =
+        redact_after_marker_with_replacement(&redacted, "--token-file ", false, REDACTED_PATH);
+    redacted =
+        redact_after_marker_with_replacement(&redacted, "--token-file=", false, REDACTED_PATH);
+    redacted = redact_assignment_value(&redacted, "p256dh");
+    redacted = redact_assignment_value(&redacted, "auth");
+    redacted = redact_after_marker(&redacted, "\"p256dh\":\"", false);
+    redacted = redact_after_marker(&redacted, "\"p256dh\": \"", false);
+    redacted = redact_after_marker(&redacted, "\"auth\":\"", false);
+    redacted = redact_after_marker(&redacted, "\"auth\": \"", false);
+    redacted = redact_push_endpoints(&redacted);
     redacted = redact_api_key_like_tokens(&redacted);
     redacted = redact_uuid_like_tokens(&redacted);
     redact_local_paths(&redacted)
+}
+
+fn redact_push_endpoints(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for (marker, quoted) in [
+        ("endpoint=", false),
+        ("\"endpoint\":\"", true),
+        ("\"endpoint\": \"", true),
+    ] {
+        redacted = redact_endpoint_after_marker(&redacted, marker, quoted);
+    }
+    redacted
+}
+
+fn redact_endpoint_after_marker(text: &str, marker: &str, quoted: bool) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(index) = remaining.find(marker) {
+        let value_start = index + marker.len();
+        output.push_str(&remaining[..value_start]);
+        let value = &remaining[value_start..];
+        let value_end = if quoted {
+            value.find('"').unwrap_or(value.len())
+        } else {
+            value.find(char::is_whitespace).unwrap_or(value.len())
+        };
+        let endpoint = &value[..value_end];
+        let host = url::Url::parse(endpoint)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "invalid-endpoint".to_string());
+        output.push_str("https://");
+        output.push_str(&host);
+        output.push_str("/[REDACTED]");
+        remaining = &value[value_end..];
+    }
+    output.push_str(remaining);
+    output
 }
 
 fn redact_header_value(text: &str, header_name: &str) -> String {
@@ -142,6 +206,15 @@ fn redact_assignment_value(text: &str, key: &str) -> String {
 }
 
 fn redact_after_marker(text: &str, marker: &str, case_insensitive: bool) -> String {
+    redact_after_marker_with_replacement(text, marker, case_insensitive, REDACTED_SECRET)
+}
+
+fn redact_after_marker_with_replacement(
+    text: &str,
+    marker: &str,
+    case_insensitive: bool,
+    replacement: &str,
+) -> String {
     let mut output = String::with_capacity(text.len());
     for line in text.lines() {
         let haystack = if case_insensitive {
@@ -158,7 +231,7 @@ fn redact_after_marker(text: &str, marker: &str, case_insensitive: bool) -> Stri
             let value_start = index + marker.len();
             output.push_str(&line[..value_start]);
             output.push(' ');
-            output.push_str(REDACTED_SECRET);
+            output.push_str(replacement);
         } else {
             output.push_str(line);
         }
@@ -292,6 +365,74 @@ mod tests {
         assert!(redacted.contains("CODEX_MOBILE_BRIDGE_CONTROL_TOKEN= [REDACTED]"));
         assert!(!redacted.contains("session-token-value"));
         assert!(!redacted.contains("control-token-value"));
+    }
+
+    #[test]
+    fn redacts_cloudflare_tunnel_credentials_and_secret_file_paths() {
+        let input = concat!(
+            "CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoiMTIzIn0.long-secret\n",
+            "TUNNEL_TOKEN=standard-cloudflare-token\n",
+            "token_file_contents=token-file-secret\n",
+            "cloudflared tunnel run --token-file /Users/damon/token-file\n",
+            "cloudflared tunnel run --token direct-token-value\n",
+            "cloudflared tunnel run --token-file=/tmp/token-file --url http://localhost:57324"
+        );
+
+        let redacted = redact_sensitive_text(input);
+
+        assert!(!redacted.contains("eyJhIjoiMTIzIn0.long-secret"));
+        assert!(!redacted.contains("standard-cloudflare-token"));
+        assert!(!redacted.contains("token-file-secret"));
+        assert!(!redacted.contains("/Users/damon/token-file"));
+        assert!(!redacted.contains("direct-token-value"));
+        assert!(!redacted.contains("/tmp/token-file"));
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(redacted.contains("[LOCAL_PATH]"));
+    }
+
+    #[test]
+    fn redacts_push_notification_credentials() {
+        let input = concat!(
+            "VAPID_PRIVATE_KEY=vapid-private-secret\n",
+            "p256dh=push-public-key auth=push-auth-secret\n",
+            "{\"keys\":{\"p256dh\":\"json-public-key\",\"auth\":\"json-auth-secret\"}}"
+        );
+
+        let redacted = redact_sensitive_text(input);
+
+        for secret in [
+            "vapid-private-secret",
+            "push-public-key",
+            "push-auth-secret",
+            "json-public-key",
+            "json-auth-secret",
+        ] {
+            assert!(!redacted.contains(secret));
+        }
+        assert!(redacted.contains(REDACTED_SECRET));
+    }
+
+    #[test]
+    fn redacts_vapid_and_subscription_material() {
+        let input = concat!(
+            "CODEX_MOBILE_BRIDGE_VAPID_KEY_FILE=/Users/damon/vapid-secret\n",
+            "VAPID_PRIVATE_KEY=private-base64-value\n",
+            "p256dh=public-client-key auth=client-auth-secret\n",
+            "endpoint=https://fcm.googleapis.com/fcm/send/private-path?token=private-query"
+        );
+
+        let redacted = redact_sensitive_text(input);
+
+        for secret in [
+            "private-base64-value",
+            "public-client-key",
+            "client-auth-secret",
+            "private-path",
+            "private-query",
+        ] {
+            assert!(!redacted.contains(secret));
+        }
+        assert!(redacted.contains("fcm.googleapis.com"));
     }
 
     #[test]

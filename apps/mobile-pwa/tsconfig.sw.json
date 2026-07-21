@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "WebWorker"],
+    "types": ["vite/client"],
+    "noEmit": true
+  },
+  "include": [
+    "src/service-worker.ts",
+    "src/notifications/push-protocol.ts",
+    "src/notifications/recent-event-store.ts",
+    "src/notifications/service-worker-handlers.ts",
+    "../../packages/bridge-protocol/src"
+  ],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
+}

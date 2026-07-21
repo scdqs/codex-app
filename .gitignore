@@ -1,5 +1,6 @@
 /target/
 /artifacts/
+.DS_Store
 node_modules/
 apps/*/dist/
 apps/*/src-tauri/gen/
@@ -9,3 +10,4 @@ apps/desktop-shell/src-tauri/resources/mobile-pwa/*
 !apps/desktop-shell/src-tauri/resources/mobile-pwa/.keep
 bridge.sqlite
 .superpowers/
+.gstack/
