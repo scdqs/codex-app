@@ -4,7 +4,7 @@
   <p><strong>把 Mac 上正在运行的 ChatGPT / Codex Desktop，带到手机继续操作。</strong></p>
   <p>电脑继续执行任务；手机查看进度、补充消息、创建会话和处理审批。</p>
   <p>
-    <img src="https://img.shields.io/badge/version-v0.1.19_Beta-1f8a70" alt="v0.1.19 Beta">
+    <img src="https://img.shields.io/badge/version-v0.1.20_Beta-1f8a70" alt="v0.1.20 Beta">
     <img src="https://img.shields.io/badge/platform-macOS-111827" alt="macOS">
     <img src="https://img.shields.io/badge/mobile-PWA-2563eb" alt="Mobile PWA">
     <img src="https://img.shields.io/badge/license-MIT-f59e0b" alt="MIT License">
@@ -19,7 +19,7 @@
 </div>
 
 > [!IMPORTANT]
-> 当前为 `v0.1.19 Beta`，优先支持 Apple Silicon Mac。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。
+> 当前为 `v0.1.20 Beta`，优先支持 Apple Silicon Mac。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。
 
 ## 界面预览
 
@@ -55,7 +55,7 @@
 - 自动检测并启动新版 `ChatGPT.app`，同时兼容旧版 `Codex.app`，排除 `ChatGPT Classic`。
 - 桌面应用使用符合现代 macOS 规范的透明连续圆角图标；PWA、主屏幕快捷方式和系统通知使用对应的普通与 Maskable 图标。
 - 通过 CDP 和 app-server RPC 读取真实桌面会话并回写消息。
-- 手机 PWA 查看会话列表和完整消息流，最新消息保持在底部；首次扫码或重新打开时优先进入最近且信息完整的主会话，不会被更新时间更晚的内部子任务或 UUID 空快照抢占；Desktop 元数据延迟到达时 Bridge 会有界重试，并补齐标题、工作目录、模型和预览。
+- 手机 PWA 查看会话列表和完整消息流，最新消息保持在底部；内部 subagent/task 会话不会混入用户会话列表，首次扫码或重新打开时优先进入最近且信息完整的主会话，也不会被 UUID 空快照抢占；Desktop 元数据延迟到达时 Bridge 会有界重试，并补齐标题、工作目录、模型和预览。
 - 按规范化工作目录展示“项目 → 会话”两层结构；项目折叠和会话置顶保存在当前手机。
 - 手机和 Web 宽屏都可通过顶部菜单打开统一会话抽屉，并从抽屉进入提醒设置。
 - 手机顶栏采用双层信息布局：主操作、产品名和连接状态位于第一层，Bridge 版本以小字显示在产品名下方，第二层状态提示可点击并通过底部抽屉完整展示；底部输入区减少留白且不再显示会话标题占位文案。

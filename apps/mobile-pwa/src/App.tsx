@@ -254,7 +254,10 @@ function App() {
       connection.label === "Connection error" ||
       connection.label === "Pairing");
   const sessionDataLoaded = liveSessions !== null;
-  const sessions = liveSessions ?? [];
+  const sessions = useMemo(
+    () => userVisibleSessions(liveSessions ?? []),
+    [liveSessions],
+  );
   const approvals = liveApprovals;
   const selectedSession = sessions.find((session) => session.threadId === selectedThreadId) ?? null;
   const selectedApprovals = selectedSession
@@ -550,15 +553,16 @@ function App() {
         sessionListFailureCountRef.current = 0;
         markSessionDataRecovered();
         const sorted = sortSessions(items);
+        const visible = userVisibleSessions(sorted);
         setLiveSessions(sorted);
         if (polledApprovals) {
           setLiveApprovals(polledApprovals);
         }
         setSelectedThreadId((current) => {
-          if (sorted.some((session) => session.threadId === current)) {
+          if (visible.some((session) => session.threadId === current)) {
             return current;
           }
-          return preferredInitialSessionId(sorted);
+          return preferredInitialSessionId(visible);
         });
       } catch (error) {
         if (!cancelled) {
@@ -804,7 +808,7 @@ function App() {
     if (!liveSessions || !pendingNotificationThreadId) {
       return;
     }
-    const target = liveSessions.find(
+    const target = sessions.find(
       (session) => session.threadId === pendingNotificationThreadId,
     );
     if (target) {
@@ -817,7 +821,7 @@ function App() {
     }
     setPendingNotificationThreadId(null);
     clearNotificationThreadParamFromUrl();
-  }, [liveSessions, pendingNotificationThreadId]);
+  }, [pendingNotificationThreadId, sessions]);
 
   useEffect(() => {
     if (!deviceSession || !isSessionDataEnabled(connection.label) || typeof WebSocket === "undefined") {
@@ -3941,6 +3945,10 @@ function sortSessions(items: SessionSnapshot[]): SessionSnapshot[] {
   return [...items].sort((left, right) => right.updatedAt - left.updatedAt);
 }
 
+function userVisibleSessions(items: SessionSnapshot[]): SessionSnapshot[] {
+  return items.filter((session) => !isSubagentSession(session));
+}
+
 function preferredInitialSessionId(items: SessionSnapshot[]): string {
   return (
     items.find((session) => !isSubagentSession(session) && hasUsefulSessionMetadata(session))
@@ -4016,8 +4024,15 @@ function upsertSession(items: SessionSnapshot[], next: SessionSnapshot): Session
   if (index === -1) {
     return [...items, next];
   }
+  const current = items[index] as SessionSnapshot & { isSubagent?: boolean };
+  const incoming = next as SessionSnapshot & { isSubagent?: boolean };
+  const isSubagent = current.isSubagent === true
+    ? true
+    : incoming.isSubagent ?? current.isSubagent;
+  const replacement: SessionSnapshot & { isSubagent?: boolean } =
+    isSubagent === undefined ? next : { ...next, isSubagent };
   const updated = [...items];
-  updated[index] = next;
+  updated[index] = replacement;
   return updated;
 }
 
