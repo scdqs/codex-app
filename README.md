@@ -1,21 +1,61 @@
-# Codex Mobile Bridge
+<div align="center">
+  <img src="apps/desktop-shell/src-tauri/icons/128x128.png" width="96" alt="Codex Mobile Bridge 图标">
+  <h1>Codex Mobile Bridge</h1>
+  <p><strong>把 Mac 上正在运行的 ChatGPT / Codex Desktop，带到手机继续操作。</strong></p>
+  <p>电脑继续执行任务；手机查看进度、补充消息、创建会话和处理审批。</p>
+  <p>
+    <img src="https://img.shields.io/badge/version-v0.1.19_Beta-1f8a70" alt="v0.1.19 Beta">
+    <img src="https://img.shields.io/badge/platform-macOS-111827" alt="macOS">
+    <img src="https://img.shields.io/badge/mobile-PWA-2563eb" alt="Mobile PWA">
+    <img src="https://img.shields.io/badge/license-MIT-f59e0b" alt="MIT License">
+  </p>
+  <p>
+    <a href="#界面预览">界面预览</a> ·
+    <a href="#mac-app-快速体验">快速体验</a> ·
+    <a href="#当前能力">功能能力</a> ·
+    <a href="#安全边界">安全边界</a> ·
+    <a href="#开发环境">开发与构建</a>
+  </p>
+</div>
 
-Codex Mobile Bridge 是一个 macOS 桌面桥接应用，让手机继续操作电脑上正在运行的 ChatGPT/Codex Desktop 任务。它不直接调用模型 API，也不替代桌面 Agent；电脑负责执行任务，手机负责查看会话、补充消息、创建会话和处理审批。
+> [!IMPORTANT]
+> 当前为 `v0.1.19 Beta`，优先支持 Apple Silicon Mac。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。
 
-当前版本：`v0.1.18 Beta`
+## 界面预览
 
-## 适用场景
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <strong>在手机查看执行进度和处理审批</strong><br><br>
+      <img src="docs/images/mobile-workbench.png" width="320" alt="手机端任务执行、计划、工具状态和审批界面">
+    </td>
+    <td width="50%" align="center">
+      <strong>按项目管理桌面中的真实会话</strong><br><br>
+      <img src="docs/images/mobile-sessions.png" width="320" alt="手机端项目与会话抽屉">
+    </td>
+  </tr>
+</table>
 
-- 使用 API 登录 ChatGPT/Codex Desktop，但无法使用官方手机 App。
-- 离开电脑后，希望在手机上继续已有任务或处理临时审批。
-- 需要局域网直连、临时公网链接，或使用自己的 Cloudflare 域名长期访问。
+<p align="center">
+  <strong>Mac 负责连接 Desktop、启动 Bridge 和管理远程访问</strong><br><br>
+  <img src="docs/images/desktop-console.jpg" width="900" alt="Codex Mobile Bridge Mac 控制台">
+</p>
+
+<p align="center"><sub>手机截图由真实 PWA 使用脱敏演示数据渲染；桌面截图已移除配对 Token、域名和设备信息。</sub></p>
+
+## 为什么用它
+
+- **离开电脑，任务不必停下。** 在手机上继续查看长任务、追加要求，或及时处理等待中的审批。
+- **沿用桌面里的真实会话。** Bridge 连接 ChatGPT/Codex Desktop，不另起一套模型调用，也不要求额外 API 费用。
+- **局域网和公网都能用。** 同一 Wi-Fi 可直接连接，也可选择固定 Cloudflare 域名或临时 Quick Tunnel。
+- **访问边界由你掌控。** 一次性配对链接、可撤销设备、认证 API、Keychain Token 和脱敏诊断共同保护本机数据。
 
 ## 当前能力
 
 - 自动检测并启动新版 `ChatGPT.app`，同时兼容旧版 `Codex.app`，排除 `ChatGPT Classic`。
 - 桌面应用使用符合现代 macOS 规范的透明连续圆角图标；PWA、主屏幕快捷方式和系统通知使用对应的普通与 Maskable 图标。
 - 通过 CDP 和 app-server RPC 读取真实桌面会话并回写消息。
-- 手机 PWA 查看会话列表和完整消息流，最新消息保持在底部；首次扫码或重新打开时优先进入最近的主会话，不会被更新时间更晚的内部子任务抢占；缺少 Desktop 标题的子任务仍会用 Agent 路径和昵称生成可读标题。
+- 手机 PWA 查看会话列表和完整消息流，最新消息保持在底部；首次扫码或重新打开时优先进入最近且信息完整的主会话，不会被更新时间更晚的内部子任务或 UUID 空快照抢占；Desktop 元数据延迟到达时 Bridge 会有界重试，并补齐标题、工作目录、模型和预览。
 - 按规范化工作目录展示“项目 → 会话”两层结构；项目折叠和会话置顶保存在当前手机。
 - 手机和 Web 宽屏都可通过顶部菜单打开统一会话抽屉，并从抽屉进入提醒设置。
 - 手机顶栏采用双层信息布局：主操作、产品名和连接状态位于第一层，Bridge 版本以小字显示在产品名下方，第二层状态提示可点击并通过底部抽屉完整展示；底部输入区减少留白且不再显示会话标题占位文案。
@@ -141,6 +181,7 @@ sudo /opt/homebrew/bin/cloudflared service uninstall
 
 - 会话列表来自 ChatGPT/Codex Desktop 的真实 threads，不是独立云端数据库。
 - Bridge 会有界遍历 `thread/list` 分页，因此较早创建但最近仍在运行或置顶的会话不会因只读取第一页而缺失。
+- 首次配对时如果实时通知先产生只有 UUID 的临时快照，手机会跳过它并优先打开信息完整的主会话；Bridge 会以 1–30 秒退避重试补全延迟到达的标题、工作目录、模型和预览，同时保留实时状态、更新时间和待审批信息。
 - 会话按 canonical `cwd` 分组为项目；手机端折叠和置顶是本地偏好，不依赖 Desktop 私有 UI store。
 - 当前会话只请求有界事件窗口，并通过游标加载更早历史，避免大线程每次传输全部消息。
 - app-server 实时通知经认证 WebSocket 增量到达；HTTP 游标结果仍是恢复和校准依据，仅保留尚未被服务端回显的本地 pending 消息。

@@ -4,7 +4,7 @@
 
 本项目让手机继续操作电脑上正在运行的 ChatGPT/Codex Desktop 任务。桌面 Agent 仍是唯一执行端；Bridge 负责读取会话、回写消息、处理审批、设备配对和远程访问，手机 PWA 不直接调用模型 API。
 
-当前产品基线为 `v0.1.15 Beta`，优先支持 macOS Desktop App。CLI、Windows、Linux、原生手机 App 和复杂授权策略属于后续范围，除非用户明确提升优先级。
+当前产品基线为 `v0.1.19 Beta`，优先支持 macOS Desktop App。CLI、Windows、Linux、原生手机 App 和复杂授权策略属于后续范围，除非用户明确提升优先级。
 
 ## 仓库结构
 
@@ -31,6 +31,9 @@
 - 事件 API 使用有界窗口和游标分页，不得每次返回完整大线程。
 - app-server server notification 是实时增量主路径，HTTP polling 是断线恢复和权威校准；两者必须使用稳定事件 ID 合并。
 - HTTP polling 返回的是当前可见窗口的权威快照，不得与旧 socket/local 事件无条件 append。
+- 实时通知可能先于 `thread/list` 产生只有 UUID、缺少标题或工作目录的稀疏会话快照；首次 `thread/resume` 返回空或暂时失败时不得永久视为补全完成，必须使用 1–30 秒的有界退避重试。
+- 会话元数据补全只合并 title、cwd、model 和 preview；不得覆盖实时链路已确认的 status、updatedAt 或 pending approvals。子任务分类一旦由可信 thread 数据确认，也不得被后续稀疏快照降级。
+- 手机首次选择会话时，信息完整的主会话优先于更晚更新的内部子任务或 UUID-only 稀疏快照；未知稀疏快照不得抢占可用主会话。
 - 只允许尚未被服务端 user echo 覆盖的 `pending` optimistic message 暂时保留。
 - 消息按旧到新展示，最新消息在底部；同 turn 同时间戳要保持稳定顺序。
 - 不把 adapter 的大型 `raw` payload 暴露给手机端。

@@ -1,5 +1,6 @@
 /target/
 /artifacts/
+.DS_Store
 node_modules/
 apps/*/dist/
 apps/*/src-tauri/gen/
