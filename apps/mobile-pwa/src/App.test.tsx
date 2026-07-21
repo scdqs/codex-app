@@ -1210,6 +1210,64 @@ describe("App", () => {
     expect(screen.queryByText("Loaded the internal worker.")).not.toBeInTheDocument();
   });
 
+  it("prefers_a_rich_root_session_over_a_newer_unresolved_uuid_snapshot", async () => {
+    saveActiveSession();
+    const unresolvedThreadId = "019f78a4-f383-7813-96e0-522b5feb06c7";
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "http://bridge.local/api/health") {
+        return jsonResponse({ status: "ok", connectionState: "writable" });
+      }
+      if (url === "http://bridge.local/api/sessions") {
+        return jsonResponse([
+          sessionSnapshot({
+            threadId: unresolvedThreadId,
+            title: unresolvedThreadId,
+            cwd: undefined,
+            modelProvider: undefined,
+            preview: undefined,
+            updatedAt: 300,
+            status: "running",
+          }),
+          sessionSnapshot({
+            threadId: "thread-root",
+            title: "修复首次配对会话",
+            cwd: "/repo",
+            modelProvider: "openai",
+            preview: "Main conversation",
+            updatedAt: 200,
+            status: "running",
+          }),
+        ]);
+      }
+      if (url === "http://bridge.local/api/sessions/thread-root/events") {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-root",
+            threadId: "thread-root",
+            payload: { role: "assistant", text: "Loaded the resolved main conversation." },
+          }),
+        ]);
+      }
+      if (url === `http://bridge.local/api/sessions/${unresolvedThreadId}/events`) {
+        return jsonResponse([
+          sessionEvent({
+            id: "event-unresolved",
+            threadId: unresolvedThreadId,
+            payload: { role: "assistant", text: "Loaded the unresolved thread." },
+          }),
+        ]);
+      }
+      return jsonResponse({});
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "修复首次配对会话" })).toBeInTheDocument();
+    expect(await screen.findByText("Loaded the resolved main conversation.")).toBeInTheDocument();
+    expect(screen.queryByText("Loaded the unresolved thread.")).not.toBeInTheDocument();
+  });
+
   it("groups_sessions_by_project_and_restores_local_view_preferences", async () => {
     const user = userEvent.setup();
     saveActiveSession();

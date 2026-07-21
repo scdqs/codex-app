@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -70,7 +71,7 @@ pub struct AppState {
     pending_approvals: Arc<Mutex<HashMap<String, ApprovalRequest>>>,
     message_dedupe: Arc<Mutex<MessageDedupeCache>>,
     refresh_failures: Arc<Mutex<HashMap<String, usize>>>,
-    title_enrichment_attempts: Arc<Mutex<HashSet<String>>>,
+    snapshot_enrichment_retries: Arc<Mutex<HashMap<String, SnapshotEnrichmentRetry>>>,
     subagent_thread_ids: Arc<Mutex<HashSet<String>>>,
     local_assets: Arc<Mutex<LocalAssetRegistry>>,
     control_token: Arc<str>,
@@ -94,6 +95,12 @@ struct AdapterEventCache {
 struct MessageDedupeCache {
     entries: HashMap<String, MessageDedupeEntry>,
     completed_order: VecDeque<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapshotEnrichmentRetry {
+    attempts: u32,
+    next_attempt_at: Instant,
 }
 
 #[derive(Debug)]
@@ -344,7 +351,7 @@ impl AppState {
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             message_dedupe: Arc::new(Mutex::new(MessageDedupeCache::default())),
             refresh_failures: Arc::new(Mutex::new(HashMap::new())),
-            title_enrichment_attempts: Arc::new(Mutex::new(HashSet::new())),
+            snapshot_enrichment_retries: Arc::new(Mutex::new(HashMap::new())),
             subagent_thread_ids: Arc::new(Mutex::new(HashSet::new())),
             local_assets: Arc::new(Mutex::new(LocalAssetRegistry::default())),
             control_token: control_token.into(),
@@ -1195,8 +1202,9 @@ async fn list_sessions(
         }
 
         for snapshot in state.event_hub.all_snapshots().await {
-            let enriched = enrich_snapshot_title(&state, adapter.as_ref(), snapshot.clone()).await;
-            if enriched.title != snapshot.title {
+            let enriched =
+                enrich_snapshot_metadata(&state, adapter.as_ref(), snapshot.clone()).await;
+            if enriched != snapshot {
                 state.event_hub.set_snapshot(enriched).await;
             }
         }
@@ -1223,61 +1231,102 @@ async fn snapshot_for_listed_thread(
     thread: &CodexThread,
 ) -> SessionSnapshot {
     remember_subagent_classification(state, thread).await;
-    enrich_snapshot_title(state, adapter, Normalizer::snapshot_from_thread(thread)).await
+    enrich_snapshot_metadata(state, adapter, Normalizer::snapshot_from_thread(thread)).await
 }
 
-async fn enrich_snapshot_title(
+async fn enrich_snapshot_metadata(
     state: &AppState,
     adapter: &dyn CodexAdapter,
     mut snapshot: SessionSnapshot,
 ) -> SessionSnapshot {
-    if snapshot.title != snapshot.thread_id {
-        return snapshot;
-    }
-
     if let Some(cached) = state
         .event_hub
         .snapshot_for_thread(&snapshot.thread_id)
         .await
-        && cached.title != cached.thread_id
-        && !cached.title.trim().is_empty()
     {
-        snapshot.title = cached.title;
+        merge_snapshot_metadata(&mut snapshot, &cached);
+    }
+
+    if snapshot_has_resolved_title(&snapshot) {
+        state
+            .snapshot_enrichment_retries
+            .lock()
+            .await
+            .remove(&snapshot.thread_id);
         return snapshot;
     }
 
-    if state
-        .title_enrichment_attempts
-        .lock()
-        .await
-        .contains(&snapshot.thread_id)
-    {
+    if !begin_snapshot_enrichment_attempt(state, &snapshot.thread_id).await {
         return snapshot;
     }
 
     match adapter.resume_thread(&snapshot.thread_id).await {
-        Ok(resumed) => {
-            state
-                .title_enrichment_attempts
-                .lock()
-                .await
-                .insert(snapshot.thread_id.clone());
-            if let Some(resumed) = resumed {
-                remember_subagent_classification(state, &resumed).await;
-                let resumed_snapshot = Normalizer::snapshot_from_thread(&resumed);
-                if resumed_snapshot.title != resumed_snapshot.thread_id
-                    && !resumed_snapshot.title.trim().is_empty()
-                {
-                    snapshot.title = resumed_snapshot.title;
-                }
-            }
+        Ok(Some(resumed)) => {
+            remember_subagent_classification(state, &resumed).await;
+            merge_snapshot_metadata(&mut snapshot, &Normalizer::snapshot_from_thread(&resumed));
         }
-        Err(_) => {
-            // Title enrichment is best-effort. A transient resume failure must not hide sessions.
+        Ok(None) | Err(_) => {
+            // Snapshot enrichment is best-effort. Transient resume gaps must not hide sessions.
         }
     }
 
+    if snapshot_has_resolved_title(&snapshot) {
+        state
+            .snapshot_enrichment_retries
+            .lock()
+            .await
+            .remove(&snapshot.thread_id);
+    }
+
     snapshot
+}
+
+async fn begin_snapshot_enrichment_attempt(state: &AppState, thread_id: &str) -> bool {
+    const BASE_RETRY_DELAY: Duration = Duration::from_secs(1);
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+    let now = Instant::now();
+    let mut retries = state.snapshot_enrichment_retries.lock().await;
+    if let Some(retry) = retries.get_mut(thread_id) {
+        if retry.next_attempt_at > now {
+            return false;
+        }
+        retry.attempts = retry.attempts.saturating_add(1);
+        let multiplier = 1_u32 << retry.attempts.saturating_sub(1).min(5);
+        retry.next_attempt_at = now + (BASE_RETRY_DELAY * multiplier).min(MAX_RETRY_DELAY);
+    } else {
+        retries.insert(
+            thread_id.to_string(),
+            SnapshotEnrichmentRetry {
+                attempts: 1,
+                next_attempt_at: now + BASE_RETRY_DELAY,
+            },
+        );
+    }
+    true
+}
+
+fn snapshot_has_resolved_title(snapshot: &SessionSnapshot) -> bool {
+    snapshot.title != snapshot.thread_id && !snapshot.title.trim().is_empty()
+}
+
+fn merge_snapshot_metadata(target: &mut SessionSnapshot, source: &SessionSnapshot) {
+    if !snapshot_has_resolved_title(target) && snapshot_has_resolved_title(source) {
+        target.title.clone_from(&source.title);
+    }
+    merge_optional_metadata(&mut target.cwd, &source.cwd);
+    merge_optional_metadata(&mut target.model_provider, &source.model_provider);
+    merge_optional_metadata(&mut target.preview, &source.preview);
+}
+
+fn merge_optional_metadata(target: &mut Option<String>, source: &Option<String>) {
+    if target
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        && source.is_some()
+    {
+        target.clone_from(source);
+    }
 }
 
 async fn remember_subagent_classification(state: &AppState, thread: &CodexThread) {
@@ -3982,6 +4031,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paired_device_retries_empty_live_thread_enrichment_and_merges_metadata() {
+        let (_dir, state) = test_state();
+        let session_token = pair_device(&state).await;
+        let thread_id = "019f78a4-f383-7813-96e0-522b5feb06c8";
+        state
+            .event_hub
+            .set_snapshot(SessionSnapshot {
+                thread_id: thread_id.to_string(),
+                title: thread_id.to_string(),
+                cwd: None,
+                model_provider: None,
+                preview: None,
+                updated_at: 1_725_000_000_300,
+                status: SessionStatus::Running,
+                pending_approval_ids: vec!["approval-live".to_string()],
+            })
+            .await;
+        let resumed = CodexThread {
+            id: thread_id.to_string(),
+            title: Some("Task 6 Pairing Fixer · Noether".to_string()),
+            cwd: Some("/repo".to_string()),
+            model_provider: Some("openai".to_string()),
+            preview: Some("Inspect pairing state".to_string()),
+            created_at: None,
+            updated_at: Some(1_725_000_000_400),
+            raw: json!({
+                "id": thread_id,
+                "status": "idle",
+                "agentPath": "/root/task6_pairing_fixer",
+                "agentNickname": "Noether"
+            }),
+        };
+        let adapter = Arc::new(
+            RecordingAdapter::with_threads(Vec::new())
+                .with_resumed_thread_sequence(thread_id, vec![None, Some(resumed)]),
+        );
+        let resume_calls = adapter.resume_calls();
+        let app = build_router(state.with_codex_adapter(adapter));
+
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(first_response).await[0]["title"],
+            json!(thread_id)
+        );
+
+        let rate_limited_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+        assert_eq!(rate_limited_response.status(), StatusCode::OK);
+        assert_eq!(
+            resume_calls.lock().expect("resume calls lock").as_slice(),
+            &[thread_id.to_string()]
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let second_response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/sessions")
+                    .header(header::AUTHORIZATION, format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("request succeeds");
+
+        assert_eq!(second_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(second_response).await[0],
+            json!({
+                "threadId": thread_id,
+                "title": "Task 6 Pairing Fixer · Noether",
+                "cwd": "/repo",
+                "modelProvider": "openai",
+                "preview": "Inspect pairing state",
+                "updatedAt": 1_725_000_000_300u64,
+                "status": "running",
+                "pendingApprovalIds": ["approval-live"],
+                "isSubagent": true
+            })
+        );
+        assert_eq!(
+            resume_calls.lock().expect("resume calls lock").as_slice(),
+            &[thread_id.to_string(), thread_id.to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn paired_device_can_list_safe_deduplicated_workspaces() {
         let (_dir, state) = test_state();
         let session_token = pair_device(&state).await;
@@ -6403,6 +6563,7 @@ mod tests {
         send_release: Option<Arc<tokio::sync::Semaphore>>,
         send_started: Option<Arc<tokio::sync::Semaphore>>,
         resumed_threads: Arc<StdMutex<StdHashMap<String, CodexThread>>>,
+        resumed_thread_sequences: Arc<StdMutex<StdHashMap<String, VecDeque<Option<CodexThread>>>>>,
         resume_calls: Arc<StdMutex<Vec<String>>>,
         started_threads: Arc<StdMutex<Vec<String>>>,
         started_workspaces: Arc<StdMutex<Vec<String>>>,
@@ -6435,6 +6596,18 @@ mod tests {
                     .map(|thread| (thread.id.clone(), thread))
                     .collect(),
             ));
+            self
+        }
+
+        fn with_resumed_thread_sequence(
+            mut self,
+            thread_id: &str,
+            sequence: Vec<Option<CodexThread>>,
+        ) -> Self {
+            self.resumed_thread_sequences = Arc::new(StdMutex::new(StdHashMap::from([(
+                thread_id.to_string(),
+                sequence.into(),
+            )])));
             self
         }
 
@@ -6580,6 +6753,15 @@ mod tests {
                 .lock()
                 .expect("resume calls lock")
                 .push(thread_id.to_string());
+            if let Some(resumed) = self
+                .resumed_thread_sequences
+                .lock()
+                .expect("resumed thread sequences lock")
+                .get_mut(thread_id)
+                .and_then(VecDeque::pop_front)
+            {
+                return Ok(resumed);
+            }
             Ok(self
                 .resumed_threads
                 .lock()

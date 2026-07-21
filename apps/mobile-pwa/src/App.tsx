@@ -3942,11 +3942,26 @@ function sortSessions(items: SessionSnapshot[]): SessionSnapshot[] {
 }
 
 function preferredInitialSessionId(items: SessionSnapshot[]): string {
-  return items.find((session) => !isSubagentSession(session))?.threadId ?? items[0]?.threadId ?? "";
+  return (
+    items.find((session) => !isSubagentSession(session) && hasUsefulSessionMetadata(session))
+      ?.threadId ??
+    items.find((session) => !isSubagentSession(session))?.threadId ??
+    items[0]?.threadId ??
+    ""
+  );
 }
 
 function isSubagentSession(session: SessionSnapshot): boolean {
   return (session as SessionSnapshot & { isSubagent?: boolean }).isSubagent === true;
+}
+
+function hasUsefulSessionMetadata(session: SessionSnapshot): boolean {
+  return (
+    (session.title.trim() !== "" && session.title !== session.threadId) ||
+    Boolean(session.cwd?.trim()) ||
+    Boolean(session.modelProvider?.trim()) ||
+    Boolean(session.preview?.trim())
+  );
 }
 
 function selectNewSessionWorkspace(

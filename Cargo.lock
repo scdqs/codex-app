@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-core"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "bridge-sidecar"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "bridge-core",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-core"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-shell"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "desktop-core",
  "reqwest 0.12.28",
