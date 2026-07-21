@@ -1208,6 +1208,27 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(await screen.findByText("Loaded the main conversation.")).toBeInTheDocument();
     expect(screen.queryByText("Loaded the internal worker.")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Task 6 Mode Implementer · Raman the 2nd" }),
+    ).not.toBeInTheDocument();
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    act(() => {
+      MockWebSocket.instances[0].emit({
+        type: "session_snapshot",
+        payload: sessionSnapshot({
+          threadId: "thread-subagent",
+          title: "Task 6 Mode Implementer · Raman the 2nd",
+          preview: "Internal worker updated over WebSocket",
+          updatedAt: 400,
+          status: "running",
+        }),
+      });
+    });
+
+    expect(
+      screen.queryByRole("button", { name: "Task 6 Mode Implementer · Raman the 2nd" }),
+    ).not.toBeInTheDocument();
   });
 
   it("prefers_a_rich_root_session_over_a_newer_unresolved_uuid_snapshot", async () => {
