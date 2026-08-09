@@ -799,7 +799,11 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
     } catch (_error) {
       return false;
     }
-    return /return\s+[A-Za-z0-9_$]+\.sendRequest\([A-Za-z0-9_$]+,[A-Za-z0-9_$]+\)/.test(source);
+    const directSender =
+      /return\s+[A-Za-z0-9_$]+\.sendRequest\([A-Za-z0-9_$]+,[A-Za-z0-9_$]+\)/;
+    const optionalRequestOptionsSender =
+      /^function\s+[^()]*\(\s*([A-Za-z0-9_$]+)\s*,\s*([A-Za-z0-9_$]+)\s*,\s*([A-Za-z0-9_$]+)\s*\)\s*\{\s*return\s+\3\s*==\s*null\s*\?\s*([A-Za-z0-9_$]+)\.sendRequest\(\s*\1\s*,\s*\2\s*\)\s*:\s*\4\.sendRequest\(\s*\1\s*,\s*\2\s*,\s*\3\s*\)\s*;?\s*\}$/;
+    return directSender.test(source) || optionalRequestOptionsSender.test(source);
   };
 
   const findExportedAppServerSender = (module) => {
@@ -1001,6 +1005,8 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
+    use std::{fs, process::Command};
+    use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tokio_tungstenite::accept_async;
 
@@ -1095,6 +1101,95 @@ mod tests {
         assert!(CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("exported-host-sender"));
         assert!(
             CODEX_APP_SERVER_BRIDGE_SCRIPT.contains("Missing AppServer request message handler")
+        );
+    }
+
+    #[test]
+    fn bridge_script_injects_current_chatgpt_three_argument_host_sender() {
+        let temp = TempDir::new().expect("temporary module fixture is created");
+        let bridge_path = temp.path().join("bridge.js");
+        let app_module_path = temp.path().join("app-initial-fixture.js");
+        let rpc_module_path = temp.path().join("rpc-fixture.js");
+        let harness_path = temp.path().join("harness.mjs");
+
+        fs::write(temp.path().join("package.json"), r#"{"type":"module"}"#)
+            .expect("module package fixture is written");
+        fs::write(&bridge_path, CODEX_APP_SERVER_BRIDGE_SCRIPT)
+            .expect("bridge script fixture is written");
+        fs::write(
+            &app_module_path,
+            r#"
+const client = { sendRequest: (...args) => args };
+
+export function aUnrelated(first, second, third) {
+  return client.sendRequest("wrong-method", first, second, third);
+}
+
+export function zAppServerSender(method, params, options) {
+  return options == null
+    ? client.sendRequest(method, params)
+    : client.sendRequest(method, params, options);
+}
+"#,
+        )
+        .expect("app module fixture is written");
+        fs::write(
+            &rpc_module_path,
+            r#"
+import { zAppServerSender } from "./app-initial-fixture.js";
+export function initializeAppHostServices() {
+  return typeof zAppServerSender;
+}
+"#,
+        )
+        .expect("rpc module fixture is written");
+        fs::write(
+            &harness_path,
+            r#"
+import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const [bridgePath, rpcModulePath] = process.argv.slice(2);
+const rpcModuleUrl = pathToFileURL(rpcModulePath).href;
+globalThis.document = {
+  querySelectorAll() {
+    return [{ href: rpcModuleUrl }];
+  },
+};
+globalThis.fetch = async (url) => ({
+  text: async () => fs.readFileSync(new URL(url), "utf8"),
+});
+
+const injected = await eval(fs.readFileSync(bridgePath, "utf8"));
+if (injected !== true) {
+  throw new Error("bridge injection returned false");
+}
+if (globalThis.__codexMobileBridge?.mode !== "exported-host-sender") {
+  throw new Error(`unexpected bridge mode: ${globalThis.__codexMobileBridge?.mode}`);
+}
+const response = await globalThis.__codexMobileBridge.rpc({
+  method: "thread/list",
+  params: { limit: 1 },
+});
+if (response[0] !== "send-cli-request-for-host") {
+  throw new Error(`selected unrelated sender: ${JSON.stringify(response)}`);
+}
+"#,
+        )
+        .expect("node harness is written");
+
+        let output = Command::new("node")
+            .arg(&harness_path)
+            .arg(&bridge_path)
+            .arg(&rpc_module_path)
+            .output()
+            .expect("node is available to execute the bridge script");
+
+        assert!(
+            output.status.success(),
+            "bridge harness failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

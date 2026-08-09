@@ -19,7 +19,7 @@
 </div>
 
 > [!IMPORTANT]
-> 当前为 `v0.1.21 Beta`，优先支持 Apple Silicon Mac。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。参见 [v0.1.21 发布说明](docs/releases/v0.1.21.md)。
+> 当前为 `v0.1.21 Beta`，优先支持 Apple Silicon Mac。此版本恢复对 ChatGPT `26.803.41515` app-server sender 的识别。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。
 
 ## 界面预览
 
