@@ -4,7 +4,7 @@
 
 本项目让手机继续操作电脑上正在运行的 ChatGPT/Codex Desktop 任务。桌面 Agent 仍是唯一执行端；Bridge 负责读取会话、回写消息、处理审批、设备配对和远程访问，手机 PWA 不直接调用模型 API。
 
-当前产品基线为 `v0.1.20 Beta`，优先支持 macOS Desktop App。CLI、Windows、Linux、原生手机 App 和复杂授权策略属于后续范围，除非用户明确提升优先级。
+当前产品基线为 `v0.1.21 Beta`，优先支持 macOS Desktop App。CLI、Windows、Linux、原生手机 App 和复杂授权策略属于后续范围，除非用户明确提升优先级。
 
 ## 仓库结构
 
@@ -62,6 +62,7 @@
 - Local Control API 只能供本机桌面壳使用，绝不能挂载到公网 phone router。
 - MVP 中已配对设备等同可信本机用户，可直接处理审批；不要擅自声称已实现风险分级。
 - 诊断必须脱敏 Authorization、control/session/pairing token、Cloudflare Token、VAPID/API key 和完整本机路径。
+- Sidecar stdout/stderr 不得输出 pairing token 或 Local Control Token；桌面壳在每次启动 sidecar 前重置旧日志并轮换 Local Control Token，防止旧版本留下的凭据继续持久化或有效。
 - 诊断中的 PushSubscription 只允许 endpoint host、状态、最后成功时间和错误类别；不得包含 endpoint path/query、p256dh、auth 或 payload。
 
 ### 提醒与 Web Push

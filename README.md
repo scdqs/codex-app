@@ -4,7 +4,7 @@
   <p><strong>把 Mac 上正在运行的 ChatGPT / Codex Desktop，带到手机继续操作。</strong></p>
   <p>电脑继续执行任务；手机查看进度、补充消息、创建会话和处理审批。</p>
   <p>
-    <img src="https://img.shields.io/badge/version-v0.1.20_Beta-1f8a70" alt="v0.1.20 Beta">
+    <img src="https://img.shields.io/badge/version-v0.1.21_Beta-1f8a70" alt="v0.1.21 Beta">
     <img src="https://img.shields.io/badge/platform-macOS-111827" alt="macOS">
     <img src="https://img.shields.io/badge/mobile-PWA-2563eb" alt="Mobile PWA">
     <img src="https://img.shields.io/badge/license-MIT-f59e0b" alt="MIT License">
@@ -19,7 +19,7 @@
 </div>
 
 > [!IMPORTANT]
-> 当前为 `v0.1.20 Beta`，优先支持 Apple Silicon Mac。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。
+> 当前为 `v0.1.21 Beta`，优先支持 Apple Silicon Mac。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。参见 [v0.1.21 发布说明](docs/releases/v0.1.21.md)。
 
 ## 界面预览
 
@@ -71,6 +71,7 @@
 - 四类任务提醒：完成、等待审批、等待输入和错误；前台提供不同提示音与可用时的震动。
 - Cloudflare 固定 HTTPS 域名下支持直接 Web Push、锁屏系统通知、订阅修复和通知点击回到对应会话。
 - 固定域名 Token 写入 macOS Keychain，诊断信息会脱敏。
+- Sidecar 启动日志只保留监听地址、PWA 资产就绪状态和连接状态等非敏感信息；不会记录本机路径、配对链接或 Local Control Token。
 
 ## 当前限制
 
@@ -204,6 +205,7 @@ sudo /opt/homebrew/bin/cloudflared service uninstall
 - 一次性配对 Token 有有效期，并且成功使用后立即失效。
 - 会话 API、图片资源和 WebSocket 都要求已配对设备的 session。
 - Local Control API 不会挂载到手机公网路由。
+- 每次启动 Sidecar 都会轮换 Local Control Token，并在写入新日志前清空旧版本可能遗留的 Sidecar stdout/stderr 日志；未使用的旧配对链接随旧 Sidecar 进程退出而失效。
 - Tunnel Token 存在 macOS Keychain；启动 `cloudflared` 时通过权限受限的临时 token 文件传入，不出现在命令行参数和诊断中。
 - VAPID 私钥存在 macOS Keychain，只通过一次性 `0600` 文件交给 sidecar 并在读取后删除；PushSubscription 与 outbox 绑定已配对设备。
 - Web Push payload 只含事件类别、thread ID/标题和时间，不含消息正文、CWD、工具参数或错误详情。
