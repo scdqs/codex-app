@@ -62,6 +62,7 @@
 - Local Control API 只能供本机桌面壳使用，绝不能挂载到公网 phone router。
 - MVP 中已配对设备等同可信本机用户，可直接处理审批；不要擅自声称已实现风险分级。
 - 诊断必须脱敏 Authorization、control/session/pairing token、Cloudflare Token、VAPID/API key 和完整本机路径。
+- Sidecar stdout/stderr 不得输出 pairing token 或 Local Control Token；桌面壳在每次启动 sidecar 前重置旧日志并轮换 Local Control Token，防止旧版本留下的凭据继续持久化或有效。
 - 诊断中的 PushSubscription 只允许 endpoint host、状态、最后成功时间和错误类别；不得包含 endpoint path/query、p256dh、auth 或 payload。
 
 ### 提醒与 Web Push

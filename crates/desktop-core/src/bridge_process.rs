@@ -266,6 +266,7 @@ impl BridgeProcessManager {
             self.child = None;
         }
 
+        self.control_token = Uuid::new_v4().to_string();
         let plan = self.prepare_launch_plan()?;
         self.state = ManagerState {
             status: BridgeProcessStatus::Starting,
@@ -273,8 +274,10 @@ impl BridgeProcessManager {
             detail: None,
         };
 
-        let stdout = append_log_file(&plan.stdout_log)?;
-        let stderr = append_log_file(&plan.stderr_log)?;
+        // Reset both files before the patched sidecar starts so credentials retained by
+        // older versions are removed without copying them into a migration artifact.
+        let stdout = reset_log_file(&plan.stdout_log)?;
+        let stderr = reset_log_file(&plan.stderr_log)?;
         let mut command = tokio::process::Command::new(&self.config.sidecar_binary);
         command
             .kill_on_drop(true)
@@ -466,10 +469,11 @@ fn create_dir_all(path: &Path) -> Result<(), BridgeProcessError> {
     })
 }
 
-fn append_log_file(path: &Path) -> Result<File, BridgeProcessError> {
+fn reset_log_file(path: &Path) -> Result<File, BridgeProcessError> {
     OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(path)
         .map_err(|source| BridgeProcessError::Io {
             path: path.to_path_buf(),
@@ -724,6 +728,55 @@ mod tests {
         assert_eq!(
             link,
             "https://mobile-codex.trycloudflare.com/?pairingToken=token%20with%20spaces&bridgeUrl=https%3A%2F%2Fmobile-codex.trycloudflare.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_clears_legacy_sidecar_logs_before_launch() {
+        let temp = TempDir::new().expect("temp dir creates");
+        let mut config = test_config(&temp);
+        config.sidecar_args = vec!["-c".to_string(), "exit 42".to_string()];
+        let mut manager = BridgeProcessManager::new(config);
+        let plan = manager.prepare_launch_plan().expect("launch plan prepares");
+        let legacy_pairing_token = "legacy-pairing-secret";
+        let legacy_control_token = "legacy-control-secret";
+        std::fs::write(
+            &plan.stdout_log,
+            format!("PWA pairing URL: https://example.com/?pairingToken={legacy_pairing_token}"),
+        )
+        .expect("legacy stdout log writes");
+        std::fs::write(
+            &plan.stderr_log,
+            format!("Local control token: {legacy_control_token}"),
+        )
+        .expect("legacy stderr log writes");
+
+        let _ = manager.start().await.expect_err("dead child fails start");
+
+        let stdout = std::fs::read_to_string(&plan.stdout_log).expect("stdout log reads");
+        let stderr = std::fs::read_to_string(&plan.stderr_log).expect("stderr log reads");
+        assert!(!stdout.contains(legacy_pairing_token));
+        assert!(!stderr.contains(legacy_control_token));
+    }
+
+    #[tokio::test]
+    async fn start_rotates_the_local_control_token() {
+        let temp = TempDir::new().expect("temp dir creates");
+        let mut config = test_config(&temp);
+        config.sidecar_args = vec!["-c".to_string(), "exit 42".to_string()];
+        let mut manager = BridgeProcessManager::new(config);
+        let previous_token = manager.control_token().to_string();
+
+        let _ = manager.start().await.expect_err("dead child fails start");
+
+        assert_ne!(manager.control_token(), previous_token);
+        assert_eq!(
+            manager
+                .state
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.env_value("CODEX_MOBILE_BRIDGE_CONTROL_TOKEN")),
+            Some(manager.control_token().to_string())
         );
     }
 

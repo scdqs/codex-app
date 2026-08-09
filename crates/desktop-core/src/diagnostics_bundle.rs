@@ -452,6 +452,22 @@ mod tests {
     }
 
     #[test]
+    fn redacts_legacy_sidecar_pairing_and_control_credentials() {
+        let pairing_token = "46c84976-74e0-46bd-b193-dfcb41dba342";
+        let control_token = "c4f36d84-7bbb-4a50-823c-494685616b02";
+        let input = format!(
+            "PWA pairing URL: https://bridge.example.com/?pairingToken={pairing_token}\n\
+             Local control token for starting device pairing: {control_token}"
+        );
+
+        let redacted = redact_sensitive_text(&input);
+
+        assert!(!redacted.contains(pairing_token));
+        assert!(!redacted.contains(control_token));
+        assert_eq!(redacted.matches(REDACTED_SECRET).count(), 2);
+    }
+
+    #[test]
     fn redacts_local_paths_without_hiding_file_context() {
         let input =
             "asset=/Users/damon/Documents/my_ai/codex-app/file.png log=/var/folders/yl/token.log";
