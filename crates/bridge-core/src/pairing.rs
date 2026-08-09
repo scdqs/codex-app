@@ -336,6 +336,25 @@ mod tests {
     }
 
     #[test]
+    fn unconsumed_pairing_token_is_invalid_after_manager_restart() {
+        let dir = tempdir().expect("tempdir is created");
+        let path = dir.path().join("bridge.sqlite");
+        let now = Arc::new(AtomicU64::new(1_725_000_000_000));
+        let token = {
+            let storage = Storage::open(&path).expect("storage opens");
+            let mut manager = manager_at(Arc::clone(&now), storage);
+            manager.create_token().expect("pairing token creates")
+        };
+        let storage = Storage::open(&path).expect("storage reopens");
+        let mut restarted_manager = manager_at(Arc::clone(&now), storage);
+
+        assert_eq!(
+            restarted_manager.register_device(&token, "phone-1", "Damon's phone", "phone-secret"),
+            Err(PairingError::InvalidToken)
+        );
+    }
+
+    #[test]
     fn revoked_device_cannot_create_session() {
         let (_dir, storage) = temp_storage();
         let now = Arc::new(AtomicU64::new(1_725_000_000_000));

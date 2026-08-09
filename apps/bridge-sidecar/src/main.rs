@@ -1,11 +1,4 @@
-use std::{
-    env,
-    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
-    path::PathBuf,
-    process::Command,
-    sync::Arc,
-    time::Duration,
-};
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use bridge_core::{
@@ -65,20 +58,9 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| Uuid::new_v4().to_string());
     let instance_id =
         env::var("CODEX_MOBILE_BRIDGE_INSTANCE_ID").unwrap_or_else(|_| Uuid::new_v4().to_string());
-    let mut pairing = PairingManager::new(storage);
-    let startup_pairing_token = pairing
-        .create_token()
-        .context("create startup pairing token")?;
-    let bridge_url = bridge_url_for_bind_addr(bind_addr);
-    let pairing_url = format!(
-        "{bridge_url}/?pairingToken={}&bridgeUrl={}",
-        url_encode_component(&startup_pairing_token),
-        url_encode_component(&bridge_url)
-    );
+    let pairing = PairingManager::new(storage);
     println!("Codex mobile bridge listening on {bind_addr}");
-    println!("Serving PWA from {}", pwa_dir.display());
-    println!("PWA pairing URL: {pairing_url}");
-    println!("QR text: {pairing_url}");
+    println!("Serving PWA assets");
     let cdp_client = CdpClient::new(debug_port).context("create cdp client")?;
     let diagnostics = diagnose_cdp_app_server(&cdp_client).await;
     println!(
@@ -90,9 +72,6 @@ async fn main() -> anyhow::Result<()> {
             .as_deref()
             .map(|detail| format!(" detail={detail}"))
             .unwrap_or_default()
-    );
-    println!(
-        "Local control token for starting device pairing: {control_token}. Keep this token on this machine; it is not exposed by the HTTP API."
     );
     let codex_adapter = cdp_app_server_adapter(&cdp_client).await;
     let event_hub = EventHub::new();
@@ -201,62 +180,4 @@ async fn cdp_app_server_adapter(cdp_client: &CdpClient) -> Option<Arc<dyn CodexA
     Some(Arc::new(AppServerJsonRpcClient::new(
         CdpAppServerTransport::new(cdp_client.clone(), target),
     )))
-}
-
-fn bridge_url_for_bind_addr(bind_addr: SocketAddr) -> String {
-    let ip = if bind_addr.ip().is_unspecified() {
-        macos_wifi_ip()
-            .or_else(lan_ip)
-            .filter(|ip| is_phone_reachable_ip(*ip))
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
-    } else {
-        bind_addr.ip()
-    };
-    format!("http://{}:{}", host_for_url(ip), bind_addr.port())
-}
-
-fn macos_wifi_ip() -> Option<IpAddr> {
-    let output = Command::new("ipconfig")
-        .args(["getifaddr", "en0"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    text.trim().parse().ok()
-}
-
-fn lan_ip() -> Option<IpAddr> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-    socket.connect((Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
-    Some(socket.local_addr().ok()?.ip())
-}
-
-fn is_phone_reachable_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            !ip.is_loopback() && !ip.is_link_local() && !matches!(ip.octets(), [198, 18 | 19, _, _])
-        }
-        IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unspecified(),
-    }
-}
-
-fn host_for_url(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(ip) => ip.to_string(),
-        IpAddr::V6(ip) => format!("[{ip}]"),
-    }
-}
-
-fn url_encode_component(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (byte as char).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
 }
