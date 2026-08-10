@@ -1392,6 +1392,48 @@ if (
 ) {
   throw new Error(`direct bridge was not versioned: ${JSON.stringify(globalThis.__codexMobileBridge)}`);
 }
+const nonlocalManager = {
+  ...manager,
+  getHostId: () => "remote",
+};
+const fallbackAtom = {};
+const fallbackScopeNode = {
+  familyBindings: new Map([[
+    { read() { throw new Error("binding requires a React hook"); } },
+    new Map([["local", {}]]),
+  ]]),
+  cachedBindings: new Map([[Symbol("cached"), fallbackAtom]]),
+  signalBindings: new Map(),
+  store: {
+    get(atom) {
+      return atom === fallbackAtom ? [nonlocalManager, manager] : null;
+    },
+  },
+};
+const fallbackScopeChain = new Map([[Symbol("scope"), fallbackScopeNode]]);
+globalThis.__codexMobileBridge = null;
+globalThis.__codexAppServerClient = null;
+globalThis.document.querySelectorAll = () => [{ href: rpcModuleUrl }];
+globalThis.__codexRoot = {
+  _internalRoot: {
+    current: {
+      child: null,
+      dependencies: {
+        firstContext: { memoizedValue: fallbackScopeChain, next: null },
+      },
+      scopeNode: fallbackScopeNode,
+      sibling: null,
+    },
+  },
+};
+const fallbackInjected = await eval(fs.readFileSync(bridgePath, "utf8"));
+const fallbackApprovals = await globalThis.__codexMobileBridge.rpc({
+  method: "codex-mobile/list-pending-approvals",
+  params: {},
+});
+if (fallbackInjected !== true || fallbackApprovals.length !== 1) {
+  throw new Error(`legacy scope fallback failed: ${JSON.stringify(fallbackApprovals)}`);
+}
 "#,
         )
         .expect("node harness is written");
