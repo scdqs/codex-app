@@ -390,8 +390,10 @@ impl BridgeConnectionState {
 
 const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
 (async () => {
+  const BRIDGE_IMPLEMENTATION_VERSION = 2;
   if (
     globalThis.__codexMobileBridge &&
+    globalThis.__codexMobileBridge.implementationVersion === BRIDGE_IMPLEMENTATION_VERSION &&
     typeof globalThis.__codexMobileBridge.rpc === "function" &&
     typeof globalThis.__codexMobileBridge.subscribeNotifications === "function" &&
     globalThis.__codexMobileBridge.supportsMobileStartConversation === true &&
@@ -428,6 +430,14 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
   let cachedAppServerManager = null;
   let notificationUnsubscribers = [];
 
+  const isScopeNode = (candidate) =>
+    candidate &&
+    candidate.familyBindings instanceof Map &&
+    (candidate.cachedBindings instanceof Map || candidate.cachedBindings instanceof WeakMap) &&
+    (candidate.signalBindings instanceof Map || candidate.signalBindings instanceof WeakMap) &&
+    candidate.store &&
+    typeof candidate.store.get === "function";
+
   const findScopeNode = () => {
     const root = globalThis.__codexRoot?._internalRoot?.current;
     if (!root) {
@@ -449,13 +459,7 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
       seen.add(object);
       visited += 1;
 
-      if (
-        object.familyBindings instanceof Map &&
-        object.cachedBindings instanceof Map &&
-        object.signalBindings instanceof Map &&
-        object.store &&
-        typeof object.store.get === "function"
-      ) {
+      if (isScopeNode(object)) {
         return object;
       }
 
@@ -506,9 +510,96 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
     typeof candidate.replyWithPermissionsRequestApprovalResponse === "function" &&
     typeof candidate.replyWithMcpServerElicitationResponse === "function";
 
+  const cacheAppServerManager = (value) => {
+    const candidates = Array.isArray(value) ? value : [value];
+    for (const candidate of candidates) {
+      if (!isAppServerManager(candidate)) {
+        continue;
+      }
+      try {
+        if (candidate.getHostId() === "local") {
+          cachedAppServerManager = candidate;
+          return candidate;
+        }
+      } catch (_error) {
+        // Some reactive proxies expose arbitrary method-shaped properties.
+      }
+    }
+    return null;
+  };
+
+  const findAppServerManagerInFiberContexts = () => {
+    const root = globalThis.__codexRoot?._internalRoot?.current;
+    if (!root) {
+      return null;
+    }
+
+    const fibers = [root];
+    const seenFibers = new WeakSet();
+    const seenScopes = new WeakSet();
+    let cursor = 0;
+    let visited = 0;
+    while (cursor < fibers.length && visited < 20000) {
+      const fiber = fibers[cursor];
+      cursor += 1;
+      if (!fiber || seenFibers.has(fiber)) {
+        continue;
+      }
+      seenFibers.add(fiber);
+      visited += 1;
+      if (fiber.child) {
+        fibers.push(fiber.child);
+      }
+      if (fiber.sibling) {
+        fibers.push(fiber.sibling);
+      }
+
+      let context = fiber.dependencies?.firstContext;
+      let contextSteps = 0;
+      while (context && contextSteps < 100) {
+        contextSteps += 1;
+        const scopeChain = context.memoizedValue;
+        const scopes = scopeChain instanceof Map ? scopeChain.values() : [scopeChain];
+        for (const scopeNode of scopes) {
+          if (!isScopeNode(scopeNode) || seenScopes.has(scopeNode)) {
+            continue;
+          }
+          seenScopes.add(scopeNode);
+          for (const [binding, familyMap] of scopeNode.familyBindings.entries()) {
+            if (
+              !(familyMap instanceof Map) ||
+              !familyMap.has("local") ||
+              typeof binding?.read !== "function"
+            ) {
+              continue;
+            }
+            try {
+              const manager = cacheAppServerManager(
+                binding.read(scopeNode, scopeChain, "local"),
+              );
+              if (manager) {
+                return manager;
+              }
+            } catch (_error) {
+              // A family may reject direct reads outside its React hook.
+            }
+          }
+        }
+        context = context.next;
+      }
+    }
+
+    return null;
+  };
+
   const findAppServerManager = () => {
     if (isAppServerManager(cachedAppServerManager)) {
       return cachedAppServerManager;
+    }
+
+    const contextManager = findAppServerManagerInFiberContexts();
+    if (contextManager) {
+      return contextManager;
     }
 
     const scopeNode = findScopeNode();
@@ -516,10 +607,17 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
       return null;
     }
 
-    const atoms = new Set([
-      ...scopeNode.cachedBindings.values(),
-      ...scopeNode.signalBindings.values(),
-    ]);
+    const atoms = new Set();
+    if (typeof scopeNode.cachedBindings.values === "function") {
+      for (const atom of scopeNode.cachedBindings.values()) {
+        atoms.add(atom);
+      }
+    }
+    if (typeof scopeNode.signalBindings.values === "function") {
+      for (const atom of scopeNode.signalBindings.values()) {
+        atoms.add(atom);
+      }
+    }
     for (const familyMap of scopeNode.familyBindings.values()) {
       if (!(familyMap instanceof Map)) {
         continue;
@@ -536,12 +634,9 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
       } catch (_error) {
         continue;
       }
-      const candidates = Array.isArray(value) ? value : [value];
-      for (const candidate of candidates) {
-        if (isAppServerManager(candidate) && candidate.getHostId() === "local") {
-          cachedAppServerManager = candidate;
-          return candidate;
-        }
+      const manager = cacheAppServerManager(value);
+      if (manager) {
+        return manager;
       }
     }
 
@@ -687,6 +782,7 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
       return false;
     }
     globalThis.__codexMobileBridge = {
+      implementationVersion: BRIDGE_IMPLEMENTATION_VERSION,
       mode: "direct-client",
       supportsMobileStartConversation: false,
       supportsMobileApprovals: false,
@@ -707,6 +803,7 @@ const CODEX_APP_SERVER_BRIDGE_SCRIPT: &str = r#"
       return false;
     }
     globalThis.__codexMobileBridge = {
+      implementationVersion: BRIDGE_IMPLEMENTATION_VERSION,
       mode,
       supportsMobileStartConversation: true,
       supportsMobileApprovals: true,
@@ -1105,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_script_injects_current_chatgpt_three_argument_host_sender() {
+    fn bridge_script_injects_current_chatgpt_sender_and_scope_manager() {
         let temp = TempDir::new().expect("temporary module fixture is created");
         let bridge_path = temp.path().join("bridge.js");
         let app_module_path = temp.path().join("app-initial-fixture.js");
@@ -1160,9 +1257,76 @@ globalThis.fetch = async (url) => ({
   text: async () => fs.readFileSync(new URL(url), "utf8"),
 });
 
+const legacyBridge = {
+  supportsMobileStartConversation: true,
+  supportsMobileApprovals: true,
+  supportsNativeApprovalRequestIds: true,
+  subscribeNotifications() {},
+  rpc() {
+    throw new Error("legacy bridge should have been replaced");
+  },
+};
+globalThis.__codexMobileBridge = legacyBridge;
+
+const pendingApproval = {
+  id: 7,
+  method: "item/commandExecution/requestApproval",
+  params: { command: "echo bridge-test" },
+};
+let approvalDecision = null;
+const notificationCallbacks = new Map();
+const manager = {
+  conversations: new Map([
+    ["thread-approval", { requests: [pendingApproval] }],
+  ]),
+  getHostId: () => "local",
+  getConversation(threadId) {
+    return this.conversations.get(threadId) ?? null;
+  },
+  addNotificationCallback(method, callback) {
+    notificationCallbacks.set(method, callback);
+    return () => notificationCallbacks.delete(method);
+  },
+  replyWithCommandExecutionApprovalDecision(...args) {
+    approvalDecision = args;
+  },
+  replyWithFileChangeApprovalDecision() {},
+  replyWithPermissionsRequestApprovalResponse() {},
+  replyWithMcpServerElicitationResponse() {},
+};
+const scopeBinding = {
+  read(_scopeNode, _scopeChain, key) {
+    return key === "local" ? manager : null;
+  },
+};
+const scopeNode = {
+  familyBindings: new Map([[scopeBinding, new Map([["local", {}]])]]),
+  cachedBindings: new WeakMap(),
+  signalBindings: new WeakMap(),
+  store: { get() {} },
+};
+const scopeChain = new Map([[Symbol("scope"), scopeNode]]);
+globalThis.__codexRoot = {
+  _internalRoot: {
+    current: {
+      child: null,
+      dependencies: {
+        firstContext: { memoizedValue: scopeChain, next: null },
+      },
+      sibling: null,
+    },
+  },
+};
+
 const injected = await eval(fs.readFileSync(bridgePath, "utf8"));
 if (injected !== true) {
   throw new Error("bridge injection returned false");
+}
+if (globalThis.__codexMobileBridge === legacyBridge) {
+  throw new Error("legacy bridge was not replaced");
+}
+if (globalThis.__codexMobileBridge?.implementationVersion !== 2) {
+  throw new Error(`unexpected bridge version: ${globalThis.__codexMobileBridge?.implementationVersion}`);
 }
 if (globalThis.__codexMobileBridge?.mode !== "exported-host-sender") {
   throw new Error(`unexpected bridge mode: ${globalThis.__codexMobileBridge?.mode}`);
@@ -1173,6 +1337,60 @@ const response = await globalThis.__codexMobileBridge.rpc({
 });
 if (response[0] !== "send-cli-request-for-host") {
   throw new Error(`selected unrelated sender: ${JSON.stringify(response)}`);
+}
+const approvals = await globalThis.__codexMobileBridge.rpc({
+  method: "codex-mobile/list-pending-approvals",
+  params: {},
+});
+if (
+  approvals.length !== 1 ||
+  approvals[0].threadId !== "thread-approval" ||
+  approvals[0].requestId !== "7" ||
+  approvals[0].method !== "item/commandExecution/requestApproval"
+) {
+  throw new Error(`pending approval was not discovered: ${JSON.stringify(approvals)}`);
+}
+globalThis.__codexRoot = null;
+const approvalResult = await globalThis.__codexMobileBridge.rpc({
+  method: "codex-mobile/respond-approval",
+  params: { approvalId: "thread-approval:7", decision: "approve" },
+});
+if (
+  approvalResult.accepted !== true ||
+  JSON.stringify(approvalDecision) !== JSON.stringify(["thread-approval", 7, "accept"])
+) {
+  throw new Error(`approval response was not routed: ${JSON.stringify({ approvalResult, approvalDecision })}`);
+}
+const notificationEvents = [];
+globalThis.__codexMobileBridgeNotification = (payload) => {
+  notificationEvents.push(JSON.parse(payload));
+};
+globalThis.__codexMobileBridge.subscribeNotifications("__codexMobileBridgeNotification");
+notificationCallbacks.get("turn/started")?.({ params: { threadId: "thread-approval" } });
+if (
+  notificationEvents.length !== 1 ||
+  notificationEvents[0].method !== "turn/started" ||
+  notificationEvents[0].params.threadId !== "thread-approval"
+) {
+  throw new Error(`notification was not forwarded: ${JSON.stringify(notificationEvents)}`);
+}
+const currentBridge = globalThis.__codexMobileBridge;
+const reinjected = await eval(fs.readFileSync(bridgePath, "utf8"));
+if (reinjected !== true || globalThis.__codexMobileBridge !== currentBridge) {
+  throw new Error("current bridge should be reused");
+}
+globalThis.__codexMobileBridge = null;
+globalThis.__codexAppServerClient = {
+  sendRequest: (...args) => args,
+};
+globalThis.document.querySelectorAll = () => [];
+const directInjected = await eval(fs.readFileSync(bridgePath, "utf8"));
+if (
+  directInjected !== true ||
+  globalThis.__codexMobileBridge?.implementationVersion !== 2 ||
+  globalThis.__codexMobileBridge?.mode !== "direct-client"
+) {
+  throw new Error(`direct bridge was not versioned: ${JSON.stringify(globalThis.__codexMobileBridge)}`);
 }
 "#,
         )

@@ -4,7 +4,7 @@
 
 本项目让手机继续操作电脑上正在运行的 ChatGPT/Codex Desktop 任务。桌面 Agent 仍是唯一执行端；Bridge 负责读取会话、回写消息、处理审批、设备配对和远程访问，手机 PWA 不直接调用模型 API。
 
-当前产品基线为 `v0.1.21 Beta`，优先支持 macOS Desktop App。CLI、Windows、Linux、原生手机 App 和复杂授权策略属于后续范围，除非用户明确提升优先级。
+当前产品基线为 `v0.1.22 Beta`，优先支持 macOS Desktop App。CLI、Windows、Linux、原生手机 App 和复杂授权策略属于后续范围，除非用户明确提升优先级。
 
 ## 仓库结构
 
