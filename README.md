@@ -18,6 +18,10 @@
   </p>
 </div>
 
+<p align="center">
+  <img src="docs/images/codex-mobile-bridge-cover.png" width="1200" alt="Codex Mobile Bridge：把 Mac 上正在运行的 ChatGPT / Codex Desktop 带到手机继续操作">
+</p>
+
 > [!IMPORTANT]
 > 当前为 `v0.1.22 Beta`，优先支持 Apple Silicon Mac。此版本修复 ChatGPT `26.803.41515` 响应式 scope 变化导致的手机审批卡片和实时事件缺失。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。
 
