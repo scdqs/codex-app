@@ -11,3 +11,4 @@ apps/desktop-shell/src-tauri/resources/mobile-pwa/*
 bridge.sqlite
 .superpowers/
 .gstack/
+.multica/

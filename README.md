@@ -4,7 +4,7 @@
   <p><strong>把 Mac 上正在运行的 ChatGPT / Codex Desktop，带到手机继续操作。</strong></p>
   <p>电脑继续执行任务；手机查看进度、补充消息、创建会话和处理审批。</p>
   <p>
-    <img src="https://img.shields.io/badge/version-v0.1.21_Beta-1f8a70" alt="v0.1.21 Beta">
+    <img src="https://img.shields.io/badge/version-v0.1.22_Beta-1f8a70" alt="v0.1.22 Beta">
     <img src="https://img.shields.io/badge/platform-macOS-111827" alt="macOS">
     <img src="https://img.shields.io/badge/mobile-PWA-2563eb" alt="Mobile PWA">
     <img src="https://img.shields.io/badge/license-MIT-f59e0b" alt="MIT License">
@@ -19,7 +19,7 @@
 </div>
 
 > [!IMPORTANT]
-> 当前为 `v0.1.21 Beta`，优先支持 Apple Silicon Mac。此版本恢复对 ChatGPT `26.803.41515` app-server sender 的识别。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。
+> 当前为 `v0.1.22 Beta`，优先支持 Apple Silicon Mac。此版本修复 ChatGPT `26.803.41515` 响应式 scope 变化导致的手机审批卡片和实时事件缺失。内部 DMG 使用 ad-hoc 签名，尚未完成 Developer ID 签名和 Apple notarization。
 
 ## 界面预览
 
