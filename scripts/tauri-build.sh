@@ -2,6 +2,7 @@
 set -uo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${script_dir}/macos-signing-env.sh"
 export CARGO_TARGET_DIR="$("${script_dir}/cargo-target-dir.sh")"
 
 "${script_dir}/check-build-cache.sh" before
@@ -9,12 +10,8 @@ status=0
 
 npm run prepare:bundle || status=$?
 
-if [ "${status}" -eq 0 ] \
-  && [ "$(uname -s)" = "Darwin" ] \
-  && [ -z "${APPLE_SIGNING_IDENTITY:-}" ] \
-  && [ -z "${MACOS_CERTIFICATE_P12:-}" ]; then
-  export APPLE_SIGNING_IDENTITY="-"
-  echo "Using ad-hoc macOS signing for this unsigned build."
+if [ "${status}" -eq 0 ]; then
+  configure_macos_signing_environment "$(uname -s)"
 fi
 
 if [ "${status}" -eq 0 ]; then

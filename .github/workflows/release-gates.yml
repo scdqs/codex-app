@@ -42,6 +42,8 @@ jobs:
       UPDATE_MANIFEST_URL: ${{ vars.UPDATE_MANIFEST_URL }}
     steps:
       - uses: actions/checkout@v4
+      - name: Test packaging scripts
+        run: scripts/tauri-build.test.sh
       - name: Validate release gate
         run: |
           channel="${{ github.event_name == 'workflow_dispatch' && inputs.channel || 'dev' }}"
