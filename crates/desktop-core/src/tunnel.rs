@@ -838,8 +838,18 @@ mod tests {
         assert_eq!(ready.status, TunnelStatus::Ready);
         assert!(ready.session.is_some());
 
-        sleep(Duration::from_millis(100)).await;
-        let failed = manager.status();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let failed = loop {
+            let snapshot = manager.status();
+            if snapshot.status == TunnelStatus::Failed {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "tunnel provider did not exit before the test deadline: {snapshot:?}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        };
 
         assert_eq!(failed.status, TunnelStatus::Failed);
         assert_eq!(failed.session, None);
