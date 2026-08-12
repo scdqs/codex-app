@@ -1,0 +1,59 @@
+name: Feature request
+description: Propose an improvement based on a concrete user need
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem and desired outcome before proposing implementation details. Search existing issues first.
+
+        请先描述用户问题和期望结果，再补充实现建议；提交前请搜索已有 Issue。
+  - type: textarea
+    id: use-case
+    attributes:
+      label: User problem and use case
+      description: Who needs this, in what situation, and what are they unable to do today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the observable result, not only a technical solution.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Primary area
+      options:
+        - Desktop shell
+        - Bridge or core protocol
+        - Mobile PWA
+        - LAN or tunnel access
+        - Notifications
+        - Release or developer tooling
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: How do you handle this need today, if at all?
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add examples, screenshots, or constraints. Remove private data first.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for this request.
+          required: true
+        - label: I have not included credentials or private user data.
+          required: true

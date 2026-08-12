@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation and setup guide
+    url: https://github.com/scdqs/codex-app#readme
+    about: Read setup, security boundaries, and troubleshooting before opening an issue.
+  - name: Contributing guide
+    url: https://github.com/scdqs/codex-app/blob/main/CONTRIBUTING.md
+    about: Review the development workflow and validation requirements.
+  - name: Report a security vulnerability privately
+    url: https://github.com/scdqs/codex-app/security/advisories/new
+    about: Do not disclose suspected vulnerabilities in a public issue.
