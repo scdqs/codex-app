@@ -451,7 +451,7 @@ Create `.github/pull_request_template.md`:
 Use Ruby's built-in YAML parser without installing dependencies:
 
 ```bash
-ruby -e 'require "yaml"; ARGV.each { |path| YAML.safe_load_file(path, aliases: false); puts "OK #{path}" }' \
+ruby -e 'require "yaml"; ARGV.each { |path| YAML.safe_load(File.read(path), [], [], false); puts "OK #{path}" }' \
   .github/ISSUE_TEMPLATE/bug_report.yml \
   .github/ISSUE_TEMPLATE/feature_request.yml \
   .github/ISSUE_TEMPLATE/config.yml
