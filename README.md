@@ -1,4 +1,5 @@
 <div align="center">
+  <p><strong>简体中文</strong> · <a href="README_EN.md">English</a></p>
   <img src="apps/desktop-shell/src-tauri/icons/128x128.png" width="96" alt="Codex Mobile Bridge 图标">
   <h1>Codex Mobile Bridge</h1>
   <p><strong>把 Mac 上正在运行的 ChatGPT / Codex Desktop，带到手机继续操作。</strong></p>
