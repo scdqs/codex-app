@@ -1,7 +1,7 @@
 # Repository Governance Design
 
-**Date:** 2026-08-12  
-**Status:** Pending written-spec review  
+**Date:** 2026-08-12
+**Status:** Approved
 **Scope:** Public contribution guidance, private security reporting, repository security settings, and lightweight `main` branch protection
 
 ## Context
